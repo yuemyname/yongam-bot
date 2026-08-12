@@ -614,6 +614,7 @@ class SeatSnapshot:
     general: int | None = None
     accessible: int | None = None
     mapped_total: int | None = None
+    available_rows: tuple[str, ...] | None = None
 
     @property
     def accessible_only(self) -> bool:
@@ -626,6 +627,34 @@ class SeatSnapshot:
             and self.accessible > 0
             and self.mapped_total == self.total
         )
+
+    @property
+    def row_a_only(self) -> bool:
+        # As with accessible-only detection, require a complete seat map before
+        # suppressing an alert. Missing row labels or a count mismatch leave the
+        # alert enabled so an incomplete response cannot hide a useful seat.
+        return (
+            self.total > 0
+            and self.mapped_total == self.total
+            and self.available_rows == ("A",)
+        )
+
+    @property
+    def suppression_reason(self) -> str | None:
+        if self.accessible_only:
+            return "잔여 좌석이 장애인석뿐입니다."
+        if self.row_a_only:
+            return "잔여 좌석이 모두 A열입니다."
+        return None
+
+    @property
+    def should_suppress(self) -> bool:
+        return self.suppression_reason is not None
+
+
+def _normalize_seat_row(value: Any) -> str:
+    row = str(value or "").strip().upper()
+    return re.sub(r"\s*열$", "", row).strip()
 
 
 def extract_seat_snapshot(payload: Any, *, scheduled_remaining: int) -> SeatSnapshot:
@@ -655,6 +684,8 @@ def extract_seat_snapshot(payload: Any, *, scheduled_remaining: int) -> SeatSnap
 
     general = 0
     accessible = 0
+    available_rows: set[str] = set()
+    row_labels_complete = True
     for seat in seats.values():
         if str(_direct_value(seat, {"seatstuscd"}) or "").strip() != "00":
             continue
@@ -663,16 +694,27 @@ def extract_seat_snapshot(payload: Any, *, scheduled_remaining: int) -> SeatSnap
         disabled = str(_direct_value(seat, {"isdisabled"}) or "").strip().lower()
         if disabled in {"1", "true", "y", "yes"}:
             continue
+        seat_row = _normalize_seat_row(_direct_value(seat, {"seatrownm"}))
+        if seat_row:
+            available_rows.add(seat_row)
+        else:
+            row_labels_complete = False
         if str(_direct_value(seat, {"seatsalfrmcd"}) or "").strip() == "04":
             accessible += 1
         else:
             general += 1
 
+    mapped_total = general + accessible
     return SeatSnapshot(
         total=scheduled_remaining,
         general=general,
         accessible=accessible,
-        mapped_total=general + accessible,
+        mapped_total=mapped_total,
+        available_rows=(
+            tuple(sorted(available_rows))
+            if row_labels_complete and mapped_total > 0
+            else None
+        ),
     )
 
 
@@ -826,7 +868,7 @@ class StateStore:
     def __init__(self, path: Path):
         self.path = path
         self.data: dict[str, Any] = {
-            "version": 2,
+            "version": 3,
             "notified": {},
             "seat_counts": {},
             "last_error_fingerprint": "",
@@ -847,7 +889,7 @@ class StateStore:
         if not isinstance(loaded.get("seat_counts", {}), dict):
             raise RuntimeError(f"좌석 수 상태 파일 형식이 올바르지 않습니다: {self.path}")
         self.data.update(loaded)
-        self.data["version"] = 2
+        self.data["version"] = 3
         self.data.setdefault("seat_counts", {})
 
     def was_notified(self, key: str) -> bool:
@@ -870,11 +912,18 @@ class StateStore:
         total = _nonnegative_int(raw.get("total"))
         if total is None:
             return None
+        raw_rows = raw.get("available_rows")
+        available_rows = None
+        if isinstance(raw_rows, list) and all(
+            isinstance(row, str) for row in raw_rows
+        ):
+            available_rows = tuple(raw_rows)
         return SeatSnapshot(
             total=total,
             general=_nonnegative_int(raw.get("general")),
             accessible=_nonnegative_int(raw.get("accessible")),
             mapped_total=_nonnegative_int(raw.get("mapped_total")),
+            available_rows=available_rows,
         )
 
     def set_seat_snapshot(self, key: str, snapshot: SeatSnapshot) -> None:
@@ -884,6 +933,11 @@ class StateStore:
             "general": snapshot.general,
             "accessible": snapshot.accessible,
             "mapped_total": snapshot.mapped_total,
+            "available_rows": (
+                list(snapshot.available_rows)
+                if snapshot.available_rows is not None
+                else None
+            ),
         }
 
     def save(self) -> None:
@@ -1073,6 +1127,7 @@ class CycleResult:
     new_sessions: int
     seat_changes: int = 0
     suppressed_accessible_only: int = 0
+    suppressed_row_a_only: int = 0
     seat_detail_errors: int = 0
 
 
@@ -1187,7 +1242,7 @@ class Watcher:
             session
             for session in detected_new_sessions
             if snapshots.get(session_keys[session]) is not None
-            and snapshots[session_keys[session]].accessible_only
+            and snapshots[session_keys[session]].should_suppress
         ]
         new_sessions = [
             session
@@ -1196,11 +1251,21 @@ class Watcher:
         ]
 
         state_changed = False
-        suppressed_accessible_only = len(suppressed_new_sessions)
+        suppressed_accessible_only = sum(
+            snapshots[session_keys[session]].accessible_only
+            for session in suppressed_new_sessions
+        )
+        suppressed_row_a_only = sum(
+            snapshots[session_keys[session]].row_a_only
+            and not snapshots[session_keys[session]].accessible_only
+            for session in suppressed_new_sessions
+        )
         for session in suppressed_new_sessions:
+            snapshot = snapshots[session_keys[session]]
             self.logger.info(
-                "알림 제외: %s 잔여 좌석이 장애인석뿐입니다.",
+                "알림 제외: %s %s",
                 _session_line(session),
+                snapshot.suppression_reason,
             )
 
         if new_sessions:
@@ -1238,11 +1303,15 @@ class Watcher:
             if not _seat_snapshot_changed(previous, current):
                 continue
 
-            if current.accessible_only:
-                suppressed_accessible_only += 1
+            if current.should_suppress:
+                if current.accessible_only:
+                    suppressed_accessible_only += 1
+                elif current.row_a_only:
+                    suppressed_row_a_only += 1
                 self.logger.info(
-                    "좌석 변경 알림 제외: %s 잔여 좌석이 장애인석뿐입니다.",
+                    "좌석 변경 알림 제외: %s %s",
                     _session_line(session),
+                    current.suppression_reason,
                 )
                 if not self.dry_run:
                     self.state.set_seat_snapshot(key, current)
@@ -1325,13 +1394,14 @@ class Watcher:
 
         self.logger.info(
             "조회 완료: 성공 %d일, 오류 %d일, IMAX 회차 %d개, 신규 %d개, "
-            "좌석변경 %d개, 장애인석만 남아 제외 %d개",
+            "좌석변경 %d개, 장애인석만 남아 제외 %d개, A열만 남아 제외 %d개",
             len(payloads),
             len(errors),
             len(sessions),
             len(new_sessions),
             seat_changes,
             suppressed_accessible_only,
+            suppressed_row_a_only,
         )
         return CycleResult(
             successful_dates=len(payloads),
@@ -1340,6 +1410,7 @@ class Watcher:
             new_sessions=len(new_sessions),
             seat_changes=seat_changes,
             suppressed_accessible_only=suppressed_accessible_only,
+            suppressed_row_a_only=suppressed_row_a_only,
             seat_detail_errors=len(seat_detail_errors),
         )
 
