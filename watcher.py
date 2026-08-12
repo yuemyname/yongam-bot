@@ -151,6 +151,7 @@ class Config:
     imax_keywords: tuple[str, ...]
     imax_code_values: tuple[str, ...]
     strict_imax_match: bool
+    subscriptions_enabled: bool
     error_alert_cooldown_seconds: int
     state_file: Path
     log_file: Path
@@ -285,6 +286,10 @@ class Config:
             imax_code_values=code_values,
             strict_imax_match=_parse_bool(
                 value("STRICT_IMAX_MATCH", "true"), name="STRICT_IMAX_MATCH"
+            ),
+            subscriptions_enabled=_parse_bool(
+                value("SUBSCRIPTIONS_ENABLED", "true"),
+                name="SUBSCRIPTIONS_ENABLED",
             ),
             error_alert_cooldown_seconds=_parse_int(
                 value("ERROR_ALERT_COOLDOWN_SECONDS", "21600"),
@@ -820,11 +825,11 @@ class TelegramClient:
         self.timeout = timeout
         self.ssl_context = ssl.create_default_context()
 
-    def send_message(self, text: str) -> None:
+    def send_message(self, text: str, *, chat_id: str | None = None) -> None:
         endpoint = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         payload = json.dumps(
             {
-                "chat_id": self.chat_id,
+                "chat_id": chat_id or self.chat_id,
                 "text": text,
                 "disable_web_page_preview": True,
             },
@@ -863,14 +868,65 @@ class TelegramClient:
             description = str(parsed.get("description", "알 수 없는 오류"))[:180]
             raise TelegramError(f"Telegram 전송 실패: {description}")
 
+    def get_updates(self, *, offset: int) -> list[Mapping[str, Any]]:
+        endpoint = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
+        payload = json.dumps(
+            {
+                "offset": offset,
+                "timeout": 0,
+                "allowed_updates": ["message"],
+            }
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            endpoint,
+            data=payload,
+            method="POST",
+            headers={"Content-Type": "application/json", "User-Agent": APP_NAME},
+        )
+        try:
+            with urllib.request.urlopen(
+                request, timeout=self.timeout, context=self.ssl_context
+            ) as response:
+                body = response.read(2_000_000)
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                parsed_error = json.loads(exc.read(100_000).decode("utf-8"))
+                detail = str(parsed_error.get("description", ""))[:180]
+            except Exception:
+                pass
+            suffix = f" - {detail}" if detail else ""
+            raise TelegramError(
+                f"Telegram 구독 명령 조회 오류: HTTP {exc.code}{suffix}"
+            ) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            reason = str(getattr(exc, "reason", None) or exc)
+            reason = reason.replace(self.bot_token, "[숨김]")
+            raise TelegramError(f"Telegram 구독 명령 연결 실패: {reason[:180]}") from exc
+
+        try:
+            parsed = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise TelegramError("Telegram 구독 명령 응답을 해석할 수 없습니다.") from exc
+        if not parsed.get("ok"):
+            description = str(parsed.get("description", "알 수 없는 오류"))[:180]
+            raise TelegramError(f"Telegram 구독 명령 조회 실패: {description}")
+        updates = parsed.get("result", [])
+        if not isinstance(updates, list):
+            raise TelegramError("Telegram 구독 명령 응답 형식이 올바르지 않습니다.")
+        return [item for item in updates if isinstance(item, Mapping)]
+
 
 class StateStore:
     def __init__(self, path: Path):
         self.path = path
         self.data: dict[str, Any] = {
-            "version": 3,
+            "version": 4,
             "notified": {},
             "seat_counts": {},
+            "subscribers": {},
+            "subscribers_initialized": False,
+            "telegram_update_offset": 0,
             "last_error_fingerprint": "",
             "last_error_notified_at": "",
         }
@@ -888,9 +944,14 @@ class StateStore:
             raise RuntimeError(f"중복 방지 상태 파일 형식이 올바르지 않습니다: {self.path}")
         if not isinstance(loaded.get("seat_counts", {}), dict):
             raise RuntimeError(f"좌석 수 상태 파일 형식이 올바르지 않습니다: {self.path}")
+        if not isinstance(loaded.get("subscribers", {}), dict):
+            raise RuntimeError(f"구독자 상태 파일 형식이 올바르지 않습니다: {self.path}")
         self.data.update(loaded)
-        self.data["version"] = 3
+        self.data["version"] = 4
         self.data.setdefault("seat_counts", {})
+        self.data.setdefault("subscribers", {})
+        self.data.setdefault("subscribers_initialized", False)
+        self.data.setdefault("telegram_update_offset", 0)
 
     def was_notified(self, key: str) -> bool:
         return key in self.data["notified"]
@@ -904,6 +965,45 @@ class StateStore:
             "remaining_seats": session.remaining_seats,
             "total_seats": session.total_seats,
         }
+
+    @property
+    def subscribers_initialized(self) -> bool:
+        return bool(self.data.get("subscribers_initialized", False))
+
+    def initialize_subscribers(self, initial_chat_id: str) -> None:
+        if initial_chat_id:
+            self.add_subscriber(initial_chat_id, label="초기 관리자")
+        self.data["subscribers_initialized"] = True
+
+    def subscriber_ids(self) -> tuple[str, ...]:
+        return tuple(str(chat_id) for chat_id in self.data["subscribers"])
+
+    def is_subscribed(self, chat_id: str) -> bool:
+        return str(chat_id) in self.data["subscribers"]
+
+    def add_subscriber(
+        self, chat_id: str, *, label: str = "", chat_type: str = ""
+    ) -> bool:
+        key = str(chat_id)
+        if key in self.data["subscribers"]:
+            return False
+        self.data["subscribers"][key] = {
+            "subscribed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "label": label[:100],
+            "chat_type": chat_type[:30],
+        }
+        return True
+
+    def remove_subscriber(self, chat_id: str) -> bool:
+        return self.data["subscribers"].pop(str(chat_id), None) is not None
+
+    @property
+    def telegram_update_offset(self) -> int:
+        value = self.data.get("telegram_update_offset", 0)
+        return value if isinstance(value, int) and value >= 0 else 0
+
+    def set_telegram_update_offset(self, offset: int) -> None:
+        self.data["telegram_update_offset"] = max(0, int(offset))
 
     def seat_snapshot(self, key: str) -> SeatSnapshot | None:
         raw = self.data["seat_counts"].get(key)
@@ -1164,8 +1264,126 @@ class Watcher:
         )
         self.state = StateStore(config.state_file)
         self.state.load()
+        if not self.state.subscribers_initialized:
+            self.state.initialize_subscribers(config.telegram_chat_id)
+            if not self.dry_run:
+                self.state.save()
+
+    def _broadcast_message(self, text: str) -> tuple[int, int, int]:
+        subscriber_ids = self.state.subscriber_ids()
+        delivered = 0
+        failed = 0
+        for chat_id in subscriber_ids:
+            try:
+                self.telegram.send_message(text, chat_id=chat_id)
+            except TelegramError as exc:
+                failed += 1
+                self.logger.error("구독자 Telegram 전송 실패: %s", exc)
+            else:
+                delivered += 1
+        if not subscriber_ids:
+            self.logger.warning("등록된 Telegram 구독자가 없어 알림을 전송하지 않습니다.")
+        return delivered, failed, len(subscriber_ids)
+
+    def sync_subscribers(self) -> None:
+        """Apply Telegram /start and /stop commands to the persistent list."""
+
+        if self.dry_run or not self.config.subscriptions_enabled:
+            return
+        try:
+            updates = self.telegram.get_updates(
+                offset=self.state.telegram_update_offset
+            )
+        except TelegramError as exc:
+            self.logger.warning("%s", exc)
+            return
+
+        state_changed = False
+        for update in sorted(
+            updates,
+            key=lambda item: _nonnegative_int(item.get("update_id")) or 0,
+        ):
+            update_id = _nonnegative_int(update.get("update_id"))
+            if update_id is not None:
+                next_offset = update_id + 1
+                if next_offset > self.state.telegram_update_offset:
+                    self.state.set_telegram_update_offset(next_offset)
+                    state_changed = True
+
+            message = update.get("message")
+            if not isinstance(message, Mapping):
+                continue
+            chat = message.get("chat")
+            if not isinstance(chat, Mapping) or chat.get("id") is None:
+                continue
+            text = str(message.get("text") or "").strip()
+            if not text.startswith("/"):
+                continue
+
+            chat_id = str(chat["id"])
+            command = text.split(maxsplit=1)[0].lower().split("@", 1)[0]
+            label = str(
+                chat.get("title")
+                or chat.get("username")
+                or chat.get("first_name")
+                or ""
+            )
+            chat_type = str(chat.get("type") or "")
+            reply = ""
+
+            if command in {"/start", "/subscribe"}:
+                added = self.state.add_subscriber(
+                    chat_id, label=label, chat_type=chat_type
+                )
+                state_changed = state_changed or added
+                reply = (
+                    "✅ CGV 용산 IMAX 알림 구독이 완료되었습니다."
+                    if added
+                    else "✅ 이미 CGV 용산 IMAX 알림을 받고 있습니다."
+                )
+                reply += (
+                    "\n\n예매 오픈과 좌석 수 변경을 알려드릴게요."
+                    "\n알림 해지: /stop\n구독 상태: /status"
+                )
+            elif command in {"/stop", "/unsubscribe"}:
+                removed = self.state.remove_subscriber(chat_id)
+                state_changed = state_changed or removed
+                reply = (
+                    "🔕 알림 구독을 해지했습니다. 다시 받으려면 /start를 보내주세요."
+                    if removed
+                    else "현재 알림을 구독하고 있지 않습니다. 구독하려면 /start를 보내주세요."
+                )
+            elif command == "/status":
+                reply = (
+                    "✅ 현재 CGV 용산 IMAX 알림을 구독 중입니다."
+                    if self.state.is_subscribed(chat_id)
+                    else "🔕 현재 구독 중이 아닙니다. 알림을 받으려면 /start를 보내주세요."
+                )
+            elif command == "/help":
+                reply = (
+                    "🎬 CGV 용산 IMAX 알림 봇\n\n"
+                    "/start - 알림 구독\n"
+                    "/stop - 알림 해지\n"
+                    "/status - 구독 상태 확인\n"
+                    "/help - 사용법 보기"
+                )
+            else:
+                reply = "사용 가능한 명령어를 보려면 /help를 보내주세요."
+
+            try:
+                self.telegram.send_message(reply, chat_id=chat_id)
+            except TelegramError as exc:
+                self.logger.warning("Telegram 구독 명령 답장 실패: %s", exc)
+
+        if state_changed:
+            self.state.save()
+            self.logger.info(
+                "Telegram 구독 명령 처리 완료: 현재 구독자 %d명",
+                len(self.state.subscriber_ids()),
+            )
 
     def run_cycle(self) -> CycleResult:
+        self.sync_subscribers()
         dates = self.config.target_dates()
         payloads: dict[dt.date, Any] = {}
         errors: dict[dt.date, str] = {}
@@ -1289,10 +1507,8 @@ class Watcher:
                     self.logger.info("드라이런 회차: %s", _session_line(session))
             else:
                 for text, chunk_sessions in message_chunks(new_sessions, self.config):
-                    try:
-                        self.telegram.send_message(text)
-                    except TelegramError as exc:
-                        self.logger.error("%s", exc)
+                    delivered, failed, total = self._broadcast_message(text)
+                    if total and not delivered:
                         break
                     for session in chunk_sessions:
                         key = session.notification_key(
@@ -1300,7 +1516,12 @@ class Watcher:
                         )
                         self.state.mark_notified(key, session)
                         state_changed = True
-                    self.logger.info("Telegram 신규 회차 알림 %d개 전송", len(chunk_sessions))
+                    self.logger.info(
+                        "Telegram 신규 회차 알림 %d개 전송: 성공 %d명, 실패 %d명",
+                        len(chunk_sessions),
+                        delivered,
+                        failed,
+                    )
 
         seat_changes = 0
         for session in sessions:
@@ -1350,20 +1571,20 @@ class Watcher:
                     current.total,
                 )
                 continue
-            try:
-                self.telegram.send_message(
-                    seat_change_message(session, previous, current, self.config)
-                )
-            except TelegramError as exc:
-                self.logger.error("%s", exc)
-            else:
+            delivered, failed, total = self._broadcast_message(
+                seat_change_message(session, previous, current, self.config)
+            )
+            if delivered or total == 0:
                 self.state.set_seat_snapshot(key, current)
                 state_changed = True
                 self.logger.info(
-                    "Telegram 좌석 변경 알림 전송: %s (%d석 -> %d석)",
+                    "Telegram 좌석 변경 알림 전송: %s (%d석 -> %d석), "
+                    "성공 %d명, 실패 %d명",
                     _session_line(session),
                     previous.total,
                     current.total,
+                    delivered,
+                    failed,
                 )
 
         if errors:
@@ -1393,11 +1614,8 @@ class Watcher:
                     f"원인: {unique_errors[0]}\n"
                     "감시기는 계속 실행되며 다음 주기에 다시 시도합니다."
                 )
-                try:
-                    self.telegram.send_message(error_text)
-                except TelegramError as exc:
-                    self.logger.error("오류 알림도 전송하지 못했습니다: %s", exc)
-                else:
+                delivered, _failed, total = self._broadcast_message(error_text)
+                if delivered or total == 0:
                     self.state.mark_error_notified(fingerprint)
                     state_changed = True
         elif self.state.clear_error():
