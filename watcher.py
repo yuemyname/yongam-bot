@@ -34,6 +34,7 @@ DEFAULT_API_URL = "https://cgv.co.kr/api/v1/booking/searchSchByMov"
 DEFAULT_SEAT_API_URL = "https://cgv.co.kr/api/v1/booking/searchIfSeatData"
 DEFAULT_BOOKING_URL = "https://cgv.co.kr/cnm/movieBook/movie"
 DEFAULT_SEAT_PAGE_URL = "https://cgv.co.kr/cnm/selectVisitorCnt"
+DEFAULT_SITE_NAME = "용산아이파크몰"
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -888,6 +889,44 @@ def _session_line(session: BookingSession) -> str:
     return f"• {session.date} {session.start_time}{suffix}"
 
 
+def booking_url_for_session(session: BookingSession, config: Config) -> str:
+    """Build a CGV booking URL with movie, theater, and date preselected."""
+
+    split = urllib.parse.urlsplit(config.booking_url)
+    query = dict(urllib.parse.parse_qsl(split.query, keep_blank_values=True))
+    query.update(
+        {
+            "coCd": config.company_code,
+            "siteNo": config.site_no,
+            "siteNm": DEFAULT_SITE_NAME,
+            "movNo": config.movie_no,
+            "scnYmd": session.date.replace("-", ""),
+        }
+    )
+    return urllib.parse.urlunsplit(
+        (
+            split.scheme,
+            split.netloc,
+            split.path,
+            urllib.parse.urlencode(query),
+            split.fragment,
+        )
+    )
+
+
+def _booking_footer(
+    sessions: Sequence[BookingSession], config: Config
+) -> str:
+    links: dict[str, str] = {}
+    for session in sessions:
+        links.setdefault(session.date, booking_url_for_session(session, config))
+    lines = [
+        f"예매 바로가기 ({show_date}): {url}"
+        for show_date, url in links.items()
+    ]
+    return "\n\n" + "\n".join(lines)
+
+
 def _seat_snapshot_changed(previous: SeatSnapshot, current: SeatSnapshot) -> bool:
     if previous.total != current.total:
         return True
@@ -918,7 +957,7 @@ def seat_change_message(
         lines.append(f"일반 예매 가능: {previous.general}석 → {current.general}석")
     if current.accessible is not None:
         lines.append(f"장애인석: {current.accessible}석 (장애인석만 남으면 알림 제외)")
-    lines.extend(["", f"예매: {config.booking_url}"])
+    lines.extend(["", f"예매 바로가기: {booking_url_for_session(session, config)}"])
     return "\n".join(lines)
 
 
@@ -930,17 +969,26 @@ def message_chunks(
         f"영화: {config.movie_label} ({config.movie_no})\n"
         f"극장: 용산아이파크몰 ({config.site_no})\n\n"
     )
-    footer = f"\n\n예매: {config.booking_url}"
     chunks: list[tuple[str, list[BookingSession]]] = []
     current_lines: list[str] = []
     current_sessions: list[BookingSession] = []
 
     for session in sessions:
         line = _session_line(session)
-        candidate = header + "\n".join(current_lines + [line]) + footer
+        candidate_sessions = current_sessions + [session]
+        candidate = (
+            header
+            + "\n".join(current_lines + [line])
+            + _booking_footer(candidate_sessions, config)
+        )
         if current_lines and len(candidate) > max_chars:
             chunks.append(
-                (header + "\n".join(current_lines) + footer, list(current_sessions))
+                (
+                    header
+                    + "\n".join(current_lines)
+                    + _booking_footer(current_sessions, config),
+                    list(current_sessions),
+                )
             )
             current_lines = []
             current_sessions = []
@@ -948,7 +996,14 @@ def message_chunks(
         current_sessions.append(session)
 
     if current_lines:
-        chunks.append((header + "\n".join(current_lines) + footer, current_sessions))
+        chunks.append(
+            (
+                header
+                + "\n".join(current_lines)
+                + _booking_footer(current_sessions, config),
+                current_sessions,
+            )
+        )
     return chunks
 
 
