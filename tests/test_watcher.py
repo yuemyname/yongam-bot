@@ -357,7 +357,8 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(first.new_sessions, 1)
             self.assertEqual(second.new_sessions, 0)
             self.assertEqual(len(sent_messages), 1)
-            self.assertIn("일자: 2026-08-26", sent_messages[0])
+            self.assertIn("📅 상영일: 2026-08-26 (수)", sent_messages[0])
+            self.assertIn("━━━━━━━━━━━━━━━━━━━━", sent_messages[0])
             self.assertIn(
                 "상영 시작시간 14:30 — 잔여좌석/총좌석: 100/624석",
                 sent_messages[0],
@@ -406,6 +407,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertIn(
                 "잔여좌석/총좌석: 9/200석 (이전 10/200석)", sent_messages[1]
             )
+            self.assertIn("📅 상영일: 2026-08-26 (수)", sent_messages[1])
 
     def test_suppresses_change_when_only_accessible_seats_remain(self):
         with tempfile.TemporaryDirectory() as temporary:
