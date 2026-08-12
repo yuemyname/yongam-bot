@@ -509,6 +509,45 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertFalse(reloaded.is_subscribed("111222"))
             self.assertTrue(reloaded.is_subscribed(config.telegram_chat_id))
 
+    def test_desc_command_explains_bot_and_usage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = dataclasses.replace(
+                make_config(Path(temporary)), subscriptions_enabled=True
+            )
+            logger = logging.getLogger(f"watcher-desc-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            replies = []
+            watcher.telegram.get_updates = lambda **_kwargs: [
+                {
+                    "update_id": 20,
+                    "message": {
+                        "text": "/desc@YongsanBot",
+                        "chat": {
+                            "id": 111222,
+                            "type": "private",
+                            "first_name": "구독자",
+                        },
+                    },
+                }
+            ]
+            watcher.telegram.send_message = (
+                lambda text, **kwargs: replies.append((kwargs.get("chat_id"), text))
+            )
+
+            watcher.sync_subscribers()
+
+            self.assertEqual(replies[0][0], "111222")
+            description = replies[0][1]
+            self.assertIn("CGV 용산아이파크몰 IMAX", description)
+            self.assertIn("오디세이 예매 오픈", description)
+            self.assertIn("오늘부터 28일", description)
+            self.assertIn("장애인석만 남은 경우", description)
+            self.assertIn("A열만 남은 경우", description)
+            self.assertIn("/start — 알림 구독", description)
+            self.assertIn("예매 바로가기 링크 열기", description)
+            self.assertIn("/stop — 알림 해지", description)
+
     def test_successful_send_is_persisted_and_not_repeated(self):
         with tempfile.TemporaryDirectory() as temporary:
             project_dir = Path(temporary)
