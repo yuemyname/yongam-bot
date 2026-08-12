@@ -622,6 +622,22 @@ class SeatSnapshot:
     available_rows: tuple[str, ...] | None = None
 
     @property
+    def seat_map_complete(self) -> bool:
+        """Whether the detail response can safely classify an alert.
+
+        Counts must agree with the schedule, and row labels are required when
+        at least one general seat remains so A-row-only availability can be
+        excluded without guessing.
+        """
+        return (
+            self.total > 0
+            and self.general is not None
+            and self.accessible is not None
+            and self.mapped_total == self.total
+            and (self.general == 0 or self.available_rows is not None)
+        )
+
+    @property
     def accessible_only(self) -> bool:
         # Suppress only when the seat-map count exactly agrees with the total
         # shown in CGV's schedule.  A partial/changed response must not hide an
@@ -655,6 +671,10 @@ class SeatSnapshot:
     @property
     def should_suppress(self) -> bool:
         return self.suppression_reason is not None
+
+    @property
+    def alertable(self) -> bool:
+        return self.seat_map_complete and not self.should_suppress
 
 
 def _normalize_seat_row(value: Any) -> str:
@@ -1242,6 +1262,8 @@ class CycleResult:
     seat_changes: int = 0
     suppressed_accessible_only: int = 0
     suppressed_row_a_only: int = 0
+    suppressed_sold_out: int = 0
+    deferred_seat_details: int = 0
     seat_detail_errors: int = 0
 
 
@@ -1431,9 +1453,33 @@ class Watcher:
 
         snapshots: dict[str, SeatSnapshot] = {}
         seat_detail_errors: dict[str, str] = {}
-        seat_candidates = [
-            session for session in sessions if session.remaining_seats is not None
-        ]
+        seat_candidates: list[BookingSession] = []
+        for session in sessions:
+            key = session_keys[session]
+            remaining = session.remaining_seats
+            if remaining is None:
+                continue
+            if remaining == 0:
+                snapshots[key] = SeatSnapshot(total=0)
+                continue
+
+            previous = previous_snapshots.get(key)
+            needs_detail = (
+                previous is None
+                or previous.total != remaining
+                or (
+                    key not in previously_notified
+                    and not previous.seat_map_complete
+                )
+            )
+            if needs_detail:
+                seat_candidates.append(session)
+            else:
+                # The schedule total did not change, so the saved complete map
+                # remains sufficient. Avoid requesting every open show each
+                # minute, which can trigger CGV's HTTP 429 rate limit.
+                snapshots[key] = previous
+
         if seat_candidates:
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=min(self.config.max_workers, len(seat_candidates))
@@ -1449,16 +1495,15 @@ class Watcher:
                         snapshots[key] = future.result()
                     except FetchError as exc:
                         seat_detail_errors[key] = str(exc)
-                        snapshots[key] = SeatSnapshot(total=session.remaining_seats or 0)
                     except Exception as exc:
                         seat_detail_errors[key] = (
                             f"예상하지 못한 좌석 조회 오류: {type(exc).__name__}"
                         )
-                        snapshots[key] = SeatSnapshot(total=session.remaining_seats or 0)
 
         if seat_detail_errors:
             self.logger.warning(
-                "좌석 상세 조회 오류 %d개: %s (전체 잔여 수 변경 감시는 계속)",
+                "좌석 상세 조회 오류 %d개: %s "
+                "(해당 회차 알림을 보류하고 다음 주기에 재확인)",
                 len(seat_detail_errors),
                 next(iter(seat_detail_errors.values())),
             )
@@ -1470,19 +1515,41 @@ class Watcher:
                 session_keys[session]
             )
         ]
+        sold_out_new_sessions = [
+            session
+            for session in detected_new_sessions
+            if snapshots.get(session_keys[session]) is not None
+            and snapshots[session_keys[session]].total == 0
+        ]
         suppressed_new_sessions = [
             session
             for session in detected_new_sessions
             if snapshots.get(session_keys[session]) is not None
+            and snapshots[session_keys[session]].total > 0
             and snapshots[session_keys[session]].should_suppress
+        ]
+        deferred_new_sessions = [
+            session
+            for session in detected_new_sessions
+            if session not in sold_out_new_sessions
+            and session not in suppressed_new_sessions
+            and (
+                snapshots.get(session_keys[session]) is None
+                or not snapshots[session_keys[session]].seat_map_complete
+            )
         ]
         new_sessions = [
             session
             for session in detected_new_sessions
-            if session not in suppressed_new_sessions
+            if snapshots.get(session_keys[session]) is not None
+            and snapshots[session_keys[session]].alertable
         ]
 
         state_changed = False
+        suppressed_sold_out = len(sold_out_new_sessions)
+        deferred_seat_detail_keys = {
+            session_keys[session] for session in deferred_new_sessions
+        }
         suppressed_accessible_only = sum(
             snapshots[session_keys[session]].accessible_only
             for session in suppressed_new_sessions
@@ -1498,6 +1565,17 @@ class Watcher:
                 "알림 제외: %s %s",
                 _session_line(session),
                 snapshot.suppression_reason,
+            )
+
+        if sold_out_new_sessions:
+            self.logger.info(
+                "알림 제외: 잔여 0석인 신규 회차 %d개",
+                len(sold_out_new_sessions),
+            )
+        if deferred_new_sessions:
+            self.logger.info(
+                "알림 보류: 좌석 종류/A열 판별 대기 중인 신규 회차 %d개",
+                len(deferred_new_sessions),
             )
 
         if new_sessions:
@@ -1538,6 +1616,17 @@ class Watcher:
             if not _seat_snapshot_changed(previous, current):
                 continue
 
+            if current.total == 0:
+                suppressed_sold_out += 1
+                self.logger.info(
+                    "좌석 변경 알림 제외: %s 잔여 좌석이 0석입니다.",
+                    _session_line(session),
+                )
+                if not self.dry_run:
+                    self.state.set_seat_snapshot(key, current)
+                    state_changed = True
+                continue
+
             if current.should_suppress:
                 if current.accessible_only:
                     suppressed_accessible_only += 1
@@ -1551,6 +1640,14 @@ class Watcher:
                 if not self.dry_run:
                     self.state.set_seat_snapshot(key, current)
                     state_changed = True
+                continue
+
+            if not current.seat_map_complete:
+                deferred_seat_detail_keys.add(key)
+                self.logger.info(
+                    "좌석 변경 알림 보류: %s 좌석 종류/A열을 완전히 판별할 수 없습니다.",
+                    _session_line(session),
+                )
                 continue
 
             # A session not notified before this cycle receives the booking-open
@@ -1626,7 +1723,8 @@ class Watcher:
 
         self.logger.info(
             "조회 완료: 성공 %d일, 오류 %d일, IMAX 회차 %d개, 신규 %d개, "
-            "좌석변경 %d개, 장애인석만 남아 제외 %d개, A열만 남아 제외 %d개",
+            "좌석변경 %d개, 장애인석만 남아 제외 %d개, A열만 남아 제외 %d개, "
+            "0석 제외 %d개, 좌석판별 대기 %d개",
             len(payloads),
             len(errors),
             len(sessions),
@@ -1634,6 +1732,8 @@ class Watcher:
             seat_changes,
             suppressed_accessible_only,
             suppressed_row_a_only,
+            suppressed_sold_out,
+            len(deferred_seat_detail_keys),
         )
         return CycleResult(
             successful_dates=len(payloads),
@@ -1643,6 +1743,8 @@ class Watcher:
             seat_changes=seat_changes,
             suppressed_accessible_only=suppressed_accessible_only,
             suppressed_row_a_only=suppressed_row_a_only,
+            suppressed_sold_out=suppressed_sold_out,
+            deferred_seat_details=len(deferred_seat_detail_keys),
             seat_detail_errors=len(seat_detail_errors),
         )
 
