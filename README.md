@@ -1,140 +1,35 @@
-# CGV 용산 IMAX 예매 오픈 Telegram 알리미
+# CGV 용산 IMAX Telegram 알림 봇
 
-CGV 공개 상영일정·좌석 조회 API를 **1분마다** 확인합니다. 아래 조건의 IMAX 회차가 나타나면 Telegram으로 날짜와 시작시간을 즉시 알리고, 이후 잔여 좌석 수가 바뀔 때도 알려줍니다.
+CGV 용산아이파크몰 IMAX의 예매 오픈과 잔여 좌석 변화를 Telegram으로 알려주는 비공식 알림 봇입니다.
 
-- 극장: CGV 용산아이파크몰 (`siteNo=0013`)
 - 영화: 오디세이 (`movNo=30001323`)
-- 날짜: 한국시간 기준 오늘을 포함한 28일(4주), 매일 자동 갱신
-- 포맷: 응답의 `IMAX`/`아이맥스` 표기 또는 특수관 코드 `08`
-- 좌석 변경: 전체 잔여 수 또는 일반 예매 가능 좌석 수가 바뀔 때 알림
-- 제외 조건: 공개 좌석표에서 예매 가능한 좌석이 장애인석뿐이거나 모두 A열인 경우 알림하지 않음
-- CGV 로그인 토큰, `accessToken`, 쿠키: **사용하지 않음**
+- 극장: CGV 용산아이파크몰 (`siteNo=0013`)
+- 감시 기간: 한국시간 기준 오늘을 포함한 28일(4주)
+- 확인 주기: 1분
+- CGV 로그인·쿠키: 사용하지 않음
 
-알림을 보낸 회차와 마지막 좌석 수는 로컬의 `data/notified.json` 또는 Railway 영구 볼륨에 저장됩니다. 프로그램을 다시 시작해도 같은 예매 오픈이나 같은 좌석 수를 중복 알림하지 않습니다. 알림의 예매 링크에는 영화·용산아이파크몰·해당 상영일이 미리 설정됩니다.
+## 알림 받는 방법
 
-> 중요: 이 도구는 CGV가 웹 예매 화면에서 사용하는 비로그인 조회 주소를 이용합니다. CGV가 API 형식이나 접속 제한 정책을 바꾸면 조회가 실패할 수 있습니다. 이때 프로그램은 이를 “아직 미오픈”으로 처리하지 않고 Telegram 오류 알림과 `logs/watcher.log`에 남긴 뒤 계속 재시도합니다. 1분 간격은 접속 제한 위험이 있으므로 더 짧게 설정하지 마세요.
+1. Telegram에서 운영자가 알려준 봇을 엽니다.
+2. **시작** 버튼을 누르거나 `/start`를 보냅니다.
+3. `✅ CGV 용산 IMAX 알림 구독이 완료되었습니다.`라는 답장이 오면 등록 완료입니다.
 
-## Railway와 Vercel 중 무엇이 적합한가요?
+봇은 1분마다 새 명령을 확인하므로 답장이 오는 데 최대 약 1분이 걸릴 수 있습니다.
 
-이 프로젝트에는 **Railway를 권장합니다.**
+| 명령어 | 기능 |
+|---|---|
+| `/start` | 알림 구독 |
+| `/stop` | 알림 해지 |
+| `/status` | 현재 구독 상태 확인 |
+| `/help` | 사용 가능한 명령어 확인 |
 
-| 항목 | Railway | Vercel |
-|---|---|---|
-| 실행 방식 | 계속 실행되는 백그라운드 서비스 | 요청이 올 때만 실행되는 함수/Cron |
-| 1분 감시 | 프로그램 내부에서 바로 가능 | 1분 Cron은 Pro 이상 필요 |
-| 중복 알림 상태 | `/data` 영구 볼륨에 저장 | 별도 데이터베이스/KV 필요 |
-| 중복 실행 | 단일 서비스로 단순하게 관리 | Cron 중복·겹침에 대비한 잠금 필요 |
-| 이 프로젝트와의 적합성 | **권장** | 비권장 |
+그룹에서 알림을 받으려면 봇을 그룹에 추가한 뒤 그룹 안에서 `/start`를 보내세요. 그룹에서 명령어가 `/start@봇이름`으로 표시되어도 정상 처리됩니다.
 
-Railway는 장기 실행 백그라운드 작업과 [영구 볼륨](https://docs.railway.com/volumes)을 지원합니다. 반면 Vercel Hobby의 Cron은 공식 제한상 하루 한 번만 실행할 수 있고, 1분 Cron은 Pro 이상에서 가능합니다. 자세한 내용은 [Vercel Cron 사용량 문서](https://vercel.com/docs/cron-jobs/usage-and-pricing)를 참고하세요.
+## 어떤 알림이 오나요?
 
-## Railway에 배포하기
+### 예매 오픈 알림
 
-저장소: [yuemyname/yongam-bot](https://github.com/yuemyname/yongam-bot)
-
-1. [Railway](https://railway.com/)에 로그인합니다.
-2. **New Project → Deploy from GitHub repo**를 선택합니다.
-3. `yuemyname/yongam-bot` 저장소를 선택합니다.
-4. 생성된 서비스에 Volume을 추가하고 Mount Path를 `/data`로 설정합니다.
-5. 서비스의 **Variables** 탭에 아래 두 값을 추가합니다.
-
-```dotenv
-TELEGRAM_BOT_TOKEN=BotFather가_준_실제_토큰
-TELEGRAM_CHAT_ID=find_chat_id에서_확인한_숫자
-```
-
-6. 변경사항을 배포합니다. 로그에 `CGV Telegram Watcher 시작`이 나타나면 실행 중입니다.
-
-`railway.toml`이 Python 실행 명령, 단일 인스턴스, 오류 시 재시작, `/data` 볼륨 요구사항을 설정합니다. Railway가 제공하는 `RAILWAY_VOLUME_MOUNT_PATH`를 프로그램이 자동 감지하므로 `STATE_DIR`을 따로 설정할 필요는 없습니다. 이 프로그램은 백그라운드 작업이므로 공개 도메인이나 웹 포트도 필요하지 않습니다.
-
-처음 GitHub 저장소를 연결하면 Variables와 Volume을 만들기 전에 첫 배포가 실패할 수 있습니다. 두 설정을 추가한 뒤 다시 배포하면 됩니다. `.env` 파일이나 실제 Bot Token은 GitHub에 올리지 마세요.
-
-> Railway 같은 클라우드 서버 IP도 CGV의 HTTP 403 차단을 받을 수 있습니다. 배포 후 반드시 로그를 확인하세요. 차단이 지속되면 `POLL_INTERVAL_SECONDS=120`으로 늘리거나 다른 실행 환경이 필요할 수 있습니다.
-
----
-
-아래 내용은 Mac에서 직접 실행할 때의 안내입니다.
-
-## Mac 1. 준비물
-
-- macOS
-- 인터넷 연결
-- Python 3.10 이상
-- Telegram 계정
-
-Terminal에서 다음 명령으로 Python을 확인할 수 있습니다.
-
-```bash
-python3 --version
-```
-
-명령을 찾을 수 없다면 [Python macOS 다운로드](https://www.python.org/downloads/macos/)에서 Python 3를 설치하세요. 별도 Python 패키지 설치는 필요 없습니다.
-
-## Mac 2. BotFather로 Telegram 봇 만들기
-
-1. Telegram에서 공식 계정 **@BotFather**를 검색합니다.
-2. 채팅에서 `/newbot`을 보냅니다.
-3. 안내에 따라 봇 이름과 `bot`으로 끝나는 사용자 이름을 정합니다.
-4. BotFather가 보내 준 **HTTP API Token**을 복사합니다. 이 값은 비밀번호처럼 다루고 다른 사람에게 보내지 마세요.
-5. 방금 만든 봇의 채팅을 열어 **시작**을 누르거나 `/start`를 보냅니다.
-
-## Mac 3. chat_id 확인하기
-
-가장 쉬운 방법은 다음과 같습니다.
-
-1. 만든 봇에게 `/start`를 보냅니다.
-2. 이 폴더의 `find_chat_id.command`를 더블 클릭합니다.
-3. Bot Token을 붙여 넣고 Enter를 누릅니다. 입력 중에는 토큰이 화면에 표시되지 않습니다.
-4. 출력된 숫자를 복사합니다. 개인 채팅은 보통 양수, 그룹 채팅은 보통 음수입니다.
-
-결과가 없다면 봇에게 메시지를 한 번 더 보낸 후 다시 실행하세요. 그룹으로 알림을 받으려면 봇을 그룹에 추가하고 그룹에서 메시지를 보낸 뒤 그룹의 음수 `chat_id`를 사용합니다.
-
-직접 확인하려면 Bot API의 `getUpdates` 응답 안에서 `"chat":{"id": ...}` 값을 찾아도 됩니다.
-
-## Mac 4. 설정하기
-
-1. `setup.command`를 더블 클릭합니다.
-2. 자동으로 열린 `.env` 파일에서 아래 두 줄을 실제 값으로 바꿉니다.
-3. TextEdit에서 저장합니다.
-
-```dotenv
-TELEGRAM_BOT_TOKEN=123456789:실제_봇_토큰
-TELEGRAM_CHAT_ID=123456789
-```
-
-나머지 대상 값은 이미 요청한 조건으로 설정되어 있습니다. `.env`는 ZIP과 Git에서 제외되며, 토큰은 코드나 로그에 기록되지 않습니다.
-
-macOS에서 “확인되지 않은 개발자” 경고가 나오면 파일을 Control-클릭 → **열기**를 선택하세요.
-
-## Mac 5. Telegram 연결 시험
-
-`test_telegram.command`를 더블 클릭합니다. Telegram에 다음과 같은 테스트 메시지가 오면 설정이 올바릅니다.
-
-```text
-✅ CGV 감시기 Telegram 연결 테스트 성공
-대상: 오디세이 / 용산아이파크몰 IMAX
-```
-
-## Mac 6. 실행하기
-
-### 간단 실행
-
-`run.command`를 더블 클릭합니다. 열린 Terminal 창을 유지하는 동안 1분마다 확인합니다. 중단하려면 Terminal 창에서 `Control+C`를 누릅니다.
-
-Mac이 잠자기 상태이거나 꺼져 있거나 인터넷 연결이 없으면 확인할 수 없습니다. 덮개를 닫은 노트북도 보통 잠자기 상태가 됩니다.
-
-### Mac 로그인 후 백그라운드 자동 실행
-
-설정과 Telegram 테스트를 마친 후 `install_background.command`를 더블 클릭합니다.
-
-- 설치 즉시 백그라운드 감시 시작
-- Mac 로그인 시 자동 시작
-- 실행 로그: `logs/watcher.log`
-- 감시 날짜가 매일 자동으로 이동하므로 백그라운드에서 계속 실행
-
-백그라운드 실행을 중단하고 자동 시작을 제거하려면 `uninstall_background.command`를 더블 클릭합니다. 자동 시작 설정은 바로 삭제하지 않고 Mac의 휴지통으로 옮깁니다. `.env`, 알림 기록, 로그는 그대로 남습니다.
-
-## 알림 예시
+새 IMAX 상영 회차가 열리면 날짜별로 모아서 알려줍니다.
 
 ```text
 🎟️ CGV 예매 오픈 감지
@@ -147,95 +42,158 @@ Mac이 잠자기 상태이거나 꺼져 있거나 인터넷 연결이 없으면 
 • 상영 시작시간 14:30 — 620/624석
 • 상영 시작시간 18:00 — 598/624석
 
-예매 바로가기: https://cgv.co.kr/cnm/movieBook/movie?...&scnYmd=20260826
+예매 바로가기: https://cgv.co.kr/cnm/movieBook/movie?...
 ```
 
-한 번에 여러 회차가 열리면 한 메시지에 묶어 보냅니다. Telegram 전송이 성공한 회차만 중복 방지 파일에 기록하므로, 전송 실패 때문에 알림이 영구 누락되지 않습니다.
+### 잔여 좌석 변경 알림
 
-좌석 수가 바뀌면 다음과 같이 별도 메시지가 옵니다.
+이미 열린 회차의 전체 잔여 좌석 수 또는 일반 예매 가능 좌석 수가 바뀌면 알려줍니다.
 
 ```text
 💺 CGV 잔여 좌석 변경
 영화: 오디세이 (30001323)
 극장: 용산아이파크몰 (0013)
+
 ━━━━━━━━━━━━━━━━━━━━
 📅 상영일: 2026-08-26 (수)
 ━━━━━━━━━━━━━━━━━━━━
 상영 시작시간: 18:00
 잔여좌석/총좌석: 597/624석 (이전 598/624석)
 일반 예매 가능: 140석 → 139석
-장애인석: 2석 (장애인석만 남거나 전체 잔여석이 A열이면 알림 제외)
+장애인석: 2석
 
-예매 바로가기: https://cgv.co.kr/cnm/movieBook/movie?...&scnYmd=20260826
+예매 바로가기: https://cgv.co.kr/cnm/movieBook/movie?...
 ```
 
-CGV 좌석표에서 예매 가능 상태(`seatStusCd=00`)를 세고, CGV가 장애인석으로 표시하는 코드(`seatSalfrmCd=04`)와 좌석 열(`seatRowNm`)을 확인합니다. 좌석표 응답과 상영일정의 전체 잔여 수가 정확히 일치하고 모든 잔여 좌석의 열 정보가 있을 때만 “장애인석만 남음” 또는 “A열만 남음”으로 판단하므로, 좌석 상세 응답이 불완전할 때 알림을 잘못 숨기지 않습니다.
+## 알림하지 않는 경우
 
-## 설정값 설명
+공개 좌석표에서 다음 상태가 확실하게 확인되면 알림을 보내지 않습니다.
+
+- 예매 가능한 좌석이 장애인석뿐인 경우
+- 예매 가능한 좌석이 모두 A열인 경우
+- 좌석 수가 이전 확인과 동일한 경우
+
+좌석표의 좌석 수와 상영일정의 잔여 수가 정확히 일치하고 모든 좌석의 열 정보가 있을 때만 제외합니다. CGV 좌석 상세 조회가 불완전하면 A열 또는 장애인석뿐이라고 추측해서 알림을 숨기지 않습니다.
+
+## 예매 링크 사용법
+
+알림의 링크에는 오디세이, 용산아이파크몰, 해당 상영일이 설정됩니다.
+
+CGV 예매 화면은 IMAX 필터 선택 상태를 링크로 전달하지 않으므로, 화면이 열리면 상단의 **IMAX** 버튼을 한 번 눌러주세요. 봇이 감지하고 알리는 회차 자체는 IMAX 조건으로만 선별됩니다.
+
+## 자주 묻는 질문
+
+### `/start`를 보냈는데 답장이 없어요
+
+- 최대 1분 정도 기다려 보세요.
+- 봇을 차단하지 않았는지 확인하세요.
+- 개인 채팅에서는 Telegram의 **시작** 버튼도 눌러 보세요.
+- 계속 답장이 없다면 운영자에게 Railway 실행 상태를 확인해 달라고 요청하세요.
+
+### 구독 전에 이미 열린 회차도 다시 알려주나요?
+
+이미 전체 구독자에게 알린 예매 오픈을 새 구독자에게 다시 보내지는 않습니다. 구독한 뒤 발생하는 새 회차와 좌석 변화부터 받을 수 있습니다.
+
+### Mac을 꺼도 알림이 오나요?
+
+Railway에 배포된 봇은 Mac과 관계없이 계속 실행됩니다. Mac에서만 직접 실행한 경우에는 Mac이 켜져 있고 잠자기 상태가 아니어야 합니다.
+
+### 공식 CGV 봇인가요?
+
+아닙니다. CGV 공개 상영일정·좌석 조회 기능을 이용하는 개인 제작 비공식 봇입니다. CGV가 API 또는 접속 정책을 바꾸면 조회가 일시적으로 실패할 수 있습니다.
+
+## 개인정보
+
+구독 기능은 알림 전송에 필요한 Telegram `chat_id`, 채팅 유형, 표시 이름과 구독 시각만 Railway 영구 볼륨에 저장합니다. Telegram Bot Token은 Railway 비밀 환경변수에만 저장하며 메시지나 GitHub 저장소에 기록하지 않습니다. CGV 로그인 정보와 쿠키는 요구하거나 저장하지 않습니다.
+
+---
+
+## 운영자 안내
+
+아래 내용은 봇을 설치하고 운영하는 사람을 위한 안내입니다.
+
+### BotFather 설정
+
+1. Telegram에서 `@BotFather`에게 `/newbot`을 보내 봇을 만듭니다.
+2. 발급된 HTTP API Token을 안전하게 보관합니다.
+3. `/setcommands`를 실행하고 아래 명령어를 등록합니다.
+
+```text
+start - 알림 구독
+stop - 알림 해지
+status - 구독 상태 확인
+help - 사용법 보기
+```
+
+BotFather의 `/setdescription`에는 저장소에서 제공하는 한글·영문 소개문을 등록할 수 있습니다.
+
+### Railway 배포
+
+저장소: [yuemyname/yongam-bot](https://github.com/yuemyname/yongam-bot)
+
+1. Railway에서 **New Project → Deploy from GitHub repo**를 선택합니다.
+2. `yuemyname/yongam-bot` 저장소를 연결합니다.
+3. Volume을 추가하고 Mount Path를 `/data`로 설정합니다.
+4. 서비스의 **Variables**에 다음 값을 등록합니다.
+
+```dotenv
+TELEGRAM_BOT_TOKEN=BotFather가_준_실제_토큰
+TELEGRAM_CHAT_ID=운영자_chat_id
+SUBSCRIPTIONS_ENABLED=true
+```
+
+`TELEGRAM_CHAT_ID`는 최초 운영자를 기존 알림 구독자로 한 번 등록하는 데 사용됩니다. 이후 일반 사용자는 자신의 채팅에서 `/start`만 보내면 자동 등록됩니다. `/stop`으로 해지한 운영자는 재배포 후에도 자동으로 다시 등록되지 않습니다.
+
+구독자 목록, 처리한 Telegram 명령 위치, 기존 예매 알림 기록과 좌석 수는 `/data/notified.json`에 저장됩니다. Railway가 재시작되거나 새 버전을 배포해도 유지됩니다.
+
+> Telegram에 webhook이 설정된 봇은 `getUpdates` 방식과 동시에 사용할 수 없습니다. 이 프로젝트 전용 봇에는 별도 webhook을 설정하지 마세요.
+
+### Railway 로그 확인
+
+정상 실행 시 다음과 비슷한 내용이 표시됩니다.
+
+```text
+CGV Telegram Watcher 시작: ... 60초 간격
+Telegram 구독 명령 처리 완료: 현재 구독자 3명
+조회 완료: 성공 28일, 오류 0일, ...
+```
+
+`HTTP 429`는 CGV가 좌석 상세 요청을 일시적으로 제한한 상태입니다. 이때 봇은 확인되지 않은 좌석을 A열 또는 장애인석뿐이라고 판단하지 않고 다음 주기에 다시 조회합니다. 제한이 계속되면 `POLL_INTERVAL_SECONDS=120`으로 늘릴 수 있습니다.
+
+### Mac에서 직접 실행
+
+1. `setup.command`를 실행해 `.env`를 만듭니다.
+2. `TELEGRAM_BOT_TOKEN`과 최초 운영자의 `TELEGRAM_CHAT_ID`를 입력합니다.
+3. `test_telegram.command`로 Telegram 전송을 시험합니다.
+4. `run.command`를 실행하거나 `install_background.command`로 로그인 시 자동 실행을 설치합니다.
+
+Mac이 잠자기 상태이거나 덮개가 닫혀 있으면 감시가 중단될 수 있으므로 여러 구독자가 사용하는 봇은 Railway 운영을 권장합니다.
+
+### 주요 설정값
 
 | 이름 | 기본값 | 설명 |
 |---|---:|---|
-| `POLL_INTERVAL_SECONDS` | `60` | 조회 주기(초), 최소 30초 |
-| `REQUEST_TIMEOUT_SECONDS` | `15` | 날짜별 CGV 요청 제한시간 |
-| `MAX_WORKERS` | `4` | 28개 날짜를 나눠 조회하는 동시 요청 수 |
-| `DYNAMIC_DATE_WINDOW` | `true` | 오늘 기준 감시 범위를 매일 자동 갱신 |
-| `TARGET_WINDOW_DAYS` | `28` | 오늘을 포함해 감시할 날짜 수(4주) |
-| `APP_TIMEZONE` | `Asia/Seoul` | 오늘 날짜를 계산할 기준 시간대 |
-| `STRICT_IMAX_MATCH` | `true` | `IMAX` 이름/코드가 있는 회차만 알림 |
-| `ERROR_ALERT_COOLDOWN_SECONDS` | `21600` | 같은 CGV 오류 알림 재전송 간격(6시간) |
-| `CGV_SEAT_API_URL` | 공개 좌석 조회 주소 | 보통 수정하지 않음 |
+| `SUBSCRIPTIONS_ENABLED` | `true` | `/start`, `/stop` 자동 구독 기능 |
+| `POLL_INTERVAL_SECONDS` | `60` | CGV 조회 및 Telegram 명령 확인 주기 |
+| `DYNAMIC_DATE_WINDOW` | `true` | 오늘 기준 감시 범위를 매일 이동 |
+| `TARGET_WINDOW_DAYS` | `28` | 오늘을 포함해 감시할 날짜 수 |
+| `APP_TIMEZONE` | `Asia/Seoul` | 날짜 계산 기준 시간대 |
+| `STRICT_IMAX_MATCH` | `true` | IMAX 이름 또는 코드가 있는 회차만 감지 |
+| `MAX_WORKERS` | `4` | 날짜별 조회 동시 작업 수 |
 
-CGV가 일정 응답에서 포맷 이름과 특수관 코드를 모두 생략해 실제 IMAX 회차가 누락되는 경우에만 `STRICT_IMAX_MATCH=false`로 바꾸세요. 이 설정은 API가 반환한 해당 영화 회차 전체를 IMAX 후보로 취급하므로 일반관 회차가 함께 알림될 수 있습니다.
+### 개발 및 테스트
 
-## Terminal에서 직접 확인하기
-
-프로젝트 폴더에서 다음 명령을 사용할 수 있습니다.
+별도 Python 패키지 설치 없이 Python 3.10 이상에서 실행됩니다.
 
 ```bash
-# 한 번 조회하고 실제 신규 회차가 있으면 알림
+# 한 번 조회
 python3 watcher.py --once
 
-# Telegram 전송과 중복 방지 저장 없이 한 번 조회
+# Telegram 전송과 상태 저장 없이 확인
 python3 watcher.py --once --dry-run
 
-# Telegram 연결 시험
-python3 watcher.py --test-telegram
-
-# 단위 테스트
+# 자동 테스트
 python3 -m unittest discover -s tests -v
 ```
 
-`--dry-run`은 `.env`의 Telegram 값이 비어 있어도 실행됩니다.
-
-## 문제 해결
-
-### Telegram 메시지가 오지 않음
-
-- 봇과의 채팅에서 `/start`를 먼저 보냈는지 확인하세요.
-- `test_telegram.command`를 실행하세요.
-- `.env`의 Token과 Chat ID 앞뒤에 공백이 없는지 확인하세요.
-- 그룹 Chat ID는 음수일 수 있습니다.
-
-### CGV 조회 오류 또는 HTTP 403
-
-CGV의 자동 접속 차단입니다. 프로그램 오류가 아니라 CGV 측 제한일 수 있습니다.
-
-- 잠시 기다린 후 자동 재시도를 확인합니다.
-- VPN/프록시를 끄거나 다른 네트워크를 사용해 봅니다.
-- `POLL_INTERVAL_SECONDS`를 `120` 이상으로 늘리면 제한 위험을 줄일 수 있습니다.
-- `logs/watcher.log`에서 최근 오류를 확인합니다.
-
-CGV 오류가 난 날짜는 “미오픈”으로 확정하지 않으며, 다음 주기에 다시 확인합니다.
-
-좌석 상세 조회만 실패하면 전체 잔여 수 변경 감시는 계속됩니다. 이때는 장애인석만 남았는지 확정할 수 없어 해당 필터를 적용하지 않으며, Railway 또는 `logs/watcher.log`에 `좌석 상세 조회 오류`가 표시됩니다.
-
-### 같은 회차를 다시 알리고 싶음
-
-감시기를 먼저 중지한 뒤 `data/notified.json`을 별도 위치에 백업하고, 파일 안의 해당 회차 항목만 제거하세요. 파일 전체를 지우면 이미 열린 모든 회차를 다시 알릴 수 있습니다.
-
-## 개인정보와 보안
-
-- CGV 로그인 정보, 로그인 토큰, 로그인 쿠키를 요구하거나 전송하지 않습니다.
-- Telegram Bot Token은 로컬 `.env` 또는 Railway 비밀 환경변수에서만 읽습니다.
-- `.env`는 로그와 중복 방지 파일에 복사되지 않습니다.
-- Bot Token이 노출되었다면 BotFather의 `/revoke`로 즉시 폐기하고 새 토큰을 발급하세요.
+실제 `.env`, Bot Token, 구독자 상태 파일과 로그는 Git에 포함하지 마세요.
