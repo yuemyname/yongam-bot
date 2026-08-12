@@ -147,6 +147,8 @@ class Config:
     target_start: dt.date
     target_end: dt.date
     poll_interval_seconds: int
+    rate_limit_backoff_initial_seconds: int
+    rate_limit_backoff_max_seconds: int
     request_timeout_seconds: int
     max_workers: int
     imax_keywords: tuple[str, ...]
@@ -269,6 +271,18 @@ class Config:
                 value("POLL_INTERVAL_SECONDS", "60"),
                 name="POLL_INTERVAL_SECONDS",
                 minimum=30,
+                maximum=86400,
+            ),
+            rate_limit_backoff_initial_seconds=_parse_int(
+                value("RATE_LIMIT_BACKOFF_INITIAL_SECONDS", "600"),
+                name="RATE_LIMIT_BACKOFF_INITIAL_SECONDS",
+                minimum=60,
+                maximum=86400,
+            ),
+            rate_limit_backoff_max_seconds=_parse_int(
+                value("RATE_LIMIT_BACKOFF_MAX_SECONDS", "1800"),
+                name="RATE_LIMIT_BACKOFF_MAX_SECONDS",
+                minimum=60,
                 maximum=86400,
             ),
             request_timeout_seconds=_parse_int(
@@ -1304,6 +1318,7 @@ class CycleResult:
     deferred_seat_details: int = 0
     unclassified_fallback_alerts: int = 0
     seat_detail_errors: int = 0
+    rate_limited_requests: int = 0
 
 
 class Watcher:
@@ -1553,6 +1568,11 @@ class Watcher:
                 next(iter(seat_detail_errors.values())),
             )
 
+        rate_limited_requests = sum(
+            "HTTP 429" in message
+            for message in (*errors.values(), *seat_detail_errors.values())
+        )
+
         detected_new_sessions = [
             session
             for session in sessions
@@ -1771,7 +1791,7 @@ class Watcher:
                     "⚠️ CGV 감시 조회 오류\n"
                     f"{status_word} 날짜 조회에 실패했습니다 ({len(errors)}/{len(dates)}일).\n"
                     f"원인: {unique_errors[0]}\n"
-                    "감시기는 계속 실행되며 다음 주기에 다시 시도합니다."
+                    "감시기는 계속 실행되며 자동 대기 후 다시 시도합니다."
                 )
                 delivered, _failed, total = self._broadcast_message(error_text)
                 if delivered or total == 0:
@@ -1786,7 +1806,8 @@ class Watcher:
         self.logger.info(
             "조회 완료: 성공 %d일, 오류 %d일, IMAX 회차 %d개, 신규 %d개, "
             "좌석변경 %d개, 장애인석만 남아 제외 %d개, A열만 남아 제외 %d개, "
-            "0석 제외 %d개, 좌석판별 대기 %d개, 미판별 7석 이상 알림 %d개",
+            "0석 제외 %d개, 좌석판별 대기 %d개, 미판별 7석 이상 알림 %d개, "
+            "HTTP 429 %d개",
             len(payloads),
             len(errors),
             len(sessions),
@@ -1797,6 +1818,7 @@ class Watcher:
             suppressed_sold_out,
             len(deferred_seat_detail_keys),
             unclassified_fallback_alerts,
+            rate_limited_requests,
         )
         return CycleResult(
             successful_dates=len(payloads),
@@ -1810,6 +1832,7 @@ class Watcher:
             deferred_seat_details=len(deferred_seat_detail_keys),
             unclassified_fallback_alerts=unclassified_fallback_alerts,
             seat_detail_errors=len(seat_detail_errors),
+            rate_limited_requests=rate_limited_requests,
         )
 
 
@@ -1827,6 +1850,20 @@ class TimezoneFormatter(logging.Formatter):
         if datefmt:
             return local_time.strftime(datefmt)
         return local_time.isoformat(sep=" ", timespec="milliseconds")
+
+
+def rate_limit_backoff_seconds(config: Config, consecutive_cycles: int) -> int:
+    """Return an exponential HTTP 429 cooldown capped by configuration."""
+
+    if consecutive_cycles < 1:
+        return config.poll_interval_seconds
+    cooldown = config.rate_limit_backoff_initial_seconds * (
+        2 ** (consecutive_cycles - 1)
+    )
+    return max(
+        config.poll_interval_seconds,
+        min(cooldown, config.rate_limit_backoff_max_seconds),
+    )
 
 
 def configure_logging(config: Config, *, verbose: bool = False) -> logging.Logger:
@@ -2000,6 +2037,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
 
+    consecutive_rate_limit_cycles = 0
     while not stop_requested:
         if (
             not config.dynamic_date_window
@@ -2008,9 +2046,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             logger.info("감시 대상 마지막 날짜가 지나 정상 종료합니다.")
             return 0
         started = time.monotonic()
-        watcher.run_cycle()
+        result = watcher.run_cycle()
+        if result.rate_limited_requests:
+            consecutive_rate_limit_cycles += 1
+            next_interval = rate_limit_backoff_seconds(
+                config, consecutive_rate_limit_cycles
+            )
+            logger.warning(
+                "CGV HTTP 429 요청 제한 감지: 다음 조회는 %d분 뒤에 시도합니다. "
+                "(이번 주기 %d개, 연속 %d회)",
+                max(1, next_interval // 60),
+                result.rate_limited_requests,
+                consecutive_rate_limit_cycles,
+            )
+        else:
+            if consecutive_rate_limit_cycles:
+                logger.info(
+                    "CGV HTTP 429 요청 제한이 해제되어 %d초 조회 주기로 복귀합니다.",
+                    config.poll_interval_seconds,
+                )
+            consecutive_rate_limit_cycles = 0
+            next_interval = config.poll_interval_seconds
         elapsed = time.monotonic() - started
-        sleep_seconds = max(0.5, config.poll_interval_seconds - elapsed)
+        sleep_seconds = max(0.5, next_interval - elapsed)
         deadline = time.monotonic() + sleep_seconds
         while not stop_requested and time.monotonic() < deadline:
             time.sleep(min(0.5, deadline - time.monotonic()))
