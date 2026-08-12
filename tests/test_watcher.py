@@ -360,9 +360,10 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertIn("📅 상영일: 2026-08-26 (수)", sent_messages[0])
             self.assertIn("━━━━━━━━━━━━━━━━━━━━", sent_messages[0])
             self.assertIn(
-                "상영 시작시간 14:30 — 잔여좌석/총좌석: 100/624석",
+                "상영 시작시간 14:30 — 100/624석",
                 sent_messages[0],
             )
+            self.assertNotIn("잔여좌석/총좌석:", sent_messages[0])
             self.assertTrue(config.state_file.exists())
 
     def test_sends_one_alert_for_each_seat_count_change(self):
