@@ -31,7 +31,9 @@ import urllib.request
 
 APP_NAME = "CGV Telegram Watcher"
 DEFAULT_API_URL = "https://cgv.co.kr/api/v1/booking/searchSchByMov"
+DEFAULT_SEAT_API_URL = "https://cgv.co.kr/api/v1/booking/searchIfSeatData"
 DEFAULT_BOOKING_URL = "https://cgv.co.kr/cnm/movieBook/movie"
+DEFAULT_SEAT_PAGE_URL = "https://cgv.co.kr/cnm/selectVisitorCnt"
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -129,6 +131,7 @@ class Config:
     telegram_bot_token: str
     telegram_chat_id: str
     api_url: str
+    seat_api_url: str
     booking_url: str
     company_code: str
     site_no: str
@@ -222,6 +225,7 @@ class Config:
             telegram_bot_token=token,
             telegram_chat_id=chat_id,
             api_url=value("CGV_API_URL", DEFAULT_API_URL),
+            seat_api_url=value("CGV_SEAT_API_URL", DEFAULT_SEAT_API_URL),
             booking_url=value("CGV_BOOKING_URL", DEFAULT_BOOKING_URL),
             company_code=value("CGV_COMPANY_CODE", "A420"),
             site_no=value("CGV_SITE_NO", "0013"),
@@ -276,6 +280,9 @@ class BookingSession:
     screen_name: str = ""
     format_name: str = "IMAX"
     schedule_id: str = ""
+    screen_no: str = ""
+    screen_sequence: str = ""
+    remaining_seats: int | None = None
 
     def notification_key(self, *, site_no: str, movie_no: str) -> str:
         # The user-visible uniqueness requirement is a show date and start time.
@@ -296,6 +303,7 @@ DATE_KEYS = {
 }
 START_TIME_KEYS = {
     "scnfrtm",
+    "scnsrttm",
     "scnstarttm",
     "scnsttm",
     "starttm",
@@ -314,6 +322,7 @@ END_TIME_KEYS = {
 }
 SCREEN_NAME_KEYS = {
     "scnsnm",
+    "exposcnsnm",
     "scnrmnm",
     "scnnm",
     "screenname",
@@ -335,6 +344,8 @@ FORMAT_NAME_KEYS = {
     "screentypename",
     "spclscnsnm",
     "specialscreenname",
+    "exposcnsnm",
+    "movknddsplnm",
 }
 SCHEDULE_ID_KEYS = {
     "schno",
@@ -343,9 +354,18 @@ SCHEDULE_ID_KEYS = {
     "scheduleid",
     "scnno",
     "scnseq",
+    "scnsseq",
     "scnsno",
     "playseq",
     "playno",
+}
+SCREEN_NO_KEYS = {"scnsno"}
+SCREEN_SEQUENCE_KEYS = {"scnsseq"}
+REMAINING_SEAT_KEYS = {
+    "frseatcnt",
+    "remainingseatcnt",
+    "remainseatcnt",
+    "availableseatcnt",
 }
 IMAX_CODE_KEYS = {
     "rtctlscopcd",
@@ -439,6 +459,16 @@ def _normalize_time(value: Any) -> str:
     return ""
 
 
+def _nonnegative_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip().replace(",", "")
+    if not re.fullmatch(r"-?\d+", text):
+        return None
+    parsed = int(text)
+    return parsed if parsed >= 0 else None
+
+
 def _imax_match(
     context: Sequence[tuple[str, str]],
     *,
@@ -469,6 +499,19 @@ def extract_sessions(
     """Extract showtimes defensively from CGV's nested JSON response."""
     sessions: dict[tuple[str, str], BookingSession] = {}
 
+    def completeness(session: BookingSession) -> int:
+        text_fields = (
+            session.end_time,
+            session.screen_name,
+            session.format_name,
+            session.schedule_id,
+            session.screen_no,
+            session.screen_sequence,
+        )
+        return sum(bool(value) for value in text_fields) + (
+            2 if session.remaining_seats is not None else 0
+        )
+
     for mapping, context in _walk_mappings(payload):
         raw_start = _direct_value(mapping, START_TIME_KEYS)
         start_time = _normalize_time(raw_start)
@@ -489,6 +532,11 @@ def extract_sessions(
         if not format_name:
             format_name = matched_format or "IMAX 후보"
         schedule_id = _context_value(mapping, context, SCHEDULE_ID_KEYS)
+        screen_no = _context_value(mapping, context, SCREEN_NO_KEYS)
+        screen_sequence = _context_value(mapping, context, SCREEN_SEQUENCE_KEYS)
+        remaining_seats = _nonnegative_int(
+            _direct_value(mapping, REMAINING_SEAT_KEYS)
+        )
 
         session = BookingSession(
             date=show_date,
@@ -497,17 +545,88 @@ def extract_sessions(
             screen_name=screen_name,
             format_name=format_name,
             schedule_id=schedule_id,
+            screen_no=screen_no,
+            screen_sequence=screen_sequence,
+            remaining_seats=remaining_seats,
         )
         # Yongsan has one IMAX screen.  Date + start time avoids duplicate
         # alerts when the same session appears in multiple response branches.
         identity = (session.date, session.start_time)
         existing = sessions.get(identity)
-        if existing is None or len(str(dataclasses.asdict(session))) > len(
-            str(dataclasses.asdict(existing))
-        ):
+        if existing is None or completeness(session) > completeness(existing):
             sessions[identity] = session
 
     return sorted(sessions.values())
+
+
+@dataclasses.dataclass(frozen=True)
+class SeatSnapshot:
+    """Seat totals observed for one screening."""
+
+    total: int
+    general: int | None = None
+    accessible: int | None = None
+    mapped_total: int | None = None
+
+    @property
+    def accessible_only(self) -> bool:
+        # Suppress only when the seat-map count exactly agrees with the total
+        # shown in CGV's schedule.  A partial/changed response must not hide an
+        # alert for a normal seat.
+        return (
+            self.general == 0
+            and self.accessible is not None
+            and self.accessible > 0
+            and self.mapped_total == self.total
+        )
+
+
+def extract_seat_snapshot(payload: Any, *, scheduled_remaining: int) -> SeatSnapshot:
+    """Count anonymously viewable seats using CGV's own seat-map codes.
+
+    CGV's booking UI treats ``seatStusCd=00`` as available and
+    ``seatSalfrmCd=04`` as an accessible/preferential seat.
+    """
+
+    seats: dict[str, Mapping[str, Any]] = {}
+    for mapping, _context in _walk_mappings(payload):
+        status = _direct_value(mapping, {"seatstuscd"})
+        seat_location = _direct_value(mapping, {"seatlocno"})
+        if status is None or seat_location is None or seat_location == "":
+            continue
+        identity_parts = (
+            seat_location,
+            _direct_value(mapping, {"seatareano"}),
+            _direct_value(mapping, {"seatrownm"}),
+            _direct_value(mapping, {"seatno"}),
+        )
+        identity = ":".join(str(part or "") for part in identity_parts)
+        seats[identity] = mapping
+
+    if not seats:
+        return SeatSnapshot(total=scheduled_remaining)
+
+    general = 0
+    accessible = 0
+    for seat in seats.values():
+        if str(_direct_value(seat, {"seatstuscd"}) or "").strip() != "00":
+            continue
+        if str(_direct_value(seat, {"seatsaleyn"}) or "Y").strip().upper() == "N":
+            continue
+        disabled = str(_direct_value(seat, {"isdisabled"}) or "").strip().lower()
+        if disabled in {"1", "true", "y", "yes"}:
+            continue
+        if str(_direct_value(seat, {"seatsalfrmcd"}) or "").strip() == "04":
+            accessible += 1
+        else:
+            general += 1
+
+    return SeatSnapshot(
+        total=scheduled_remaining,
+        general=general,
+        accessible=accessible,
+        mapped_total=general + accessible,
+    )
 
 
 class CgvClient:
@@ -517,17 +636,7 @@ class CgvClient:
         self.config = config
         self.ssl_context = ssl.create_default_context()
 
-    def fetch_date(self, show_date: dt.date) -> Any:
-        query = urllib.parse.urlencode(
-            {
-                "coCd": self.config.company_code,
-                "siteNo": self.config.site_no,
-                "scnYmd": show_date.strftime("%Y%m%d"),
-                "movNo": self.config.movie_no,
-                "rtctlScopCd": self.config.rtctl_scope_code,
-            }
-        )
-        url = f"{self.config.api_url}?{query}"
+    def _get_json(self, url: str, *, referer: str) -> Any:
         request = urllib.request.Request(
             url,
             method="GET",
@@ -536,7 +645,7 @@ class CgvClient:
                 "Accept-Language": "ko-KR",
                 "Cache-Control": "no-cache",
                 "Pragma": "no-cache",
-                "Referer": self.config.booking_url,
+                "Referer": referer,
                 "User-Agent": USER_AGENT,
             },
         )
@@ -575,6 +684,44 @@ class CgvClient:
             return json.loads(body.decode("utf-8-sig"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise FetchError("CGV 응답을 JSON으로 해석할 수 없습니다.") from exc
+
+    def fetch_date(self, show_date: dt.date) -> Any:
+        query = urllib.parse.urlencode(
+            {
+                "coCd": self.config.company_code,
+                "siteNo": self.config.site_no,
+                "scnYmd": show_date.strftime("%Y%m%d"),
+                "movNo": self.config.movie_no,
+                "rtctlScopCd": self.config.rtctl_scope_code,
+            }
+        )
+        url = f"{self.config.api_url}?{query}"
+        return self._get_json(url, referer=self.config.booking_url)
+
+    def fetch_seat_snapshot(self, session: BookingSession) -> SeatSnapshot:
+        if session.remaining_seats is None:
+            raise FetchError("상영 일정 응답에 잔여 좌석 수가 없습니다.")
+        if not session.screen_no or not session.screen_sequence:
+            return SeatSnapshot(total=session.remaining_seats)
+
+        query = urllib.parse.urlencode(
+            {
+                "coCd": self.config.company_code,
+                "siteNo": self.config.site_no,
+                "scnYmd": session.date.replace("-", ""),
+                "scnsNo": session.screen_no,
+                "scnSseq": session.screen_sequence,
+                "seatAreaNo": "",
+                "cusgdCd": "",
+                "custNo": "",
+            }
+        )
+        payload = self._get_json(
+            f"{self.config.seat_api_url}?{query}", referer=DEFAULT_SEAT_PAGE_URL
+        )
+        return extract_seat_snapshot(
+            payload, scheduled_remaining=session.remaining_seats
+        )
 
 
 class TelegramClient:
@@ -632,8 +779,9 @@ class StateStore:
     def __init__(self, path: Path):
         self.path = path
         self.data: dict[str, Any] = {
-            "version": 1,
+            "version": 2,
             "notified": {},
+            "seat_counts": {},
             "last_error_fingerprint": "",
             "last_error_notified_at": "",
         }
@@ -649,7 +797,11 @@ class StateStore:
             ) from exc
         if not isinstance(loaded, dict) or not isinstance(loaded.get("notified", {}), dict):
             raise RuntimeError(f"중복 방지 상태 파일 형식이 올바르지 않습니다: {self.path}")
+        if not isinstance(loaded.get("seat_counts", {}), dict):
+            raise RuntimeError(f"좌석 수 상태 파일 형식이 올바르지 않습니다: {self.path}")
         self.data.update(loaded)
+        self.data["version"] = 2
+        self.data.setdefault("seat_counts", {})
 
     def was_notified(self, key: str) -> bool:
         return key in self.data["notified"]
@@ -660,6 +812,30 @@ class StateStore:
             "date": session.date,
             "start_time": session.start_time,
             "screen_name": session.screen_name,
+            "remaining_seats": session.remaining_seats,
+        }
+
+    def seat_snapshot(self, key: str) -> SeatSnapshot | None:
+        raw = self.data["seat_counts"].get(key)
+        if not isinstance(raw, Mapping):
+            return None
+        total = _nonnegative_int(raw.get("total"))
+        if total is None:
+            return None
+        return SeatSnapshot(
+            total=total,
+            general=_nonnegative_int(raw.get("general")),
+            accessible=_nonnegative_int(raw.get("accessible")),
+            mapped_total=_nonnegative_int(raw.get("mapped_total")),
+        )
+
+    def set_seat_snapshot(self, key: str, snapshot: SeatSnapshot) -> None:
+        self.data["seat_counts"][key] = {
+            "observed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "total": snapshot.total,
+            "general": snapshot.general,
+            "accessible": snapshot.accessible,
+            "mapped_total": snapshot.mapped_total,
         }
 
     def save(self) -> None:
@@ -706,8 +882,44 @@ def _session_line(session: BookingSession) -> str:
         details.append(session.screen_name)
     if session.end_time:
         details.append(f"종료 {session.end_time}")
+    if session.remaining_seats is not None:
+        details.append(f"잔여 {session.remaining_seats}석")
     suffix = f" — {' / '.join(details)}" if details else ""
     return f"• {session.date} {session.start_time}{suffix}"
+
+
+def _seat_snapshot_changed(previous: SeatSnapshot, current: SeatSnapshot) -> bool:
+    if previous.total != current.total:
+        return True
+    if (
+        previous.general is not None
+        and current.general is not None
+        and previous.general != current.general
+    ):
+        return True
+    return False
+
+
+def seat_change_message(
+    session: BookingSession,
+    previous: SeatSnapshot,
+    current: SeatSnapshot,
+    config: Config,
+) -> str:
+    lines = [
+        "💺 CGV 잔여 좌석 변경",
+        f"영화: {config.movie_label} ({config.movie_no})",
+        f"극장: 용산아이파크몰 ({config.site_no})",
+        "",
+        _session_line(session),
+        f"전체 잔여: {previous.total}석 → {current.total}석",
+    ]
+    if previous.general is not None and current.general is not None:
+        lines.append(f"일반 예매 가능: {previous.general}석 → {current.general}석")
+    if current.accessible is not None:
+        lines.append(f"장애인석: {current.accessible}석 (장애인석만 남으면 알림 제외)")
+    lines.extend(["", f"예매: {config.booking_url}"])
+    return "\n".join(lines)
 
 
 def message_chunks(
@@ -746,6 +958,9 @@ class CycleResult:
     failed_dates: int
     matching_sessions: int
     new_sessions: int
+    seat_changes: int = 0
+    suppressed_accessible_only: int = 0
+    seat_detail_errors: int = 0
 
 
 class Watcher:
@@ -801,17 +1016,80 @@ class Watcher:
                 session_map[(session.date, session.start_time)] = session
 
         sessions = sorted(session_map.values())
-        new_sessions = [
+        session_keys = {
+            session: session.notification_key(
+                site_no=self.config.site_no, movie_no=self.config.movie_no
+            )
+            for session in sessions
+        }
+        previously_notified = {
+            key for key in session_keys.values() if self.state.was_notified(key)
+        }
+        previous_snapshots = {
+            key: self.state.seat_snapshot(key) for key in session_keys.values()
+        }
+
+        snapshots: dict[str, SeatSnapshot] = {}
+        seat_detail_errors: dict[str, str] = {}
+        seat_candidates = [
+            session for session in sessions if session.remaining_seats is not None
+        ]
+        if seat_candidates:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(self.config.max_workers, len(seat_candidates))
+            ) as executor:
+                pending_seats = {
+                    executor.submit(self.cgv.fetch_seat_snapshot, session): session
+                    for session in seat_candidates
+                }
+                for future in concurrent.futures.as_completed(pending_seats):
+                    session = pending_seats[future]
+                    key = session_keys[session]
+                    try:
+                        snapshots[key] = future.result()
+                    except FetchError as exc:
+                        seat_detail_errors[key] = str(exc)
+                        snapshots[key] = SeatSnapshot(total=session.remaining_seats or 0)
+                    except Exception as exc:
+                        seat_detail_errors[key] = (
+                            f"예상하지 못한 좌석 조회 오류: {type(exc).__name__}"
+                        )
+                        snapshots[key] = SeatSnapshot(total=session.remaining_seats or 0)
+
+        if seat_detail_errors:
+            self.logger.warning(
+                "좌석 상세 조회 오류 %d개: %s (전체 잔여 수 변경 감시는 계속)",
+                len(seat_detail_errors),
+                next(iter(seat_detail_errors.values())),
+            )
+
+        detected_new_sessions = [
             session
             for session in sessions
             if not self.state.was_notified(
-                session.notification_key(
-                    site_no=self.config.site_no, movie_no=self.config.movie_no
-                )
+                session_keys[session]
             )
+        ]
+        suppressed_new_sessions = [
+            session
+            for session in detected_new_sessions
+            if snapshots.get(session_keys[session]) is not None
+            and snapshots[session_keys[session]].accessible_only
+        ]
+        new_sessions = [
+            session
+            for session in detected_new_sessions
+            if session not in suppressed_new_sessions
         ]
 
         state_changed = False
+        suppressed_accessible_only = len(suppressed_new_sessions)
+        for session in suppressed_new_sessions:
+            self.logger.info(
+                "알림 제외: %s 잔여 좌석이 장애인석뿐입니다.",
+                _session_line(session),
+            )
+
         if new_sessions:
             if self.dry_run:
                 self.logger.info("드라이런: 새 회차 %d개(메시지/상태 저장 생략)", len(new_sessions))
@@ -831,6 +1109,66 @@ class Watcher:
                         self.state.mark_notified(key, session)
                         state_changed = True
                     self.logger.info("Telegram 신규 회차 알림 %d개 전송", len(chunk_sessions))
+
+        seat_changes = 0
+        for session in sessions:
+            key = session_keys[session]
+            current = snapshots.get(key)
+            if current is None:
+                continue
+            previous = previous_snapshots.get(key)
+            if previous is None:
+                if not self.dry_run:
+                    self.state.set_seat_snapshot(key, current)
+                    state_changed = True
+                continue
+            if not _seat_snapshot_changed(previous, current):
+                continue
+
+            if current.accessible_only:
+                suppressed_accessible_only += 1
+                self.logger.info(
+                    "좌석 변경 알림 제외: %s 잔여 좌석이 장애인석뿐입니다.",
+                    _session_line(session),
+                )
+                if not self.dry_run:
+                    self.state.set_seat_snapshot(key, current)
+                    state_changed = True
+                continue
+
+            # A session not notified before this cycle receives the booking-open
+            # alert above.  Do not send a second seat-change message for the same
+            # observation.
+            if key not in previously_notified:
+                if not self.dry_run:
+                    self.state.set_seat_snapshot(key, current)
+                    state_changed = True
+                continue
+
+            seat_changes += 1
+            if self.dry_run:
+                self.logger.info(
+                    "드라이런 좌석 변경: %s (%d석 -> %d석)",
+                    _session_line(session),
+                    previous.total,
+                    current.total,
+                )
+                continue
+            try:
+                self.telegram.send_message(
+                    seat_change_message(session, previous, current, self.config)
+                )
+            except TelegramError as exc:
+                self.logger.error("%s", exc)
+            else:
+                self.state.set_seat_snapshot(key, current)
+                state_changed = True
+                self.logger.info(
+                    "Telegram 좌석 변경 알림 전송: %s (%d석 -> %d석)",
+                    _session_line(session),
+                    previous.total,
+                    current.total,
+                )
 
         if errors:
             unique_errors = sorted(set(errors.values()))
@@ -873,17 +1211,23 @@ class Watcher:
             self.state.save()
 
         self.logger.info(
-            "조회 완료: 성공 %d일, 오류 %d일, IMAX 회차 %d개, 신규 %d개",
+            "조회 완료: 성공 %d일, 오류 %d일, IMAX 회차 %d개, 신규 %d개, "
+            "좌석변경 %d개, 장애인석만 남아 제외 %d개",
             len(payloads),
             len(errors),
             len(sessions),
             len(new_sessions),
+            seat_changes,
+            suppressed_accessible_only,
         )
         return CycleResult(
             successful_dates=len(payloads),
             failed_dates=len(errors),
             matching_sessions=len(sessions),
             new_sessions=len(new_sessions),
+            seat_changes=seat_changes,
+            suppressed_accessible_only=suppressed_accessible_only,
+            seat_detail_errors=len(seat_detail_errors),
         )
 
 
