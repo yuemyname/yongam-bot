@@ -36,6 +36,7 @@ DEFAULT_SEAT_API_URL = "https://cgv.co.kr/api/v1/booking/searchIfSeatData"
 DEFAULT_BOOKING_URL = "https://cgv.co.kr/cnm/movieBook/movie"
 DEFAULT_SEAT_PAGE_URL = "https://cgv.co.kr/cnm/selectVisitorCnt"
 DEFAULT_SITE_NAME = "용산아이파크몰"
+UNCLASSIFIED_ALERT_MIN_SEATS = 7
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -674,7 +675,24 @@ class SeatSnapshot:
 
     @property
     def alertable(self) -> bool:
-        return self.seat_map_complete and not self.should_suppress
+        """Whether this snapshot may trigger an alert.
+
+        A complete seat map is preferred.  When CGV does not return enough
+        detail to classify seat types, the schedule total is used only from
+        seven remaining seats upward.
+        """
+        return (
+            self.total > 0
+            and not self.should_suppress
+            and (
+                self.seat_map_complete
+                or self.total >= UNCLASSIFIED_ALERT_MIN_SEATS
+            )
+        )
+
+    @property
+    def uses_unclassified_fallback(self) -> bool:
+        return self.alertable and not self.seat_map_complete
 
 
 def _normalize_seat_row(value: Any) -> str:
@@ -1117,8 +1135,13 @@ def _seat_ratio(session: BookingSession, *, remaining: int | None = None) -> str
     return f"{remaining_text}/{total_text}석"
 
 
-def _alert_session_line(session: BookingSession) -> str:
-    return f"• 상영 시작시간 {session.start_time} — {_seat_ratio(session)}"
+def _alert_session_line(
+    session: BookingSession, *, seat_detail_unclassified: bool = False
+) -> str:
+    line = f"• 상영 시작시간 {session.start_time} — {_seat_ratio(session)}"
+    if seat_detail_unclassified:
+        line += " ⚠️ 좌석 종류 미확인 · 전체 잔여 수 기준"
+    return line
 
 
 def _alert_date_banner(date_text: str) -> str:
@@ -1212,12 +1235,18 @@ def seat_change_message(
         lines.append(f"일반 예매 가능: {previous.general}석 → {current.general}석")
     if current.accessible is not None:
         lines.append(f"장애인석: {current.accessible}석 (장애인석만 남으면 알림 제외)")
+    if current.uses_unclassified_fallback:
+        lines.append("⚠️ 좌석 종류 미확인 · 전체 잔여 수 기준 알림")
     lines.extend(["", f"예매 바로가기: {booking_url_for_session(session, config)}"])
     return "\n".join(lines)
 
 
 def message_chunks(
-    sessions: Sequence[BookingSession], config: Config, *, max_chars: int = 3500
+    sessions: Sequence[BookingSession],
+    config: Config,
+    *,
+    unclassified_keys: set[str] | None = None,
+    max_chars: int = 3500,
 ) -> list[tuple[str, list[BookingSession]]]:
     header = (
         "🎟️ CGV 예매 오픈 감지\n"
@@ -1225,13 +1254,25 @@ def message_chunks(
         f"극장: 용산아이파크몰 ({config.site_no})\n\n"
     )
     chunks: list[tuple[str, list[BookingSession]]] = []
+    unclassified_keys = unclassified_keys or set()
     sessions_by_date: dict[str, list[BookingSession]] = {}
     for session in sessions:
         sessions_by_date.setdefault(session.date, []).append(session)
 
     def render(date_sessions: Sequence[BookingSession]) -> str:
         show_date = date_sessions[0].date
-        lines = [_alert_session_line(session) for session in date_sessions]
+        lines = [
+            _alert_session_line(
+                session,
+                seat_detail_unclassified=(
+                    session.notification_key(
+                        site_no=config.site_no, movie_no=config.movie_no
+                    )
+                    in unclassified_keys
+                ),
+            )
+            for session in date_sessions
+        ]
         return (
             header
             + _alert_date_banner(show_date)
@@ -1264,6 +1305,7 @@ class CycleResult:
     suppressed_row_a_only: int = 0
     suppressed_sold_out: int = 0
     deferred_seat_details: int = 0
+    unclassified_fallback_alerts: int = 0
     seat_detail_errors: int = 0
 
 
@@ -1495,15 +1537,21 @@ class Watcher:
                         snapshots[key] = future.result()
                     except FetchError as exc:
                         seat_detail_errors[key] = str(exc)
+                        snapshots[key] = SeatSnapshot(
+                            total=session.remaining_seats or 0
+                        )
                     except Exception as exc:
                         seat_detail_errors[key] = (
                             f"예상하지 못한 좌석 조회 오류: {type(exc).__name__}"
+                        )
+                        snapshots[key] = SeatSnapshot(
+                            total=session.remaining_seats or 0
                         )
 
         if seat_detail_errors:
             self.logger.warning(
                 "좌석 상세 조회 오류 %d개: %s "
-                "(해당 회차 알림을 보류하고 다음 주기에 재확인)",
+                "(6석 이하는 보류, 7석 이상은 전체 잔여 수 기준 알림)",
                 len(seat_detail_errors),
                 next(iter(seat_detail_errors.values())),
             )
@@ -1535,7 +1583,7 @@ class Watcher:
             and session not in suppressed_new_sessions
             and (
                 snapshots.get(session_keys[session]) is None
-                or not snapshots[session_keys[session]].seat_map_complete
+                or not snapshots[session_keys[session]].alertable
             )
         ]
         new_sessions = [
@@ -1550,6 +1598,12 @@ class Watcher:
         deferred_seat_detail_keys = {
             session_keys[session] for session in deferred_new_sessions
         }
+        unclassified_new_keys = {
+            session_keys[session]
+            for session in new_sessions
+            if snapshots[session_keys[session]].uses_unclassified_fallback
+        }
+        unclassified_fallback_alerts = len(unclassified_new_keys)
         suppressed_accessible_only = sum(
             snapshots[session_keys[session]].accessible_only
             for session in suppressed_new_sessions
@@ -1574,7 +1628,7 @@ class Watcher:
             )
         if deferred_new_sessions:
             self.logger.info(
-                "알림 보류: 좌석 종류/A열 판별 대기 중인 신규 회차 %d개",
+                "알림 보류: 좌석 종류 판별 실패 후 잔여 6석 이하인 신규 회차 %d개",
                 len(deferred_new_sessions),
             )
 
@@ -1584,7 +1638,11 @@ class Watcher:
                 for session in new_sessions:
                     self.logger.info("드라이런 회차: %s", _session_line(session))
             else:
-                for text, chunk_sessions in message_chunks(new_sessions, self.config):
+                for text, chunk_sessions in message_chunks(
+                    new_sessions,
+                    self.config,
+                    unclassified_keys=unclassified_new_keys,
+                ):
                     delivered, failed, total = self._broadcast_message(text)
                     if total and not delivered:
                         break
@@ -1642,10 +1700,10 @@ class Watcher:
                     state_changed = True
                 continue
 
-            if not current.seat_map_complete:
+            if not current.alertable:
                 deferred_seat_detail_keys.add(key)
                 self.logger.info(
-                    "좌석 변경 알림 보류: %s 좌석 종류/A열을 완전히 판별할 수 없습니다.",
+                    "좌석 변경 알림 보류: %s 좌석 종류 판별 실패 후 잔여 6석 이하입니다.",
                     _session_line(session),
                 )
                 continue
@@ -1658,6 +1716,13 @@ class Watcher:
                     self.state.set_seat_snapshot(key, current)
                     state_changed = True
                 continue
+
+            if current.uses_unclassified_fallback:
+                unclassified_fallback_alerts += 1
+                self.logger.info(
+                    "좌석 종류 미확인 알림 허용: %s 잔여 7석 이상입니다.",
+                    _session_line(session),
+                )
 
             seat_changes += 1
             if self.dry_run:
@@ -1724,7 +1789,7 @@ class Watcher:
         self.logger.info(
             "조회 완료: 성공 %d일, 오류 %d일, IMAX 회차 %d개, 신규 %d개, "
             "좌석변경 %d개, 장애인석만 남아 제외 %d개, A열만 남아 제외 %d개, "
-            "0석 제외 %d개, 좌석판별 대기 %d개",
+            "0석 제외 %d개, 좌석판별 대기 %d개, 미판별 7석 이상 알림 %d개",
             len(payloads),
             len(errors),
             len(sessions),
@@ -1734,6 +1799,7 @@ class Watcher:
             suppressed_row_a_only,
             suppressed_sold_out,
             len(deferred_seat_detail_keys),
+            unclassified_fallback_alerts,
         )
         return CycleResult(
             successful_dates=len(payloads),
@@ -1745,6 +1811,7 @@ class Watcher:
             suppressed_row_a_only=suppressed_row_a_only,
             suppressed_sold_out=suppressed_sold_out,
             deferred_seat_details=len(deferred_seat_detail_keys),
+            unclassified_fallback_alerts=unclassified_fallback_alerts,
             seat_detail_errors=len(seat_detail_errors),
         )
 
