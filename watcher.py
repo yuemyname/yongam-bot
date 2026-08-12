@@ -1220,10 +1220,10 @@ def seat_change_message(
 ) -> str:
     lines = [
         "💺 CGV 잔여 좌석 변경",
+        _alert_date_banner(session.date),
         f"영화: {config.movie_label} ({config.movie_no})",
         f"극장: 용산아이파크몰 ({config.site_no})",
         "",
-        _alert_date_banner(session.date),
         f"상영 시작시간: {session.start_time}",
         (
             "잔여좌석/총좌석: "
@@ -1248,11 +1248,6 @@ def message_chunks(
     unclassified_keys: set[str] | None = None,
     max_chars: int = 3500,
 ) -> list[tuple[str, list[BookingSession]]]:
-    header = (
-        "🎟️ CGV 예매 오픈 감지\n"
-        f"영화: {config.movie_label} ({config.movie_no})\n"
-        f"극장: 용산아이파크몰 ({config.site_no})\n\n"
-    )
     chunks: list[tuple[str, list[BookingSession]]] = []
     unclassified_keys = unclassified_keys or set()
     sessions_by_date: dict[str, list[BookingSession]] = {}
@@ -1274,9 +1269,11 @@ def message_chunks(
             for session in date_sessions
         ]
         return (
-            header
+            "🎟️ CGV 예매 오픈 감지\n"
             + _alert_date_banner(show_date)
             + "\n"
+            + f"영화: {config.movie_label} ({config.movie_no})\n"
+            + f"극장: 용산아이파크몰 ({config.site_no})\n\n"
             + "\n".join(lines)
             + _booking_footer(date_sessions, config)
         )
