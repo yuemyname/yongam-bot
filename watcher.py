@@ -27,6 +27,7 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 import urllib.error
 import urllib.parse
 import urllib.request
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 APP_NAME = "CGV Telegram Watcher"
@@ -139,6 +140,9 @@ class Config:
     movie_no: str
     movie_label: str
     rtctl_scope_code: str
+    dynamic_date_window: bool
+    target_window_days: int
+    timezone_name: str
     target_start: dt.date
     target_end: dt.date
     poll_interval_seconds: int
@@ -180,16 +184,37 @@ class Config:
             raise ConfigurationError("TELEGRAM_CHAT_ID를 .env에 입력하세요.")
 
         project_dir = path.parent
-        target_start = _parse_date(
-            value("TARGET_START_DATE", "2026-08-26"), name="TARGET_START_DATE"
+        timezone_name = value("APP_TIMEZONE", "Asia/Seoul")
+        try:
+            local_today = dt.datetime.now(ZoneInfo(timezone_name)).date()
+        except ZoneInfoNotFoundError as exc:
+            raise ConfigurationError(
+                f"APP_TIMEZONE을 찾을 수 없습니다: {timezone_name}"
+            ) from exc
+
+        dynamic_date_window = _parse_bool(
+            value("DYNAMIC_DATE_WINDOW", "true"), name="DYNAMIC_DATE_WINDOW"
         )
-        target_end = _parse_date(
-            value("TARGET_END_DATE", "2026-09-08"), name="TARGET_END_DATE"
+        target_window_days = _parse_int(
+            value("TARGET_WINDOW_DAYS", "28"),
+            name="TARGET_WINDOW_DAYS",
+            minimum=1,
+            maximum=63,
         )
-        if target_end < target_start:
-            raise ConfigurationError("TARGET_END_DATE는 시작일보다 빠를 수 없습니다.")
-        if (target_end - target_start).days > 62:
-            raise ConfigurationError("조회 날짜 범위는 최대 63일까지 지원합니다.")
+        if dynamic_date_window:
+            target_start = local_today
+            target_end = local_today + dt.timedelta(days=target_window_days - 1)
+        else:
+            target_start = _parse_date(
+                value("TARGET_START_DATE", "2026-08-26"), name="TARGET_START_DATE"
+            )
+            target_end = _parse_date(
+                value("TARGET_END_DATE", "2026-09-08"), name="TARGET_END_DATE"
+            )
+            if target_end < target_start:
+                raise ConfigurationError("TARGET_END_DATE는 시작일보다 빠를 수 없습니다.")
+            if (target_end - target_start).days > 62:
+                raise ConfigurationError("조회 날짜 범위는 최대 63일까지 지원합니다.")
 
         keywords = tuple(
             item.strip() for item in value("IMAX_KEYWORDS", "IMAX,아이맥스").split(",")
@@ -233,6 +258,9 @@ class Config:
             movie_no=value("CGV_MOVIE_NO", "30001323"),
             movie_label=value("MOVIE_LABEL", "오디세이"),
             rtctl_scope_code=value("CGV_RTCTL_SCOPE_CODE", "08"),
+            dynamic_date_window=dynamic_date_window,
+            target_window_days=target_window_days,
+            timezone_name=timezone_name,
             target_start=target_start,
             target_end=target_end,
             poll_interval_seconds=_parse_int(
@@ -268,9 +296,19 @@ class Config:
             log_file=log_file,
         )
 
-    def target_dates(self) -> list[dt.date]:
-        count = (self.target_end - self.target_start).days + 1
-        return [self.target_start + dt.timedelta(days=offset) for offset in range(count)]
+    def local_today(self) -> dt.date:
+        return dt.datetime.now(ZoneInfo(self.timezone_name)).date()
+
+    def target_range(self, *, today: dt.date | None = None) -> tuple[dt.date, dt.date]:
+        if not self.dynamic_date_window:
+            return self.target_start, self.target_end
+        start = today or self.local_today()
+        return start, start + dt.timedelta(days=self.target_window_days - 1)
+
+    def target_dates(self, *, today: dt.date | None = None) -> list[dt.date]:
+        start, end = self.target_range(today=today)
+        count = (end - start).days + 1
+        return [start + dt.timedelta(days=offset) for offset in range(count)]
 
 
 @dataclasses.dataclass(frozen=True, order=True)
@@ -284,6 +322,7 @@ class BookingSession:
     screen_no: str = ""
     screen_sequence: str = ""
     remaining_seats: int | None = None
+    total_seats: int | None = None
 
     def notification_key(self, *, site_no: str, movie_no: str) -> str:
         # The user-visible uniqueness requirement is a show date and start time.
@@ -367,6 +406,11 @@ REMAINING_SEAT_KEYS = {
     "remainingseatcnt",
     "remainseatcnt",
     "availableseatcnt",
+}
+TOTAL_SEAT_KEYS = {
+    "stcnt",
+    "totalseatcnt",
+    "seatcapacity",
 }
 IMAX_CODE_KEYS = {
     "rtctlscopcd",
@@ -511,7 +555,7 @@ def extract_sessions(
         )
         return sum(bool(value) for value in text_fields) + (
             2 if session.remaining_seats is not None else 0
-        )
+        ) + (1 if session.total_seats is not None else 0)
 
     for mapping, context in _walk_mappings(payload):
         raw_start = _direct_value(mapping, START_TIME_KEYS)
@@ -538,6 +582,7 @@ def extract_sessions(
         remaining_seats = _nonnegative_int(
             _direct_value(mapping, REMAINING_SEAT_KEYS)
         )
+        total_seats = _nonnegative_int(_direct_value(mapping, TOTAL_SEAT_KEYS))
 
         session = BookingSession(
             date=show_date,
@@ -549,6 +594,7 @@ def extract_sessions(
             screen_no=screen_no,
             screen_sequence=screen_sequence,
             remaining_seats=remaining_seats,
+            total_seats=total_seats,
         )
         # Yongsan has one IMAX screen.  Date + start time avoids duplicate
         # alerts when the same session appears in multiple response branches.
@@ -814,6 +860,7 @@ class StateStore:
             "start_time": session.start_time,
             "screen_name": session.screen_name,
             "remaining_seats": session.remaining_seats,
+            "total_seats": session.total_seats,
         }
 
     def seat_snapshot(self, key: str) -> SeatSnapshot | None:
@@ -883,10 +930,24 @@ def _session_line(session: BookingSession) -> str:
         details.append(session.screen_name)
     if session.end_time:
         details.append(f"종료 {session.end_time}")
-    if session.remaining_seats is not None:
-        details.append(f"잔여 {session.remaining_seats}석")
+    if session.remaining_seats is not None or session.total_seats is not None:
+        details.append(f"좌석 {_seat_ratio(session)}")
     suffix = f" — {' / '.join(details)}" if details else ""
     return f"• {session.date} {session.start_time}{suffix}"
+
+
+def _seat_ratio(session: BookingSession, *, remaining: int | None = None) -> str:
+    remaining_value = session.remaining_seats if remaining is None else remaining
+    remaining_text = str(remaining_value) if remaining_value is not None else "?"
+    total_text = str(session.total_seats) if session.total_seats is not None else "?"
+    return f"{remaining_text}/{total_text}석"
+
+
+def _alert_session_line(session: BookingSession) -> str:
+    return (
+        f"• 상영 시작시간 {session.start_time} — "
+        f"잔여좌석/총좌석: {_seat_ratio(session)}"
+    )
 
 
 def booking_url_for_session(session: BookingSession, config: Config) -> str:
@@ -920,10 +981,13 @@ def _booking_footer(
     links: dict[str, str] = {}
     for session in sessions:
         links.setdefault(session.date, booking_url_for_session(session, config))
-    lines = [
-        f"예매 바로가기 ({show_date}): {url}"
-        for show_date, url in links.items()
-    ]
+    if len(links) == 1:
+        lines = [f"예매 바로가기: {next(iter(links.values()))}"]
+    else:
+        lines = [
+            f"예매 바로가기 ({show_date}): {url}"
+            for show_date, url in links.items()
+        ]
     return "\n\n" + "\n".join(lines)
 
 
@@ -949,9 +1013,13 @@ def seat_change_message(
         "💺 CGV 잔여 좌석 변경",
         f"영화: {config.movie_label} ({config.movie_no})",
         f"극장: 용산아이파크몰 ({config.site_no})",
-        "",
-        _session_line(session),
-        f"전체 잔여: {previous.total}석 → {current.total}석",
+        f"일자: {session.date}",
+        f"상영 시작시간: {session.start_time}",
+        (
+            "잔여좌석/총좌석: "
+            f"{_seat_ratio(session, remaining=current.total)} "
+            f"(이전 {_seat_ratio(session, remaining=previous.total)})"
+        ),
     ]
     if previous.general is not None and current.general is not None:
         lines.append(f"일반 예매 가능: {previous.general}석 → {current.general}석")
@@ -970,40 +1038,30 @@ def message_chunks(
         f"극장: 용산아이파크몰 ({config.site_no})\n\n"
     )
     chunks: list[tuple[str, list[BookingSession]]] = []
-    current_lines: list[str] = []
-    current_sessions: list[BookingSession] = []
-
+    sessions_by_date: dict[str, list[BookingSession]] = {}
     for session in sessions:
-        line = _session_line(session)
-        candidate_sessions = current_sessions + [session]
-        candidate = (
-            header
-            + "\n".join(current_lines + [line])
-            + _booking_footer(candidate_sessions, config)
-        )
-        if current_lines and len(candidate) > max_chars:
-            chunks.append(
-                (
-                    header
-                    + "\n".join(current_lines)
-                    + _booking_footer(current_sessions, config),
-                    list(current_sessions),
-                )
-            )
-            current_lines = []
-            current_sessions = []
-        current_lines.append(line)
-        current_sessions.append(session)
+        sessions_by_date.setdefault(session.date, []).append(session)
 
-    if current_lines:
-        chunks.append(
-            (
-                header
-                + "\n".join(current_lines)
-                + _booking_footer(current_sessions, config),
-                current_sessions,
-            )
+    def render(date_sessions: Sequence[BookingSession]) -> str:
+        show_date = date_sessions[0].date
+        lines = [_alert_session_line(session) for session in date_sessions]
+        return (
+            header
+            + f"일자: {show_date}\n"
+            + "\n".join(lines)
+            + _booking_footer(date_sessions, config)
         )
+
+    for date_sessions in sessions_by_date.values():
+        current_sessions: list[BookingSession] = []
+        for session in date_sessions:
+            candidate = current_sessions + [session]
+            if current_sessions and len(render(candidate)) > max_chars:
+                chunks.append((render(current_sessions), list(current_sessions)))
+                current_sessions = []
+            current_sessions.append(session)
+        if current_sessions:
+            chunks.append((render(current_sessions), current_sessions))
     return chunks
 
 
@@ -1424,13 +1482,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.error("%s", exc)
         return 2
 
+    range_start, range_end = config.target_range()
+    range_label = (
+        f"오늘부터 {config.target_window_days}일(매일 자동 갱신)"
+        if config.dynamic_date_window
+        else f"{range_start}~{range_end}"
+    )
     logger.info(
-        "%s 시작: siteNo=%s, movNo=%s, %s~%s, %d초 간격",
+        "%s 시작: siteNo=%s, movNo=%s, %s [%s~%s], %d초 간격",
         APP_NAME,
         config.site_no,
         config.movie_no,
-        config.target_start,
-        config.target_end,
+        range_label,
+        range_start,
+        range_end,
         config.poll_interval_seconds,
     )
     logger.info("CGV 로그인 토큰과 로그인 쿠키는 사용하지 않습니다.")
@@ -1449,7 +1514,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, request_stop)
 
     while not stop_requested:
-        if dt.date.today() > config.target_end:
+        if (
+            not config.dynamic_date_window
+            and config.local_today() > config.target_end
+        ):
             logger.info("감시 대상 마지막 날짜가 지나 정상 종료합니다.")
             return 0
         started = time.monotonic()
