@@ -451,6 +451,14 @@ class WatcherIntegrationTests(unittest.TestCase):
                 "상영 시작시간 14:30 — 100/624석",
                 sent_messages[0],
             )
+            self.assertLess(
+                sent_messages[0].index("📅 상영일"),
+                sent_messages[0].index("영화: 오디세이"),
+            )
+            self.assertLess(
+                sent_messages[0].index("영화: 오디세이"),
+                sent_messages[0].index("극장: 용산아이파크몰"),
+            )
             self.assertNotIn("잔여좌석/총좌석:", sent_messages[0])
             self.assertTrue(config.state_file.exists())
 
@@ -500,6 +508,14 @@ class WatcherIntegrationTests(unittest.TestCase):
                 "잔여좌석/총좌석: 9/200석 (이전 10/200석)", sent_messages[1]
             )
             self.assertIn("📅 상영일: 2026-08-26 (수)", sent_messages[1])
+            self.assertLess(
+                sent_messages[1].index("📅 상영일"),
+                sent_messages[1].index("영화: 오디세이"),
+            )
+            self.assertLess(
+                sent_messages[1].index("영화: 오디세이"),
+                sent_messages[1].index("극장: 용산아이파크몰"),
+            )
 
     def test_suppresses_change_when_only_accessible_seats_remain(self):
         with tempfile.TemporaryDirectory() as temporary:
