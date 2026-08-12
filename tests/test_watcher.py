@@ -16,6 +16,7 @@ from watcher import (
     FetchError,
     SeatSnapshot,
     StateStore,
+    TimezoneFormatter,
     Watcher,
     booking_url_for_session,
     extract_seat_snapshot,
@@ -353,6 +354,32 @@ class ConfigTests(unittest.TestCase):
 
             self.assertEqual(config.state_file, volume_dir.resolve() / "notified.json")
             self.assertEqual(config.log_file, volume_dir.resolve() / "watcher.log")
+
+
+class LoggingTests(unittest.TestCase):
+    def test_formats_railway_utc_timestamp_as_korean_time(self):
+        formatter = TimezoneFormatter(
+            "%(asctime)s %(levelname)s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S %Z",
+            timezone_name="Asia/Seoul",
+        )
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg="조회 완료",
+            args=(),
+            exc_info=None,
+        )
+        record.created = dt.datetime(
+            2026, 8, 12, 15, 54, 36, tzinfo=dt.timezone.utc
+        ).timestamp()
+
+        self.assertEqual(
+            formatter.format(record),
+            "2026-08-13 00:54:36 KST INFO 조회 완료",
+        )
 
 
 class WatcherIntegrationTests(unittest.TestCase):
