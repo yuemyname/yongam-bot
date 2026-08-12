@@ -35,6 +35,7 @@ def make_config(project_dir: Path) -> Config:
                 "DYNAMIC_DATE_WINDOW=false",
                 "TARGET_START_DATE=2026-08-26",
                 "TARGET_END_DATE=2026-08-26",
+                "CGV_REQUEST_SPACING_SECONDS=0",
                 "STRICT_IMAX_MATCH=true",
                 "SUBSCRIPTIONS_ENABLED=false",
             ]
@@ -356,15 +357,15 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.state_file, volume_dir.resolve() / "notified.json")
             self.assertEqual(config.log_file, volume_dir.resolve() / "watcher.log")
 
-    def test_rate_limit_backoff_grows_and_caps_at_thirty_minutes(self):
+    def test_rate_limit_backoff_grows_and_caps_at_two_hours(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = make_config(Path(temporary))
 
             self.assertEqual(rate_limit_backoff_seconds(config, 0), 60)
-            self.assertEqual(rate_limit_backoff_seconds(config, 1), 600)
-            self.assertEqual(rate_limit_backoff_seconds(config, 2), 1200)
-            self.assertEqual(rate_limit_backoff_seconds(config, 3), 1800)
-            self.assertEqual(rate_limit_backoff_seconds(config, 4), 1800)
+            self.assertEqual(rate_limit_backoff_seconds(config, 1), 1800)
+            self.assertEqual(rate_limit_backoff_seconds(config, 2), 3600)
+            self.assertEqual(rate_limit_backoff_seconds(config, 3), 7200)
+            self.assertEqual(rate_limit_backoff_seconds(config, 4), 7200)
 
 
 class LoggingTests(unittest.TestCase):
@@ -396,12 +397,17 @@ class LoggingTests(unittest.TestCase):
 class WatcherIntegrationTests(unittest.TestCase):
     def test_reports_schedule_rate_limit_for_adaptive_backoff(self):
         with tempfile.TemporaryDirectory() as temporary:
-            config = make_config(Path(temporary))
+            config = dataclasses.replace(
+                make_config(Path(temporary)), target_end=dt.date(2026, 8, 28)
+            )
             logger = logging.getLogger(f"watcher-rate-limit-{id(self)}")
             logger.handlers = [logging.NullHandler()]
             watcher = Watcher(config, logger=logger, dry_run=True)
 
-            def fail_with_rate_limit(_date):
+            attempted_dates = []
+
+            def fail_with_rate_limit(show_date):
+                attempted_dates.append(show_date)
                 raise FetchError("CGV 응답 오류: HTTP 429")
 
             watcher.cgv.fetch_date = fail_with_rate_limit
@@ -409,6 +415,46 @@ class WatcherIntegrationTests(unittest.TestCase):
 
             self.assertEqual(result.failed_dates, 1)
             self.assertEqual(result.rate_limited_requests, 1)
+            self.assertEqual(result.schedule_skipped_dates, 2)
+            self.assertEqual(attempted_dates, [dt.date(2026, 8, 26)])
+
+    def test_stops_remaining_seat_requests_after_first_rate_limit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            logger = logging.getLogger(f"watcher-seat-rate-limit-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger, dry_run=True)
+            watcher.cgv.fetch_date = lambda _date: {
+                "data": [
+                    {
+                        "scnsNm": "IMAX관",
+                        "scnYmd": "20260826",
+                        "scnsrtTm": start_time,
+                        "scnsNo": "13",
+                        "scnSseq": sequence,
+                        "frSeatCnt": 2,
+                        "stcnt": 200,
+                    }
+                    for start_time, sequence in (
+                        ("1000", "1"),
+                        ("1400", "2"),
+                        ("1800", "3"),
+                    )
+                ]
+            }
+            attempted_sessions = []
+
+            def fail_first_seat_request(session):
+                attempted_sessions.append(session.start_time)
+                raise FetchError("CGV 응답 오류: HTTP 429")
+
+            watcher.cgv.fetch_seat_snapshot = fail_first_seat_request
+            result = watcher.run_cycle()
+
+            self.assertEqual(attempted_sessions, ["10:00"])
+            self.assertEqual(result.rate_limited_requests, 1)
+            self.assertEqual(result.seat_detail_errors, 1)
+            self.assertEqual(result.seat_detail_skipped, 2)
 
     def test_start_and_stop_commands_persist_subscribers(self):
         with tempfile.TemporaryDirectory() as temporary:
