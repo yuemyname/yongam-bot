@@ -8,7 +8,6 @@ credentials are neither accepted nor sent.
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import dataclasses
 import datetime as dt
 import getpass
@@ -147,10 +146,10 @@ class Config:
     target_start: dt.date
     target_end: dt.date
     poll_interval_seconds: int
+    cgv_request_spacing_seconds: int
     rate_limit_backoff_initial_seconds: int
     rate_limit_backoff_max_seconds: int
     request_timeout_seconds: int
-    max_workers: int
     imax_keywords: tuple[str, ...]
     imax_code_values: tuple[str, ...]
     strict_imax_match: bool
@@ -273,14 +272,20 @@ class Config:
                 minimum=30,
                 maximum=86400,
             ),
+            cgv_request_spacing_seconds=_parse_int(
+                value("CGV_REQUEST_SPACING_SECONDS", "2"),
+                name="CGV_REQUEST_SPACING_SECONDS",
+                minimum=0,
+                maximum=60,
+            ),
             rate_limit_backoff_initial_seconds=_parse_int(
-                value("RATE_LIMIT_BACKOFF_INITIAL_SECONDS", "600"),
+                value("RATE_LIMIT_BACKOFF_INITIAL_SECONDS", "1800"),
                 name="RATE_LIMIT_BACKOFF_INITIAL_SECONDS",
                 minimum=60,
                 maximum=86400,
             ),
             rate_limit_backoff_max_seconds=_parse_int(
-                value("RATE_LIMIT_BACKOFF_MAX_SECONDS", "1800"),
+                value("RATE_LIMIT_BACKOFF_MAX_SECONDS", "7200"),
                 name="RATE_LIMIT_BACKOFF_MAX_SECONDS",
                 minimum=60,
                 maximum=86400,
@@ -290,12 +295,6 @@ class Config:
                 name="REQUEST_TIMEOUT_SECONDS",
                 minimum=5,
                 maximum=60,
-            ),
-            max_workers=_parse_int(
-                value("MAX_WORKERS", "4"),
-                name="MAX_WORKERS",
-                minimum=1,
-                maximum=8,
             ),
             imax_keywords=keywords,
             imax_code_values=code_values,
@@ -1319,6 +1318,8 @@ class CycleResult:
     unclassified_fallback_alerts: int = 0
     seat_detail_errors: int = 0
     rate_limited_requests: int = 0
+    schedule_skipped_dates: int = 0
+    seat_detail_skipped: int = 0
 
 
 class Watcher:
@@ -1339,11 +1340,25 @@ class Watcher:
             timeout=config.request_timeout_seconds,
         )
         self.state = StateStore(config.state_file)
+        self._last_cgv_request_finished_at: float | None = None
         self.state.load()
         if not self.state.subscribers_initialized:
             self.state.initialize_subscribers(config.telegram_chat_id)
             if not self.dry_run:
                 self.state.save()
+
+    def _wait_for_cgv_request_slot(self) -> None:
+        """Keep CGV requests spaced apart instead of sending them in a burst."""
+
+        if self._last_cgv_request_finished_at is None:
+            return
+        elapsed = time.monotonic() - self._last_cgv_request_finished_at
+        remaining = self.config.cgv_request_spacing_seconds - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
+
+    def _mark_cgv_request_finished(self) -> None:
+        self._last_cgv_request_finished_at = time.monotonic()
 
     def _broadcast_message(self, text: str) -> tuple[int, int, int]:
         subscriber_ids = self.state.subscriber_ids()
@@ -1463,22 +1478,28 @@ class Watcher:
         dates = self.config.target_dates()
         payloads: dict[dt.date, Any] = {}
         errors: dict[dt.date, str] = {}
+        schedule_skipped_dates = 0
+        rate_limit_detected = False
 
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(self.config.max_workers, len(dates))
-        ) as executor:
-            pending = {
-                executor.submit(self.cgv.fetch_date, show_date): show_date
-                for show_date in dates
-            }
-            for future in concurrent.futures.as_completed(pending):
-                show_date = pending[future]
-                try:
-                    payloads[show_date] = future.result()
-                except FetchError as exc:
-                    errors[show_date] = str(exc)
-                except Exception as exc:  # Keep a single malformed date from stopping the watcher.
-                    errors[show_date] = f"예상하지 못한 조회 오류: {type(exc).__name__}"
+        for index, show_date in enumerate(dates):
+            self._wait_for_cgv_request_slot()
+            try:
+                payloads[show_date] = self.cgv.fetch_date(show_date)
+            except FetchError as exc:
+                message = str(exc)
+                errors[show_date] = message
+                if "HTTP 429" in message:
+                    rate_limit_detected = True
+                    schedule_skipped_dates = len(dates) - index - 1
+                    self.logger.warning(
+                        "CGV HTTP 429 감지: 남은 일정 조회 %d일을 즉시 생략합니다.",
+                        schedule_skipped_dates,
+                    )
+                    break
+            except Exception as exc:  # Keep a single malformed date from stopping the watcher.
+                errors[show_date] = f"예상하지 못한 조회 오류: {type(exc).__name__}"
+            finally:
+                self._mark_cgv_request_finished()
 
         session_map: dict[tuple[str, str], BookingSession] = {}
         for show_date, payload in payloads.items():
@@ -1534,31 +1555,47 @@ class Watcher:
                 # minute, which can trigger CGV's HTTP 429 rate limit.
                 snapshots[key] = previous
 
-        if seat_candidates:
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(self.config.max_workers, len(seat_candidates))
-            ) as executor:
-                pending_seats = {
-                    executor.submit(self.cgv.fetch_seat_snapshot, session): session
-                    for session in seat_candidates
-                }
-                for future in concurrent.futures.as_completed(pending_seats):
-                    session = pending_seats[future]
-                    key = session_keys[session]
-                    try:
-                        snapshots[key] = future.result()
-                    except FetchError as exc:
-                        seat_detail_errors[key] = str(exc)
-                        snapshots[key] = SeatSnapshot(
-                            total=session.remaining_seats or 0
+        seat_detail_skipped = 0
+        if rate_limit_detected:
+            seat_detail_skipped = len(seat_candidates)
+            for session in seat_candidates:
+                snapshots[session_keys[session]] = SeatSnapshot(
+                    total=session.remaining_seats or 0
+                )
+        else:
+            for index, session in enumerate(seat_candidates):
+                key = session_keys[session]
+                self._wait_for_cgv_request_slot()
+                try:
+                    snapshots[key] = self.cgv.fetch_seat_snapshot(session)
+                except FetchError as exc:
+                    message = str(exc)
+                    seat_detail_errors[key] = message
+                    snapshots[key] = SeatSnapshot(
+                        total=session.remaining_seats or 0
+                    )
+                    if "HTTP 429" in message:
+                        rate_limit_detected = True
+                        remaining_sessions = seat_candidates[index + 1 :]
+                        seat_detail_skipped = len(remaining_sessions)
+                        for skipped_session in remaining_sessions:
+                            snapshots[session_keys[skipped_session]] = SeatSnapshot(
+                                total=skipped_session.remaining_seats or 0
+                            )
+                        self.logger.warning(
+                            "CGV HTTP 429 감지: 남은 좌석 상세 조회 %d개를 즉시 생략합니다.",
+                            seat_detail_skipped,
                         )
-                    except Exception as exc:
-                        seat_detail_errors[key] = (
-                            f"예상하지 못한 좌석 조회 오류: {type(exc).__name__}"
-                        )
-                        snapshots[key] = SeatSnapshot(
-                            total=session.remaining_seats or 0
-                        )
+                        break
+                except Exception as exc:
+                    seat_detail_errors[key] = (
+                        f"예상하지 못한 좌석 조회 오류: {type(exc).__name__}"
+                    )
+                    snapshots[key] = SeatSnapshot(
+                        total=session.remaining_seats or 0
+                    )
+                finally:
+                    self._mark_cgv_request_finished()
 
         if seat_detail_errors:
             self.logger.warning(
@@ -1791,7 +1828,12 @@ class Watcher:
                     "⚠️ CGV 감시 조회 오류\n"
                     f"{status_word} 날짜 조회에 실패했습니다 ({len(errors)}/{len(dates)}일).\n"
                     f"원인: {unique_errors[0]}\n"
-                    "감시기는 계속 실행되며 자동 대기 후 다시 시도합니다."
+                    + (
+                        f"요청 제한으로 남은 {schedule_skipped_dates}일 조회를 생략했습니다.\n"
+                        if schedule_skipped_dates
+                        else ""
+                    )
+                    + "감시기는 계속 실행되며 자동 대기 후 다시 시도합니다."
                 )
                 delivered, _failed, total = self._broadcast_message(error_text)
                 if delivered or total == 0:
@@ -1807,7 +1849,7 @@ class Watcher:
             "조회 완료: 성공 %d일, 오류 %d일, IMAX 회차 %d개, 신규 %d개, "
             "좌석변경 %d개, 장애인석만 남아 제외 %d개, A열만 남아 제외 %d개, "
             "0석 제외 %d개, 좌석판별 대기 %d개, 미판별 7석 이상 알림 %d개, "
-            "HTTP 429 %d개",
+            "HTTP 429 %d개, 일정 생략 %d일, 좌석상세 생략 %d개",
             len(payloads),
             len(errors),
             len(sessions),
@@ -1819,6 +1861,8 @@ class Watcher:
             len(deferred_seat_detail_keys),
             unclassified_fallback_alerts,
             rate_limited_requests,
+            schedule_skipped_dates,
+            seat_detail_skipped,
         )
         return CycleResult(
             successful_dates=len(payloads),
@@ -1833,6 +1877,8 @@ class Watcher:
             unclassified_fallback_alerts=unclassified_fallback_alerts,
             seat_detail_errors=len(seat_detail_errors),
             rate_limited_requests=rate_limited_requests,
+            schedule_skipped_dates=schedule_skipped_dates,
+            seat_detail_skipped=seat_detail_skipped,
         )
 
 
