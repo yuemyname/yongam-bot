@@ -192,6 +192,39 @@ class SeatSnapshotTests(unittest.TestCase):
         self.assertTrue(matching.accessible_only)
         self.assertFalse(partial.accessible_only)
 
+    def test_row_a_only_requires_complete_matching_map(self):
+        def seat(number, row):
+            return {
+                "seatLocNo": number,
+                "seatRowNm": row,
+                "seatStusCd": "00",
+                "seatSaleYn": "Y",
+                "seatSalfrmCd": "01",
+            }
+
+        only_a = extract_seat_snapshot(
+            {"data": {"items": [{"seats": [seat("1", "A"), seat("2", "A열")]}]}},
+            scheduled_remaining=2,
+        )
+        mixed_rows = extract_seat_snapshot(
+            {"data": {"items": [{"seats": [seat("1", "A"), seat("2", "B")]}]}},
+            scheduled_remaining=2,
+        )
+        missing_row = extract_seat_snapshot(
+            {"data": {"items": [{"seats": [seat("1", "A"), seat("2", "")]}]}},
+            scheduled_remaining=2,
+        )
+        count_mismatch = extract_seat_snapshot(
+            {"data": {"items": [{"seats": [seat("1", "A"), seat("2", "A")]}]}},
+            scheduled_remaining=3,
+        )
+
+        self.assertTrue(only_a.row_a_only)
+        self.assertTrue(only_a.should_suppress)
+        self.assertFalse(mixed_rows.row_a_only)
+        self.assertFalse(missing_row.row_a_only)
+        self.assertFalse(count_mismatch.row_a_only)
+
 
 class StateStoreTests(unittest.TestCase):
     def test_persists_notification_keys(self):
@@ -218,14 +251,24 @@ class StateStoreTests(unittest.TestCase):
             store = StateStore(state_path)
             store.load()
             store.set_seat_snapshot(
-                "session", SeatSnapshot(total=5, general=3, accessible=2, mapped_total=5)
+                "session",
+                SeatSnapshot(
+                    total=5,
+                    general=3,
+                    accessible=2,
+                    mapped_total=5,
+                    available_rows=("A", "B"),
+                ),
             )
             store.save()
 
             reloaded = StateStore(state_path)
             reloaded.load()
-            self.assertEqual(reloaded.data["version"], 2)
+            self.assertEqual(reloaded.data["version"], 3)
             self.assertEqual(reloaded.seat_snapshot("session").general, 3)
+            self.assertEqual(
+                reloaded.seat_snapshot("session").available_rows, ("A", "B")
+            )
 
 
 class ConfigTests(unittest.TestCase):
@@ -401,6 +444,42 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(len(sent_messages), 1)
             self.assertEqual(second.seat_changes, 0)
             self.assertEqual(second.suppressed_accessible_only, 1)
+
+    def test_suppresses_new_session_when_only_row_a_remains(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            logger = logging.getLogger(f"watcher-row-a-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+
+            watcher.cgv.fetch_date = lambda _date: {
+                "data": [
+                    {
+                        "scnsNm": "IMAX관",
+                        "scnYmd": "20260826",
+                        "scnsrtTm": "1430",
+                        "scnsNo": "13",
+                        "scnSseq": "4",
+                        "frSeatCnt": 2,
+                        "stcnt": 200,
+                    }
+                ]
+            }
+            watcher.cgv.fetch_seat_snapshot = lambda _session: SeatSnapshot(
+                total=2,
+                general=2,
+                accessible=0,
+                mapped_total=2,
+                available_rows=("A",),
+            )
+            sent_messages = []
+            watcher.telegram.send_message = sent_messages.append
+
+            result = watcher.run_cycle()
+
+            self.assertEqual(sent_messages, [])
+            self.assertEqual(result.new_sessions, 0)
+            self.assertEqual(result.suppressed_row_a_only, 1)
 
 
 class CgvClientTests(unittest.TestCase):
