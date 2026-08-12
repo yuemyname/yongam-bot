@@ -1457,6 +1457,7 @@ class Watcher:
                     "/stop - 알림 해지\n"
                     "/status - 구독 상태 확인\n"
                     "/desc - 봇 설명과 사용 방법\n"
+                    "/coffee - 개발자에게 커피 후원\n"
                     "/help - 사용법 보기"
                 )
             elif command in {"/desc", "/description"}:
@@ -1479,7 +1480,15 @@ class Watcher:
                     "3. CGV 화면에서 IMAX 버튼 선택 후 예매\n\n"
                     "/status — 구독 상태 확인\n"
                     "/stop — 알림 해지\n"
+                    "/coffee — 개발자에게 커피 후원\n"
                     "/help — 전체 명령어 보기"
+                )
+            elif command in {"/coffee", "/donate"}:
+                reply = (
+                    "☕ 개발자에게 커피 한 잔 후원하기\n\n"
+                    "용아맥 알림 봇이 도움이 되었다면 Ko-fi에서 후원할 수 있어요.\n"
+                    "https://ko-fi.com/yuemyname\n\n"
+                    "후원 여부와 관계없이 모든 알림 기능은 동일하게 제공됩니다."
                 )
             else:
                 reply = "사용 가능한 명령어를 보려면 /help를 보내주세요."
