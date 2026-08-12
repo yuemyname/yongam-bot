@@ -50,7 +50,7 @@ SUBSCRIPTIONS_ENABLED=true
 2026-08-13 00:54:41 KST INFO 조회 완료: 성공 28일, 오류 0일, ...
 ```
 
-`HTTP 429`는 CGV가 요청을 일시적으로 제한한 상태입니다. 한 건이라도 발생하면 다음 전체 조회를 10분 뒤로 미루고, 연속으로 발생하면 20분, 30분까지 대기 시간을 늘립니다. 429 없이 조회가 끝나면 자동으로 1분 주기로 복귀합니다. 좌석 상세 판별만 실패한 경우에는 전체 잔여 좌석이 6석 이하면 알림을 보류하고, 7석 이상이면 좌석 종류를 확인하지 못했다는 표시와 함께 전체 잔여 수 기준으로 알림을 보냅니다.
+`HTTP 429`는 CGV가 요청을 일시적으로 제한한 상태입니다. 봇은 CGV 요청을 최소 2초 간격으로 하나씩 보내며, 첫 429가 나오면 해당 주기의 남은 일정·좌석 요청을 즉시 중단합니다. 다음 전체 조회는 30분 뒤로 미루고, 연속으로 발생하면 60분, 최대 120분까지 대기 시간을 늘립니다. 429 없이 조회가 끝나면 자동으로 1분 주기로 복귀합니다. 좌석 상세 판별만 실패한 경우에는 전체 잔여 좌석이 6석 이하면 알림을 보류하고, 7석 이상이면 좌석 종류를 확인하지 못했다는 표시와 함께 전체 잔여 수 기준으로 알림을 보냅니다.
 
 ## Mac에서 직접 실행
 
@@ -67,13 +67,13 @@ Mac이 잠자기 상태이거나 덮개가 닫혀 있으면 감시가 중단될 
 |---|---:|---|
 | `SUBSCRIPTIONS_ENABLED` | `true` | `/start`, `/stop` 자동 구독 기능 |
 | `POLL_INTERVAL_SECONDS` | `60` | CGV 조회 및 Telegram 명령 확인 주기 |
-| `RATE_LIMIT_BACKOFF_INITIAL_SECONDS` | `600` | HTTP 429 발생 후 첫 대기 시간(10분) |
-| `RATE_LIMIT_BACKOFF_MAX_SECONDS` | `1800` | 연속 HTTP 429 시 최대 대기 시간(30분) |
+| `CGV_REQUEST_SPACING_SECONDS` | `2` | 연속 CGV 요청 사이의 최소 간격 |
+| `RATE_LIMIT_BACKOFF_INITIAL_SECONDS` | `1800` | HTTP 429 발생 후 첫 대기 시간(30분) |
+| `RATE_LIMIT_BACKOFF_MAX_SECONDS` | `7200` | 연속 HTTP 429 시 최대 대기 시간(120분) |
 | `DYNAMIC_DATE_WINDOW` | `true` | 오늘 기준 감시 범위를 매일 이동 |
 | `TARGET_WINDOW_DAYS` | `28` | 오늘을 포함해 감시할 날짜 수 |
 | `APP_TIMEZONE` | `Asia/Seoul` | 날짜 계산 기준 시간대 |
 | `STRICT_IMAX_MATCH` | `true` | IMAX 이름 또는 코드가 있는 회차만 감지 |
-| `MAX_WORKERS` | `4` | 날짜별 조회 동시 작업 수 |
 
 ## 개발 및 테스트
 
