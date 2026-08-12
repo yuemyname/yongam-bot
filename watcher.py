@@ -1813,12 +1813,30 @@ class Watcher:
         )
 
 
+class TimezoneFormatter(logging.Formatter):
+    """Render log timestamps in the configured application timezone."""
+
+    def __init__(self, *args: Any, timezone_name: str, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self.timezone = ZoneInfo(timezone_name)
+
+    def formatTime(
+        self, record: logging.LogRecord, datefmt: str | None = None
+    ) -> str:
+        local_time = dt.datetime.fromtimestamp(record.created, tz=self.timezone)
+        if datefmt:
+            return local_time.strftime(datefmt)
+        return local_time.isoformat(sep=" ", timespec="milliseconds")
+
+
 def configure_logging(config: Config, *, verbose: bool = False) -> logging.Logger:
     logger = logging.getLogger("cgv_watcher")
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
     logger.handlers.clear()
-    formatter = logging.Formatter(
-        "%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    formatter = TimezoneFormatter(
+        "%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S %Z",
+        timezone_name=config.timezone_name,
     )
 
     stream = logging.StreamHandler()
