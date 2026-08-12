@@ -153,12 +153,17 @@ class SeatSnapshotTests(unittest.TestCase):
         )
         missing_rows = dataclasses.replace(complete, available_rows=None)
         count_mismatch = dataclasses.replace(complete, mapped_total=1)
+        unclassified_six = SeatSnapshot(total=6)
+        unclassified_seven = SeatSnapshot(total=7)
         sold_out = SeatSnapshot(total=0)
 
         self.assertTrue(complete.seat_map_complete)
         self.assertTrue(complete.alertable)
         self.assertFalse(missing_rows.alertable)
         self.assertFalse(count_mismatch.alertable)
+        self.assertFalse(unclassified_six.alertable)
+        self.assertTrue(unclassified_seven.alertable)
+        self.assertTrue(unclassified_seven.uses_unclassified_fallback)
         self.assertFalse(sold_out.alertable)
 
     def test_counts_available_general_and_accessible_seats(self):
@@ -629,6 +634,99 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(second.deferred_seat_details, 0)
             self.assertEqual(len(sent_messages), 1)
             self.assertTrue(watcher.state.was_notified(key))
+
+    def test_alerts_new_session_with_seven_seats_after_detail_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            logger = logging.getLogger(f"watcher-fallback-new-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            watcher.cgv.fetch_date = lambda _date: {
+                "data": [
+                    {
+                        "scnsNm": "IMAX관",
+                        "scnYmd": "20260826",
+                        "scnsrtTm": "1430",
+                        "scnsNo": "13",
+                        "scnSseq": "4",
+                        "frSeatCnt": 7,
+                        "stcnt": 200,
+                    }
+                ]
+            }
+
+            def fail_seat_detail(_session):
+                raise FetchError("CGV 응답 오류: HTTP 429")
+
+            watcher.cgv.fetch_seat_snapshot = fail_seat_detail
+            sent_messages = []
+            watcher.telegram.send_message = (
+                lambda text, **_kwargs: sent_messages.append(text)
+            )
+
+            result = watcher.run_cycle()
+            session = BookingSession(date="2026-08-26", start_time="14:30")
+            key = session.notification_key(site_no="0013", movie_no="30001323")
+
+            self.assertEqual(result.new_sessions, 1)
+            self.assertEqual(result.deferred_seat_details, 0)
+            self.assertEqual(result.seat_detail_errors, 1)
+            self.assertEqual(result.unclassified_fallback_alerts, 1)
+            self.assertEqual(len(sent_messages), 1)
+            self.assertIn("7/200석", sent_messages[0])
+            self.assertIn("좌석 종류 미확인", sent_messages[0])
+            self.assertTrue(watcher.state.was_notified(key))
+
+    def test_alerts_seat_change_with_seven_seats_after_detail_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            logger = logging.getLogger(f"watcher-fallback-change-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            remaining = {"count": 8}
+            watcher.cgv.fetch_date = lambda _date: {
+                "data": [
+                    {
+                        "scnsNm": "IMAX관",
+                        "scnYmd": "20260826",
+                        "scnsrtTm": "1430",
+                        "scnsNo": "13",
+                        "scnSseq": "4",
+                        "frSeatCnt": remaining["count"],
+                        "stcnt": 200,
+                    }
+                ]
+            }
+
+            def fetch_seat_snapshot(session):
+                if session.remaining_seats == 7:
+                    raise FetchError("CGV 응답 오류: HTTP 429")
+                return SeatSnapshot(
+                    total=8,
+                    general=8,
+                    accessible=0,
+                    mapped_total=8,
+                    available_rows=("B",),
+                )
+
+            watcher.cgv.fetch_seat_snapshot = fetch_seat_snapshot
+            sent_messages = []
+            watcher.telegram.send_message = (
+                lambda text, **_kwargs: sent_messages.append(text)
+            )
+
+            first = watcher.run_cycle()
+            remaining["count"] = 7
+            second = watcher.run_cycle()
+
+            self.assertEqual(first.new_sessions, 1)
+            self.assertEqual(second.seat_changes, 1)
+            self.assertEqual(second.deferred_seat_details, 0)
+            self.assertEqual(second.seat_detail_errors, 1)
+            self.assertEqual(second.unclassified_fallback_alerts, 1)
+            self.assertEqual(len(sent_messages), 2)
+            self.assertIn("7/200석 (이전 8/200석)", sent_messages[1])
+            self.assertIn("좌석 종류 미확인", sent_messages[1])
 
     def test_suppresses_change_to_zero_remaining_seats(self):
         with tempfile.TemporaryDirectory() as temporary:
