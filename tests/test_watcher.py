@@ -15,6 +15,7 @@ from watcher import (
     SeatSnapshot,
     StateStore,
     Watcher,
+    booking_url_for_session,
     extract_seat_snapshot,
     extract_sessions,
 )
@@ -225,6 +226,23 @@ class StateStoreTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_booking_url_preselects_movie_theater_and_date(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            session = BookingSession(date="2026-08-26", start_time="14:30")
+            url = booking_url_for_session(session, config)
+            query = dict(
+                urllib.parse.parse_qsl(
+                    urllib.parse.urlsplit(url).query, keep_blank_values=True
+                )
+            )
+
+            self.assertEqual(query["coCd"], "A420")
+            self.assertEqual(query["siteNo"], "0013")
+            self.assertEqual(query["siteNm"], "용산아이파크몰")
+            self.assertEqual(query["movNo"], "30001323")
+            self.assertEqual(query["scnYmd"], "20260826")
+
     def test_railway_environment_works_without_dotenv_and_uses_volume(self):
         with tempfile.TemporaryDirectory() as temporary:
             project_dir = Path(temporary)
