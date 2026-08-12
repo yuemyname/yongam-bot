@@ -1,4 +1,5 @@
 import datetime as dt
+import dataclasses
 import json
 import logging
 import os
@@ -32,6 +33,7 @@ def make_config(project_dir: Path) -> Config:
                 "TARGET_START_DATE=2026-08-26",
                 "TARGET_END_DATE=2026-08-26",
                 "STRICT_IMAX_MATCH=true",
+                "SUBSCRIPTIONS_ENABLED=false",
             ]
         )
         + "\n",
@@ -264,7 +266,7 @@ class StateStoreTests(unittest.TestCase):
 
             reloaded = StateStore(state_path)
             reloaded.load()
-            self.assertEqual(reloaded.data["version"], 3)
+            self.assertEqual(reloaded.data["version"], 4)
             self.assertEqual(reloaded.seat_snapshot("session").general, 3)
             self.assertEqual(
                 reloaded.seat_snapshot("session").available_rows, ("A", "B")
@@ -330,6 +332,59 @@ class ConfigTests(unittest.TestCase):
 
 
 class WatcherIntegrationTests(unittest.TestCase):
+    def test_start_and_stop_commands_persist_subscribers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = dataclasses.replace(
+                make_config(Path(temporary)), subscriptions_enabled=True
+            )
+            logger = logging.getLogger(f"watcher-subscriptions-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            replies = []
+            batches = [
+                [
+                    {
+                        "update_id": 10,
+                        "message": {
+                            "text": "/start@YongsanBot",
+                            "chat": {
+                                "id": 111222,
+                                "type": "private",
+                                "first_name": "구독자",
+                            },
+                        },
+                    }
+                ],
+                [
+                    {
+                        "update_id": 11,
+                        "message": {
+                            "text": "/stop",
+                            "chat": {"id": 111222, "type": "private"},
+                        },
+                    }
+                ],
+            ]
+            watcher.telegram.get_updates = lambda **_kwargs: batches.pop(0)
+            watcher.telegram.send_message = (
+                lambda text, **kwargs: replies.append((kwargs.get("chat_id"), text))
+            )
+
+            watcher.sync_subscribers()
+            self.assertTrue(watcher.state.is_subscribed("111222"))
+            self.assertIn("구독이 완료", replies[-1][1])
+            self.assertEqual(watcher.state.telegram_update_offset, 11)
+
+            watcher.sync_subscribers()
+            self.assertFalse(watcher.state.is_subscribed("111222"))
+            self.assertIn("구독을 해지", replies[-1][1])
+            self.assertEqual(watcher.state.telegram_update_offset, 12)
+
+            reloaded = StateStore(config.state_file)
+            reloaded.load()
+            self.assertFalse(reloaded.is_subscribed("111222"))
+            self.assertTrue(reloaded.is_subscribed(config.telegram_chat_id))
+
     def test_successful_send_is_persisted_and_not_repeated(self):
         with tempfile.TemporaryDirectory() as temporary:
             project_dir = Path(temporary)
@@ -349,7 +404,9 @@ class WatcherIntegrationTests(unittest.TestCase):
                 ]
             }
             sent_messages = []
-            watcher.telegram.send_message = sent_messages.append
+            watcher.telegram.send_message = (
+                lambda text, **_kwargs: sent_messages.append(text)
+            )
 
             first = watcher.run_cycle()
             second = watcher.run_cycle()
@@ -394,7 +451,9 @@ class WatcherIntegrationTests(unittest.TestCase):
                 mapped_total=session.remaining_seats,
             )
             sent_messages = []
-            watcher.telegram.send_message = sent_messages.append
+            watcher.telegram.send_message = (
+                lambda text, **_kwargs: sent_messages.append(text)
+            )
 
             first = watcher.run_cycle()
             remaining["count"] = 9
@@ -438,7 +497,9 @@ class WatcherIntegrationTests(unittest.TestCase):
                 mapped_total=availability["general"] + availability["accessible"],
             )
             sent_messages = []
-            watcher.telegram.send_message = sent_messages.append
+            watcher.telegram.send_message = (
+                lambda text, **_kwargs: sent_messages.append(text)
+            )
 
             watcher.run_cycle()
             availability.update(total=2, general=0, accessible=2)
@@ -476,7 +537,9 @@ class WatcherIntegrationTests(unittest.TestCase):
                 available_rows=("A",),
             )
             sent_messages = []
-            watcher.telegram.send_message = sent_messages.append
+            watcher.telegram.send_message = (
+                lambda text, **_kwargs: sent_messages.append(text)
+            )
 
             result = watcher.run_cycle()
 
