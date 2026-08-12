@@ -548,6 +548,39 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertIn("예매 바로가기 링크 열기", description)
             self.assertIn("/stop — 알림 해지", description)
 
+    def test_coffee_command_shows_kofi_donation_link(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = dataclasses.replace(
+                make_config(Path(temporary)), subscriptions_enabled=True
+            )
+            logger = logging.getLogger(f"watcher-coffee-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            replies = []
+            watcher.telegram.get_updates = lambda **_kwargs: [
+                {
+                    "update_id": 21,
+                    "message": {
+                        "text": "/coffee@YongsanBot",
+                        "chat": {
+                            "id": 111222,
+                            "type": "private",
+                            "first_name": "구독자",
+                        },
+                    },
+                }
+            ]
+            watcher.telegram.send_message = (
+                lambda text, **kwargs: replies.append((kwargs.get("chat_id"), text))
+            )
+
+            watcher.sync_subscribers()
+
+            self.assertEqual(replies[0][0], "111222")
+            self.assertIn("커피 한 잔 후원", replies[0][1])
+            self.assertIn("https://ko-fi.com/yuemyname", replies[0][1])
+            self.assertIn("모든 알림 기능은 동일", replies[0][1])
+
     def test_successful_send_is_persisted_and_not_repeated(self):
         with tempfile.TemporaryDirectory() as temporary:
             project_dir = Path(temporary)
