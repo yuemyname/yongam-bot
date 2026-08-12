@@ -1004,6 +1004,21 @@ def _alert_session_line(session: BookingSession) -> str:
     )
 
 
+def _alert_date_banner(date_text: str) -> str:
+    weekdays = ("월", "화", "수", "목", "금", "토", "일")
+    try:
+        parsed = dt.date.fromisoformat(date_text)
+    except ValueError:
+        display_date = date_text
+    else:
+        display_date = f"{date_text} ({weekdays[parsed.weekday()]})"
+    return (
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"📅 상영일: {display_date}\n"
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
 def booking_url_for_session(session: BookingSession, config: Config) -> str:
     """Build a CGV booking URL with movie, theater, and date preselected."""
 
@@ -1067,7 +1082,8 @@ def seat_change_message(
         "💺 CGV 잔여 좌석 변경",
         f"영화: {config.movie_label} ({config.movie_no})",
         f"극장: 용산아이파크몰 ({config.site_no})",
-        f"일자: {session.date}",
+        "",
+        _alert_date_banner(session.date),
         f"상영 시작시간: {session.start_time}",
         (
             "잔여좌석/총좌석: "
@@ -1101,7 +1117,8 @@ def message_chunks(
         lines = [_alert_session_line(session) for session in date_sessions]
         return (
             header
-            + f"일자: {show_date}\n"
+            + _alert_date_banner(show_date)
+            + "\n"
             + "\n".join(lines)
             + _booking_footer(date_sessions, config)
         )
