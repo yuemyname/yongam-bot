@@ -998,10 +998,7 @@ def _seat_ratio(session: BookingSession, *, remaining: int | None = None) -> str
 
 
 def _alert_session_line(session: BookingSession) -> str:
-    return (
-        f"• 상영 시작시간 {session.start_time} — "
-        f"잔여좌석/총좌석: {_seat_ratio(session)}"
-    )
+    return f"• 상영 시작시간 {session.start_time} — {_seat_ratio(session)}"
 
 
 def _alert_date_banner(date_text: str) -> str:
