@@ -13,6 +13,7 @@ from watcher import (
     BookingSession,
     CgvClient,
     Config,
+    FetchError,
     SeatSnapshot,
     StateStore,
     Watcher,
@@ -142,6 +143,24 @@ class ExtractSessionsTests(unittest.TestCase):
 
 
 class SeatSnapshotTests(unittest.TestCase):
+    def test_alertable_requires_matching_counts_and_complete_row_labels(self):
+        complete = SeatSnapshot(
+            total=2,
+            general=2,
+            accessible=0,
+            mapped_total=2,
+            available_rows=("B",),
+        )
+        missing_rows = dataclasses.replace(complete, available_rows=None)
+        count_mismatch = dataclasses.replace(complete, mapped_total=1)
+        sold_out = SeatSnapshot(total=0)
+
+        self.assertTrue(complete.seat_map_complete)
+        self.assertTrue(complete.alertable)
+        self.assertFalse(missing_rows.alertable)
+        self.assertFalse(count_mismatch.alertable)
+        self.assertFalse(sold_out.alertable)
+
     def test_counts_available_general_and_accessible_seats(self):
         payload = {
             "data": {
@@ -403,6 +422,13 @@ class WatcherIntegrationTests(unittest.TestCase):
                     }
                 ]
             }
+            watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
+                total=session.remaining_seats,
+                general=session.remaining_seats,
+                accessible=0,
+                mapped_total=session.remaining_seats,
+                available_rows=("B",),
+            )
             sent_messages = []
             watcher.telegram.send_message = (
                 lambda text, **_kwargs: sent_messages.append(text)
@@ -449,6 +475,7 @@ class WatcherIntegrationTests(unittest.TestCase):
                 general=session.remaining_seats - 2,
                 accessible=2,
                 mapped_total=session.remaining_seats,
+                available_rows=("B",),
             )
             sent_messages = []
             watcher.telegram.send_message = (
@@ -495,6 +522,7 @@ class WatcherIntegrationTests(unittest.TestCase):
                 general=availability["general"],
                 accessible=availability["accessible"],
                 mapped_total=availability["general"] + availability["accessible"],
+                available_rows=("B",),
             )
             sent_messages = []
             watcher.telegram.send_message = (
@@ -546,6 +574,104 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(sent_messages, [])
             self.assertEqual(result.new_sessions, 0)
             self.assertEqual(result.suppressed_row_a_only, 1)
+
+    def test_defers_new_alert_after_seat_detail_error_then_retries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            logger = logging.getLogger(f"watcher-deferred-detail-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            watcher.cgv.fetch_date = lambda _date: {
+                "data": [
+                    {
+                        "scnsNm": "IMAX관",
+                        "scnYmd": "20260826",
+                        "scnsrtTm": "1430",
+                        "scnsNo": "13",
+                        "scnSseq": "4",
+                        "frSeatCnt": 2,
+                        "stcnt": 200,
+                    }
+                ]
+            }
+            detail_available = {"value": False}
+
+            def fetch_seat_snapshot(_session):
+                if not detail_available["value"]:
+                    raise FetchError("CGV 응답 오류: HTTP 429")
+                return SeatSnapshot(
+                    total=2,
+                    general=2,
+                    accessible=0,
+                    mapped_total=2,
+                    available_rows=("B",),
+                )
+
+            watcher.cgv.fetch_seat_snapshot = fetch_seat_snapshot
+            sent_messages = []
+            watcher.telegram.send_message = (
+                lambda text, **_kwargs: sent_messages.append(text)
+            )
+
+            first = watcher.run_cycle()
+            session = BookingSession(date="2026-08-26", start_time="14:30")
+            key = session.notification_key(site_no="0013", movie_no="30001323")
+            self.assertEqual(first.new_sessions, 0)
+            self.assertEqual(first.deferred_seat_details, 1)
+            self.assertEqual(first.seat_detail_errors, 1)
+            self.assertFalse(watcher.state.was_notified(key))
+            self.assertEqual(sent_messages, [])
+
+            detail_available["value"] = True
+            second = watcher.run_cycle()
+
+            self.assertEqual(second.new_sessions, 1)
+            self.assertEqual(second.deferred_seat_details, 0)
+            self.assertEqual(len(sent_messages), 1)
+            self.assertTrue(watcher.state.was_notified(key))
+
+    def test_suppresses_change_to_zero_remaining_seats(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            logger = logging.getLogger(f"watcher-sold-out-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            remaining = {"count": 1}
+            watcher.cgv.fetch_date = lambda _date: {
+                "data": [
+                    {
+                        "scnsNm": "IMAX관",
+                        "scnYmd": "20260826",
+                        "scnsrtTm": "1430",
+                        "scnsNo": "13",
+                        "scnSseq": "4",
+                        "frSeatCnt": remaining["count"],
+                        "stcnt": 200,
+                    }
+                ]
+            }
+            watcher.cgv.fetch_seat_snapshot = lambda _session: SeatSnapshot(
+                total=1,
+                general=1,
+                accessible=0,
+                mapped_total=1,
+                available_rows=("B",),
+            )
+            sent_messages = []
+            watcher.telegram.send_message = (
+                lambda text, **_kwargs: sent_messages.append(text)
+            )
+
+            first = watcher.run_cycle()
+            remaining["count"] = 0
+            second = watcher.run_cycle()
+            third = watcher.run_cycle()
+
+            self.assertEqual(first.new_sessions, 1)
+            self.assertEqual(second.seat_changes, 0)
+            self.assertEqual(second.suppressed_sold_out, 1)
+            self.assertEqual(third.seat_changes, 0)
+            self.assertEqual(len(sent_messages), 1)
 
 
 class CgvClientTests(unittest.TestCase):
