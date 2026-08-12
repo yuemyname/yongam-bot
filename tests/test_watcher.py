@@ -8,7 +8,16 @@ import unittest
 from unittest.mock import patch
 import urllib.parse
 
-from watcher import BookingSession, CgvClient, Config, StateStore, Watcher, extract_sessions
+from watcher import (
+    BookingSession,
+    CgvClient,
+    Config,
+    SeatSnapshot,
+    StateStore,
+    Watcher,
+    extract_seat_snapshot,
+    extract_sessions,
+)
 
 
 def make_config(project_dir: Path) -> Config:
@@ -103,6 +112,82 @@ class ExtractSessionsTests(unittest.TestCase):
         self.assertEqual(len(sessions), 1)
         self.assertEqual(sessions[0].date, "2026-09-01")
 
+    def test_extracts_cgv_schedule_ids_and_remaining_seats(self):
+        payload = {
+            "data": [
+                {
+                    "scnsNm": "IMAX관",
+                    "scnYmd": "20260826",
+                    "scnsrtTm": "1430",
+                    "scnendTm": "1710",
+                    "scnsNo": "13",
+                    "scnSseq": "4",
+                    "frSeatCnt": "182",
+                }
+            ]
+        }
+        sessions = extract_sessions(
+            payload, requested_date=dt.date(2026, 8, 26), strict_imax_match=True
+        )
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0].screen_no, "13")
+        self.assertEqual(sessions[0].screen_sequence, "4")
+        self.assertEqual(sessions[0].remaining_seats, 182)
+
+
+class SeatSnapshotTests(unittest.TestCase):
+    def test_counts_available_general_and_accessible_seats(self):
+        payload = {
+            "data": {
+                "items": [
+                    {
+                        "seats": [
+                            {
+                                "seatLocNo": "1",
+                                "seatStusCd": "00",
+                                "seatSaleYn": "Y",
+                                "seatSalfrmCd": "01",
+                            },
+                            {
+                                "seatLocNo": "2",
+                                "seatStusCd": "00",
+                                "seatSaleYn": "Y",
+                                "seatSalfrmCd": "04",
+                            },
+                            {
+                                "seatLocNo": "3",
+                                "seatStusCd": "02",
+                                "seatSaleYn": "Y",
+                                "seatSalfrmCd": "01",
+                            },
+                        ]
+                    }
+                ]
+            }
+        }
+        snapshot = extract_seat_snapshot(payload, scheduled_remaining=2)
+        self.assertEqual(snapshot.general, 1)
+        self.assertEqual(snapshot.accessible, 1)
+        self.assertFalse(snapshot.accessible_only)
+
+    def test_accessible_only_requires_map_total_to_match_schedule(self):
+        seats = [
+            {
+                "seatLocNo": "W1",
+                "seatStusCd": "00",
+                "seatSaleYn": "Y",
+                "seatSalfrmCd": "04",
+            }
+        ]
+        matching = extract_seat_snapshot(
+            {"data": {"items": [{"seats": seats}]}}, scheduled_remaining=1
+        )
+        partial = extract_seat_snapshot(
+            {"data": {"items": [{"seats": seats}]}}, scheduled_remaining=2
+        )
+        self.assertTrue(matching.accessible_only)
+        self.assertFalse(partial.accessible_only)
+
 
 class StateStoreTests(unittest.TestCase):
     def test_persists_notification_keys(self):
@@ -119,6 +204,24 @@ class StateStoreTests(unittest.TestCase):
             self.assertTrue(reloaded.was_notified(key))
             parsed = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertEqual(parsed["notified"][key]["start_time"], "14:30")
+
+    def test_migrates_v1_state_and_persists_seat_snapshot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "notified.json"
+            state_path.write_text(
+                json.dumps({"version": 1, "notified": {}}), encoding="utf-8"
+            )
+            store = StateStore(state_path)
+            store.load()
+            store.set_seat_snapshot(
+                "session", SeatSnapshot(total=5, general=3, accessible=2, mapped_total=5)
+            )
+            store.save()
+
+            reloaded = StateStore(state_path)
+            reloaded.load()
+            self.assertEqual(reloaded.data["version"], 2)
+            self.assertEqual(reloaded.seat_snapshot("session").general, 3)
 
 
 class ConfigTests(unittest.TestCase):
@@ -167,6 +270,83 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertIn("2026-08-26 14:30", sent_messages[0])
             self.assertTrue(config.state_file.exists())
 
+    def test_sends_one_alert_for_each_seat_count_change(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            logger = logging.getLogger(f"watcher-seat-change-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            remaining = {"count": 10}
+
+            watcher.cgv.fetch_date = lambda _date: {
+                "data": [
+                    {
+                        "scnsNm": "IMAX관",
+                        "scnYmd": "20260826",
+                        "scnsrtTm": "1430",
+                        "scnsNo": "13",
+                        "scnSseq": "4",
+                        "frSeatCnt": remaining["count"],
+                    }
+                ]
+            }
+            watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
+                total=session.remaining_seats,
+                general=session.remaining_seats - 2,
+                accessible=2,
+                mapped_total=session.remaining_seats,
+            )
+            sent_messages = []
+            watcher.telegram.send_message = sent_messages.append
+
+            first = watcher.run_cycle()
+            remaining["count"] = 9
+            second = watcher.run_cycle()
+            third = watcher.run_cycle()
+
+            self.assertEqual(first.new_sessions, 1)
+            self.assertEqual(second.seat_changes, 1)
+            self.assertEqual(third.seat_changes, 0)
+            self.assertEqual(len(sent_messages), 2)
+            self.assertIn("전체 잔여: 10석 → 9석", sent_messages[1])
+
+    def test_suppresses_change_when_only_accessible_seats_remain(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            logger = logging.getLogger(f"watcher-accessible-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            availability = {"total": 3, "general": 1, "accessible": 2}
+
+            watcher.cgv.fetch_date = lambda _date: {
+                "data": [
+                    {
+                        "scnsNm": "IMAX관",
+                        "scnYmd": "20260826",
+                        "scnsrtTm": "1430",
+                        "scnsNo": "13",
+                        "scnSseq": "4",
+                        "frSeatCnt": availability["total"],
+                    }
+                ]
+            }
+            watcher.cgv.fetch_seat_snapshot = lambda _session: SeatSnapshot(
+                total=availability["total"],
+                general=availability["general"],
+                accessible=availability["accessible"],
+                mapped_total=availability["general"] + availability["accessible"],
+            )
+            sent_messages = []
+            watcher.telegram.send_message = sent_messages.append
+
+            watcher.run_cycle()
+            availability.update(total=2, general=0, accessible=2)
+            second = watcher.run_cycle()
+
+            self.assertEqual(len(sent_messages), 1)
+            self.assertEqual(second.seat_changes, 0)
+            self.assertEqual(second.suppressed_accessible_only, 1)
+
 
 class CgvClientTests(unittest.TestCase):
     def test_anonymous_request_has_expected_query_and_no_login_headers(self):
@@ -191,13 +371,60 @@ class CgvClientTests(unittest.TestCase):
 
             request = opened.call_args.args[0]
             headers = {key.lower(): value for key, value in request.header_items()}
-            query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(request.full_url).query))
+            query = dict(
+                urllib.parse.parse_qsl(
+                    urllib.parse.urlsplit(request.full_url).query,
+                    keep_blank_values=True,
+                )
+            )
             self.assertEqual(payload, {"data": []})
             self.assertNotIn("authorization", headers)
             self.assertNotIn("cookie", headers)
             self.assertEqual(query["siteNo"], "0013")
             self.assertEqual(query["movNo"], "30001323")
             self.assertEqual(query["scnYmd"], "20260826")
+
+    def test_seat_request_is_anonymous_and_uses_schedule_identifiers(self):
+        class FakeResponse:
+            status = 200
+            headers = {"Content-Type": "application/json"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback):
+                return False
+
+            def read(self, _limit):
+                return b'{"data": {"items": []}}'
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            client = CgvClient(config)
+            session = BookingSession(
+                date="2026-08-26",
+                start_time="14:30",
+                screen_no="13",
+                screen_sequence="4",
+                remaining_seats=182,
+            )
+            with patch("watcher.urllib.request.urlopen", return_value=FakeResponse()) as opened:
+                snapshot = client.fetch_seat_snapshot(session)
+
+            request = opened.call_args.args[0]
+            headers = {key.lower(): value for key, value in request.header_items()}
+            query = dict(
+                urllib.parse.parse_qsl(
+                    urllib.parse.urlsplit(request.full_url).query,
+                    keep_blank_values=True,
+                )
+            )
+            self.assertEqual(snapshot.total, 182)
+            self.assertNotIn("authorization", headers)
+            self.assertNotIn("cookie", headers)
+            self.assertEqual(query["scnsNo"], "13")
+            self.assertEqual(query["scnSseq"], "4")
+            self.assertEqual(query["custNo"], "")
 
 
 if __name__ == "__main__":
