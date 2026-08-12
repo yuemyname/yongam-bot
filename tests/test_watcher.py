@@ -28,6 +28,7 @@ def make_config(project_dir: Path) -> Config:
             [
                 "TELEGRAM_BOT_TOKEN=123456:test-token",
                 "TELEGRAM_CHAT_ID=987654",
+                "DYNAMIC_DATE_WINDOW=false",
                 "TARGET_START_DATE=2026-08-26",
                 "TARGET_END_DATE=2026-08-26",
                 "STRICT_IMAX_MATCH=true",
@@ -124,6 +125,7 @@ class ExtractSessionsTests(unittest.TestCase):
                     "scnsNo": "13",
                     "scnSseq": "4",
                     "frSeatCnt": "182",
+                    "stcnt": "624",
                 }
             ]
         }
@@ -134,6 +136,7 @@ class ExtractSessionsTests(unittest.TestCase):
         self.assertEqual(sessions[0].screen_no, "13")
         self.assertEqual(sessions[0].screen_sequence, "4")
         self.assertEqual(sessions[0].remaining_seats, 182)
+        self.assertEqual(sessions[0].total_seats, 624)
 
 
 class SeatSnapshotTests(unittest.TestCase):
@@ -226,6 +229,30 @@ class StateStoreTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_dynamic_window_is_today_plus_27_days(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project_dir = Path(temporary)
+            env_path = project_dir / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TELEGRAM_BOT_TOKEN=123456:test-token",
+                        "TELEGRAM_CHAT_ID=987654",
+                        "DYNAMIC_DATE_WINDOW=true",
+                        "TARGET_WINDOW_DAYS=28",
+                        "APP_TIMEZONE=Asia/Seoul",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config = Config.from_env_file(env_path)
+            dates = config.target_dates(today=dt.date(2026, 8, 12))
+
+            self.assertEqual(len(dates), 28)
+            self.assertEqual(dates[0], dt.date(2026, 8, 12))
+            self.assertEqual(dates[-1], dt.date(2026, 9, 8))
+
     def test_booking_url_preselects_movie_theater_and_date(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = make_config(Path(temporary))
@@ -273,6 +300,8 @@ class WatcherIntegrationTests(unittest.TestCase):
                         "screenName": "IMAX관",
                         "scnYmd": "20260826",
                         "scnFrTm": "1430",
+                        "frSeatCnt": 100,
+                        "stcnt": 624,
                     }
                 ]
             }
@@ -285,7 +314,11 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(first.new_sessions, 1)
             self.assertEqual(second.new_sessions, 0)
             self.assertEqual(len(sent_messages), 1)
-            self.assertIn("2026-08-26 14:30", sent_messages[0])
+            self.assertIn("일자: 2026-08-26", sent_messages[0])
+            self.assertIn(
+                "상영 시작시간 14:30 — 잔여좌석/총좌석: 100/624석",
+                sent_messages[0],
+            )
             self.assertTrue(config.state_file.exists())
 
     def test_sends_one_alert_for_each_seat_count_change(self):
@@ -305,6 +338,7 @@ class WatcherIntegrationTests(unittest.TestCase):
                         "scnsNo": "13",
                         "scnSseq": "4",
                         "frSeatCnt": remaining["count"],
+                        "stcnt": 200,
                     }
                 ]
             }
@@ -326,7 +360,9 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(second.seat_changes, 1)
             self.assertEqual(third.seat_changes, 0)
             self.assertEqual(len(sent_messages), 2)
-            self.assertIn("전체 잔여: 10석 → 9석", sent_messages[1])
+            self.assertIn(
+                "잔여좌석/총좌석: 9/200석 (이전 10/200석)", sent_messages[1]
+            )
 
     def test_suppresses_change_when_only_accessible_seats_remain(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -345,6 +381,7 @@ class WatcherIntegrationTests(unittest.TestCase):
                         "scnsNo": "13",
                         "scnSseq": "4",
                         "frSeatCnt": availability["total"],
+                        "stcnt": 200,
                     }
                 ]
             }
