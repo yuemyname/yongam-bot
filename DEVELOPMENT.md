@@ -12,6 +12,7 @@
 start - 알림 구독
 stop - 알림 해지
 status - 구독 상태 확인
+desc - 봇 설명과 사용 방법
 help - 사용법 보기
 ```
 
