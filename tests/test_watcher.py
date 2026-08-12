@@ -21,6 +21,7 @@ from watcher import (
     booking_url_for_session,
     extract_seat_snapshot,
     extract_sessions,
+    rate_limit_backoff_seconds,
 )
 
 
@@ -355,6 +356,16 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.state_file, volume_dir.resolve() / "notified.json")
             self.assertEqual(config.log_file, volume_dir.resolve() / "watcher.log")
 
+    def test_rate_limit_backoff_grows_and_caps_at_thirty_minutes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+
+            self.assertEqual(rate_limit_backoff_seconds(config, 0), 60)
+            self.assertEqual(rate_limit_backoff_seconds(config, 1), 600)
+            self.assertEqual(rate_limit_backoff_seconds(config, 2), 1200)
+            self.assertEqual(rate_limit_backoff_seconds(config, 3), 1800)
+            self.assertEqual(rate_limit_backoff_seconds(config, 4), 1800)
+
 
 class LoggingTests(unittest.TestCase):
     def test_formats_railway_utc_timestamp_as_korean_time(self):
@@ -383,6 +394,22 @@ class LoggingTests(unittest.TestCase):
 
 
 class WatcherIntegrationTests(unittest.TestCase):
+    def test_reports_schedule_rate_limit_for_adaptive_backoff(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            logger = logging.getLogger(f"watcher-rate-limit-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger, dry_run=True)
+
+            def fail_with_rate_limit(_date):
+                raise FetchError("CGV 응답 오류: HTTP 429")
+
+            watcher.cgv.fetch_date = fail_with_rate_limit
+            result = watcher.run_cycle()
+
+            self.assertEqual(result.failed_dates, 1)
+            self.assertEqual(result.rate_limited_requests, 1)
+
     def test_start_and_stop_commands_persist_subscribers(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = dataclasses.replace(
