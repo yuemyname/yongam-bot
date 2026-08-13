@@ -28,6 +28,7 @@ from watcher import (
     FetchError,
     SeatSnapshot,
     StateStore,
+    TelegramError,
     TimezoneFormatter,
     Watcher,
     booking_url_for_session,
@@ -274,6 +275,36 @@ class SeatSnapshotTests(unittest.TestCase):
         self.assertFalse(missing_row.row_a_only)
         self.assertFalse(count_mismatch.row_a_only)
 
+    def test_row_a_only_ignores_accessible_seats_in_other_rows(self):
+        payload = {
+            "data": {
+                "seats": [
+                    {
+                        "seatLocNo": "A1",
+                        "seatRowNm": "A",
+                        "seatStusCd": "00",
+                        "seatSaleYn": "Y",
+                        "seatSalfrmCd": "01",
+                    },
+                    {
+                        "seatLocNo": "W1",
+                        "seatRowNm": "B",
+                        "seatStusCd": "00",
+                        "seatSaleYn": "Y",
+                        "seatSalfrmCd": "04",
+                    },
+                ]
+            }
+        }
+
+        snapshot = extract_seat_snapshot(payload, scheduled_remaining=2)
+
+        self.assertEqual(snapshot.general, 1)
+        self.assertEqual(snapshot.accessible, 1)
+        self.assertEqual(snapshot.available_rows, ("A",))
+        self.assertTrue(snapshot.row_a_only)
+        self.assertTrue(snapshot.should_suppress)
+
 
 class StateStoreTests(unittest.TestCase):
     def test_persists_notification_keys(self):
@@ -318,7 +349,6 @@ class StateStoreTests(unittest.TestCase):
             self.assertEqual(
                 reloaded.seat_snapshot("session").available_rows, ("A", "B")
             )
-
 
 class StatePruningTests(unittest.TestCase):
     @staticmethod
@@ -499,9 +529,17 @@ class ScanPlanTests(unittest.TestCase):
 
             self.assertFalse(plan.full_scan)
             self.assertEqual(plan.open_end, dt.date(2026, 8, 20))
-            # 08-13..08-20 open, then a three-day probe through 08-23.
-            self.assertEqual(plan.dates[0], self.TODAY)
-            self.assertEqual(plan.dates[-1], dt.date(2026, 8, 23))
+            # The three-day new-opening probe comes before known open dates.
+            self.assertEqual(
+                plan.dates[:3],
+                (
+                    dt.date(2026, 8, 21),
+                    dt.date(2026, 8, 22),
+                    dt.date(2026, 8, 23),
+                ),
+            )
+            self.assertEqual(plan.dates[3], self.TODAY)
+            self.assertEqual(plan.dates[-1], dt.date(2026, 8, 20))
             self.assertEqual(len(plan.dates), 11)
 
     def test_probe_stays_anchored_to_today_when_the_frontier_has_passed(self):
@@ -844,6 +882,107 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual({chat_id for chat_id, _ in sent}, {"2", "3"})
             self.assertIn("잔여 좌석 변경", sent[0][1])
 
+    def test_partial_open_delivery_retries_only_the_failed_subscriber(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            logger = logging.getLogger(f"watcher-partial-send-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            watcher.state.remove_subscriber(config.telegram_chat_id)
+            watcher.state.add_subscriber("ok")
+            watcher.state.add_subscriber("retry")
+            watcher.cgv.fetch_date = lambda _date: self._schedule_payload(10)
+            watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
+                total=session.remaining_seats,
+                general=session.remaining_seats,
+                accessible=0,
+                mapped_total=session.remaining_seats,
+                available_rows=("B",),
+            )
+
+            attempts = []
+            successful = []
+
+            def first_send(text, **kwargs):
+                chat_id = kwargs.get("chat_id")
+                attempts.append(chat_id)
+                if chat_id == "retry":
+                    raise TelegramError("일시적인 테스트 오류")
+                successful.append(chat_id)
+
+            watcher.telegram.send_message = first_send
+            first = watcher.run_cycle()
+            self.assertEqual(first.new_sessions, 1)
+            self.assertEqual(successful, ["ok"])
+            self.assertEqual(len(watcher.state.pending_deliveries()), 1)
+
+            # The failed-recipient queue survives a Railway restart.
+            restarted = Watcher(config, logger=logger)
+            restarted.cgv.fetch_date = watcher.cgv.fetch_date
+            restarted.cgv.fetch_seat_snapshot = watcher.cgv.fetch_seat_snapshot
+            self.assertEqual(len(restarted.state.pending_deliveries()), 1)
+
+            def recovered_send(text, **kwargs):
+                chat_id = kwargs.get("chat_id")
+                attempts.append(chat_id)
+                successful.append(chat_id)
+
+            restarted.telegram.send_message = recovered_send
+            second = restarted.run_cycle()
+
+            self.assertEqual(second.new_sessions, 0)
+            self.assertEqual(attempts.count("ok"), 1)
+            self.assertEqual(attempts.count("retry"), 2)
+            self.assertEqual(successful, ["ok", "retry"])
+            self.assertEqual(restarted.state.pending_deliveries(), ())
+
+    def test_partial_seat_delivery_retries_without_repeating_for_others(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            logger = logging.getLogger(f"watcher-partial-seat-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            watcher.state.remove_subscriber(config.telegram_chat_id)
+            watcher.state.add_subscriber("ok")
+            watcher.state.add_subscriber("retry")
+            remaining = {"count": 10}
+            watcher.cgv.fetch_date = lambda _date: self._schedule_payload(
+                remaining["count"]
+            )
+            watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
+                total=session.remaining_seats,
+                general=session.remaining_seats,
+                accessible=0,
+                mapped_total=session.remaining_seats,
+                available_rows=("B",),
+            )
+            watcher.telegram.send_message = lambda text, **kwargs: None
+            watcher.run_cycle()
+
+            attempts = []
+
+            def partial_send(text, **kwargs):
+                chat_id = kwargs.get("chat_id")
+                attempts.append(chat_id)
+                if chat_id == "retry":
+                    raise TelegramError("일시적인 테스트 오류")
+
+            remaining["count"] = 9
+            watcher.telegram.send_message = partial_send
+            changed = watcher.run_cycle()
+            self.assertEqual(changed.seat_changes, 1)
+            self.assertEqual(len(watcher.state.pending_deliveries()), 1)
+
+            watcher.telegram.send_message = lambda text, **kwargs: attempts.append(
+                kwargs.get("chat_id")
+            )
+            unchanged = watcher.run_cycle()
+
+            self.assertEqual(unchanged.seat_changes, 0)
+            self.assertEqual(attempts.count("ok"), 1)
+            self.assertEqual(attempts.count("retry"), 2)
+            self.assertEqual(watcher.state.pending_deliveries(), ())
+
     def test_open_alert_is_marked_notified_even_with_no_open_subscribers(self):
         with tempfile.TemporaryDirectory() as temporary:
             watcher = self._watcher_with_three_alert_modes(temporary, "no-open-subs")
@@ -1105,7 +1244,14 @@ class WatcherIntegrationTests(unittest.TestCase):
                 second = watcher.run_cycle()
                 self.assertFalse(second.full_scan)
                 self.assertEqual(second.requested_dates, 11)
-                self.assertEqual(requested[-1], dt.date(2026, 8, 23))
+                self.assertEqual(
+                    requested[:3],
+                    [
+                        dt.date(2026, 8, 21),
+                        dt.date(2026, 8, 22),
+                        dt.date(2026, 8, 23),
+                    ],
+                )
 
                 # CGV opens further ahead; the probe catches it and the cycle
                 # widens to find the new end of the open range.
@@ -1116,6 +1262,11 @@ class WatcherIntegrationTests(unittest.TestCase):
                 self.assertFalse(third.full_scan)
                 self.assertGreater(third.requested_dates, 11)
                 self.assertIn(dt.date(2026, 8, 30), requested)
+                self.assertLess(
+                    requested.index(dt.date(2026, 8, 24)),
+                    requested.index(today),
+                    "확장 신규 오픈 날짜가 기존 취소표 날짜보다 먼저여야 합니다",
+                )
                 self.assertEqual(
                     watcher.state.frontier_date, dt.date(2026, 8, 30)
                 )
@@ -1386,6 +1537,66 @@ class WatcherIntegrationTests(unittest.TestCase):
                 events[0], ("fetch", dt.date(2026, 8, 13).isoformat())
             )
             self.assertEqual(events[1][0], "send")
+
+    def test_new_open_alert_precedes_seat_change_on_the_same_date(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = dataclasses.replace(
+                make_config(Path(temporary)),
+                dynamic_date_window=True,
+                target_window_days=1,
+            )
+            logger = logging.getLogger(f"watcher-open-priority-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            phase = {"new_open": False}
+
+            def fetch(show_date):
+                sessions = [
+                    {
+                        "scnsNm": "IMAX관",
+                        "scnYmd": show_date.strftime("%Y%m%d"),
+                        "scnsrtTm": "1900",
+                        "scnsNo": "13",
+                        "scnSseq": "1",
+                        "frSeatCnt": 9 if phase["new_open"] else 10,
+                        "stcnt": 200,
+                    }
+                ]
+                if phase["new_open"]:
+                    sessions.append(
+                        {
+                            "scnsNm": "IMAX관",
+                            "scnYmd": show_date.strftime("%Y%m%d"),
+                            "scnsrtTm": "2000",
+                            "scnsNo": "13",
+                            "scnSseq": "2",
+                            "frSeatCnt": 100,
+                            "stcnt": 200,
+                        }
+                    )
+                return {"data": sessions}
+
+            watcher.cgv.fetch_date = fetch
+            watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
+                total=session.remaining_seats,
+                general=session.remaining_seats,
+                accessible=0,
+                mapped_total=session.remaining_seats,
+                available_rows=("B",),
+            )
+            watcher.telegram.send_message = lambda text, **_kwargs: None
+            watcher.run_cycle()
+
+            sent = []
+            phase["new_open"] = True
+            watcher.telegram.send_message = lambda text, **_kwargs: sent.append(text)
+            result = watcher.run_cycle()
+
+            self.assertEqual(result.new_sessions, 1)
+            self.assertEqual(result.seat_changes, 1)
+            self.assertEqual(len(sent), 2)
+            self.assertIn("예매 오픈 감지", sent[0])
+            self.assertIn("잔여 좌석 변경", sent[1])
 
     def test_state_is_saved_as_each_date_finishes(self):
         with tempfile.TemporaryDirectory() as temporary:
