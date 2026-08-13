@@ -37,7 +37,7 @@ DEFAULT_BOOKING_URL = "https://cgv.co.kr/cnm/movieBook/movie"
 DEFAULT_SEAT_PAGE_URL = "https://cgv.co.kr/cnm/selectVisitorCnt"
 DEFAULT_SITE_NAME = "용산아이파크몰"
 UNCLASSIFIED_ALERT_MIN_SEATS = 7
-STATE_VERSION = 6
+STATE_VERSION = 7
 
 # Scanning strategy.  "full" requests every date in the window each cycle.
 # "cursor" requests only the already-open range plus a short probe past the
@@ -263,6 +263,7 @@ class Config:
     subscriptions_enabled: bool
     scan_mode: str
     booking_close_margin_minutes: int
+    deferred_recheck_cycles: int
     cursor_probe_days: int
     cursor_expansion_days: int
     full_scan_every_cycles: int
@@ -429,6 +430,12 @@ class Config:
                 name="BOOKING_CLOSE_MARGIN_MINUTES",
                 minimum=0,
                 maximum=240,
+            ),
+            deferred_recheck_cycles=_parse_int(
+                value("DEFERRED_RECHECK_CYCLES", "5"),
+                name="DEFERRED_RECHECK_CYCLES",
+                minimum=1,
+                maximum=60,
             ),
             cursor_probe_days=_parse_int(
                 value("CURSOR_PROBE_DAYS", "3"),
@@ -1167,6 +1174,7 @@ class StateStore:
             "subscribers_initialized": False,
             "telegram_update_offset": 0,
             "frontier_date": "",
+            "deferred": {},
             "last_error_fingerprint": "",
             "last_error_notified_at": "",
         }
@@ -1194,6 +1202,7 @@ class StateStore:
             self.data.setdefault("subscribers_initialized", False)
             self.data.setdefault("telegram_update_offset", 0)
             self.data.setdefault("frontier_date", "")
+            self.data.setdefault("deferred", {})
 
     def was_notified(self, key: str) -> bool:
         with self._lock:
@@ -1221,7 +1230,7 @@ class StateStore:
         cutoff = today - dt.timedelta(days=STATE_RETENTION_DAYS)
         removed = 0
         with self._lock:
-            for bucket in ("notified", "seat_counts"):
+            for bucket in ("notified", "seat_counts", "deferred"):
                 records = self.data.get(bucket)
                 if not isinstance(records, dict):
                     continue
@@ -1302,6 +1311,48 @@ class StateStore:
             updated = dict(record)
             updated["verified_seats_only"] = bool(value)
             self.data["subscribers"][str(chat_id)] = updated
+            return True
+
+    def note_deferred(self, key: str, total: int, skips: int) -> bool:
+        """Remember that a showing could not be classified at this seat count.
+
+        CGV's seat map is readable or it is not; asking again sixty seconds
+        later almost never changes the answer, so record how many cycles to
+        coast before spending another request on it.
+        """
+
+        with self._lock:
+            bucket = self.data.setdefault("deferred", {})
+            record = {"total": int(total), "skips": max(0, int(skips))}
+            if bucket.get(key) == record:
+                return False
+            bucket[key] = record
+            return True
+
+    def clear_deferred(self, key: str) -> bool:
+        with self._lock:
+            bucket = self.data.setdefault("deferred", {})
+            return bucket.pop(key, None) is not None
+
+    def take_deferred_skip(self, key: str, remaining: int) -> bool:
+        """True when this cycle should coast instead of re-reading seat detail.
+
+        A changed seat count always earns a fresh look — something happened,
+        and the new count may well be classifiable.
+        """
+
+        with self._lock:
+            bucket = self.data.setdefault("deferred", {})
+            record = bucket.get(key)
+            if not isinstance(record, Mapping):
+                return False
+            if record.get("total") != remaining:
+                bucket.pop(key, None)
+                return False
+            skips = int(record.get("skips", 0))
+            if skips <= 0:
+                return False
+            bucket[key] = {"total": remaining, "skips": skips - 1}
             return True
 
     def subscriber_breakdown(self) -> dict[str, Any]:
@@ -1676,6 +1727,7 @@ class CycleResult:
     requested_dates: int = 0
     full_scan: bool = True
     suppressed_closed: int = 0
+    deferred_rechecks_skipped: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1713,6 +1765,7 @@ class _CycleTally:
     rate_limited_requests: int = 0
     schedule_skipped_dates: int = 0
     seat_detail_skipped: int = 0
+    deferred_rechecks_skipped: int = 0
     rate_limited: bool = False
     latest_session_date: str = ""
     # A key can be deferred both as a new session and as a seat change; a set
@@ -2380,6 +2433,21 @@ class Watcher:
                     and not previous.seat_map_complete
                 )
             )
+            # Only showings already announced may coast.  One we have never
+            # alerted on still owes the subscriber a booking-open message, so
+            # it keeps asking every cycle until the seat map can be read.
+            if (
+                needs_detail
+                and key in previously_notified
+                and not self.dry_run
+                and self.state.take_deferred_skip(key, remaining)
+            ):
+                # Leaving the snapshot unset keeps the showing classified as
+                # deferred downstream, exactly as a fresh unreadable map would.
+                tally.deferred_keys.add(key)
+                tally.deferred_rechecks_skipped += 1
+                tally.dirty = True
+                continue
             if needs_detail:
                 seat_candidates.append(session)
             else:
@@ -2434,6 +2502,29 @@ class Watcher:
                     )
                 finally:
                     self._mark_cgv_request_finished()
+
+        if not self.dry_run:
+            for session in seat_candidates:
+                key = session_keys[session]
+                snapshot = snapshots.get(key)
+                if snapshot is None:
+                    continue
+                unresolved = (
+                    key in previously_notified
+                    and snapshot.total > 0
+                    and not snapshot.should_suppress
+                    and not snapshot.alertable
+                )
+                changed = (
+                    self.state.note_deferred(
+                        key,
+                        snapshot.total,
+                        self.config.deferred_recheck_cycles - 1,
+                    )
+                    if unresolved
+                    else self.state.clear_deferred(key)
+                )
+                tally.dirty = tally.dirty or changed
 
         detected_new_sessions = [
             session
@@ -2763,7 +2854,8 @@ class Watcher:
             "좌석변경 %d개, 장애인석만 남아 제외 %d개, A열만 남아 제외 %d개, "
             "0석 제외 %d개, 예매 마감 제외 %d개, 좌석판별 대기 %d개, "
             "미판별 7석 이상 알림 %d개, "
-            "HTTP 429 %d개, 일정 생략 %d일, 좌석상세 생략 %d개",
+            "HTTP 429 %d개, 일정 생략 %d일, 좌석상세 생략 %d개, "
+            "보류 재조회 생략 %d개",
             tally.successful_dates,
             len(errors),
             tally.matching_sessions,
@@ -2778,6 +2870,7 @@ class Watcher:
             tally.rate_limited_requests,
             tally.schedule_skipped_dates,
             tally.seat_detail_skipped,
+            tally.deferred_rechecks_skipped,
         )
         return CycleResult(
             successful_dates=tally.successful_dates,
@@ -2797,6 +2890,7 @@ class Watcher:
             requested_dates=len(dates),
             full_scan=plan.full_scan,
             suppressed_closed=tally.suppressed_closed,
+            deferred_rechecks_skipped=tally.deferred_rechecks_skipped,
         )
 
 

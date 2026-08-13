@@ -1509,6 +1509,101 @@ class WatcherIntegrationTests(unittest.TestCase):
         self.assertFalse([m for _l, m in records if m.startswith("회차 판정")])
         self.assertTrue([m for _l, m in records if m.startswith("조회 완료")])
 
+    def _unreadable_seat_map_watcher(self, temporary, name, **overrides):
+        """A watcher whose seat map is unreadable once a showing drops to ≤6."""
+
+        settings = {
+            "dynamic_date_window": True,
+            "target_window_days": 1,
+            **overrides,
+        }
+        config = dataclasses.replace(make_config(Path(temporary)), **settings)
+        logger = logging.getLogger(f"defer-{name}-{id(self)}")
+        logger.handlers = [logging.NullHandler()]
+        watcher = Watcher(config, logger=logger)
+        watcher.telegram.send_message = lambda text, **_kwargs: None
+        remaining = {"count": 100}
+        watcher.cgv.fetch_date = lambda show_date: {
+            "data": [
+                {
+                    "scnsNm": "IMAX관",
+                    "scnYmd": show_date.strftime("%Y%m%d"),
+                    "scnsrtTm": "2200",
+                    "scnsNo": "13",
+                    "scnSseq": "4",
+                    "frSeatCnt": remaining["count"],
+                    "stcnt": 624,
+                }
+            ]
+        }
+        calls = []
+
+        def seat(session):
+            calls.append(session.remaining_seats)
+            if session.remaining_seats <= 6:
+                return SeatSnapshot(total=session.remaining_seats)
+            return SeatSnapshot(
+                total=session.remaining_seats,
+                general=session.remaining_seats - 2,
+                accessible=2,
+                mapped_total=session.remaining_seats,
+                available_rows=("B",),
+            )
+
+        watcher.cgv.fetch_seat_snapshot = seat
+        return watcher, remaining, calls
+
+    def test_an_announced_showing_rechecks_an_unreadable_map_on_a_backoff(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher, remaining, calls = self._unreadable_seat_map_watcher(
+                temporary, "backoff", deferred_recheck_cycles=5
+            )
+            watcher.run_cycle()
+            remaining["count"] = 5
+
+            per_cycle = []
+            for _ in range(10):
+                before = len(calls)
+                per_cycle.append(watcher.run_cycle())
+                per_cycle[-1] = len(calls) - before
+
+            # One read, then four cycles coasting, repeating.
+            self.assertEqual(per_cycle, [1, 0, 0, 0, 0, 1, 0, 0, 0, 0])
+
+    def test_a_changed_seat_count_cancels_the_backoff(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher, remaining, calls = self._unreadable_seat_map_watcher(
+                temporary, "changed", deferred_recheck_cycles=5
+            )
+            watcher.run_cycle()
+            remaining["count"] = 5
+            watcher.run_cycle()
+            watcher.run_cycle()
+
+            before = len(calls)
+            remaining["count"] = 4
+            watcher.run_cycle()
+
+            # Something moved, so the next look happens immediately.
+            self.assertEqual(len(calls) - before, 1)
+
+    def test_a_showing_never_announced_keeps_retrying_every_cycle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher, remaining, calls = self._unreadable_seat_map_watcher(
+                temporary, "unannounced", deferred_recheck_cycles=5
+            )
+            remaining["count"] = 5
+
+            per_cycle = []
+            for _ in range(4):
+                before = len(calls)
+                watcher.run_cycle()
+                per_cycle.append(len(calls) - before)
+
+            # It still owes the subscriber a booking-open alert, so the
+            # backoff must not apply to it.
+            self.assertEqual(per_cycle, [1, 1, 1, 1])
+
     def test_fetch_error_alert_reaches_every_alert_mode(self):
         with tempfile.TemporaryDirectory() as temporary:
             watcher = self._watcher_with_three_alert_modes(temporary, "error-fanout")
