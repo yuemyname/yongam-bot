@@ -119,6 +119,8 @@ SEAT_INFO_LABELS = {
     True: "일반 좌석이 확인된 알림만",
     False: "좌석 종류 미확인 알림도 포함",
 }
+# Operator-only. Deliberately left out of /help and the BotFather command list.
+ADMIN_STATS_COMMANDS = {"/stats", "/subscribers"}
 SEAT_INFO_GUIDE = (
     "잔여 좌석 알림의 범위를 고를 수 있습니다.\n"
     "/seat_all - 좌석 종류 미확인 알림도 받기 (기본)\n"
@@ -1302,6 +1304,28 @@ class StateStore:
             self.data["subscribers"][str(chat_id)] = updated
             return True
 
+    def subscriber_breakdown(self) -> dict[str, Any]:
+        """Counts of who is subscribed and how they configured their alerts."""
+
+        with self._lock:
+            modes = {mode: 0 for mode in ALERT_MODES}
+            chat_types: dict[str, int] = {}
+            verified = 0
+            for chat_id, record in self.data["subscribers"].items():
+                modes[self.alert_mode(chat_id)] += 1
+                if self.verified_seats_only(chat_id):
+                    verified += 1
+                kind = ""
+                if isinstance(record, Mapping):
+                    kind = str(record.get("chat_type") or "")
+                chat_types[kind or "unknown"] = chat_types.get(kind or "unknown", 0) + 1
+            return {
+                "total": len(self.data["subscribers"]),
+                "modes": modes,
+                "verified_seats_only": verified,
+                "chat_types": chat_types,
+            }
+
     def subscriber_ids_for(self, category: str) -> tuple[str, ...]:
         """Subscribers who opted in to this alert category."""
 
@@ -1901,6 +1925,47 @@ class Watcher:
                 )
         return delivered, failed, len(subscriber_ids)
 
+    def _subscriber_stats_message(self) -> str:
+        """Operator-facing snapshot of the subscriber list."""
+
+        stats = self.state.subscriber_breakdown()
+        total = stats["total"]
+        lines = ["📊 구독 현황", f"전체 {total}명"]
+
+        chat_labels = {
+            "private": "개인",
+            "group": "그룹",
+            "supergroup": "그룹",
+            "channel": "채널",
+            "unknown": "미상",
+        }
+        grouped: dict[str, int] = {}
+        for kind, count in stats["chat_types"].items():
+            label = chat_labels.get(kind, kind)
+            grouped[label] = grouped.get(label, 0) + count
+        if grouped:
+            lines.append(
+                "채팅 유형: "
+                + ", ".join(
+                    f"{label} {count}명"
+                    for label, count in sorted(
+                        grouped.items(), key=lambda item: -item[1]
+                    )
+                )
+            )
+
+        lines.append("")
+        lines.append("알림 종류")
+        for mode in (ALERT_MODE_ALL, ALERT_MODE_OPEN_ONLY, ALERT_MODE_SEATS_ONLY):
+            lines.append(f"• {ALERT_MODE_LABELS[mode]} — {stats['modes'][mode]}명")
+
+        verified = stats["verified_seats_only"]
+        lines.append("")
+        lines.append("잔여 좌석 알림 범위")
+        lines.append(f"• {SEAT_INFO_LABELS[False]} — {total - verified}명")
+        lines.append(f"• {SEAT_INFO_LABELS[True]} — {verified}명")
+        return "\n".join(lines)
+
     def _handle_mode_command(
         self, chat_id: str, command: str, argument: str
     ) -> tuple[str, bool]:
@@ -2085,6 +2150,12 @@ class Watcher:
                     chat_id, command, argument
                 )
                 state_changed = state_changed or seat_info_changed
+            elif command in ADMIN_STATS_COMMANDS and chat_id == str(
+                self.config.telegram_chat_id
+            ):
+                # Anyone else falls through to the unknown-command reply, so the
+                # command is not advertised to subscribers at all.
+                reply = self._subscriber_stats_message()
             elif command == "/help":
                 reply = (
                     "🎬 CGV 용산 IMAX 알림 봇\n\n"

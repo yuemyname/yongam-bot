@@ -2,6 +2,8 @@
 
 CGV 용산아이파크몰 IMAX의 예매 오픈과 잔여 좌석 변화를 Telegram으로 알려주는 비공식 알림 봇입니다.
 
+### 👉 [@yongambot](https://t.me/yongambot) — 봇 열고 `/start` 보내기
+
 - 영화: 오디세이 (`movNo=30001323`)
 - 극장: CGV 용산아이파크몰 (`siteNo=0013`)
 - 감시 기간: 한국시간 기준 오늘을 포함한 28일(4주)
@@ -10,7 +12,7 @@ CGV 용산아이파크몰 IMAX의 예매 오픈과 잔여 좌석 변화를 Teleg
 
 ## 알림 받는 방법
 
-1. Telegram에서 운영자가 알려준 봇을 엽니다.
+1. [https://t.me/yongambot](https://t.me/yongambot) 을 열어 봇으로 이동합니다.
 2. **시작** 버튼을 누르거나 `/start`를 보냅니다.
 3. `✅ CGV 용산 IMAX 알림 구독이 완료되었습니다.`라는 답장이 오면 등록 완료입니다.
 

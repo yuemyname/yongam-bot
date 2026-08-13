@@ -1672,6 +1672,68 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(len(counted("leave")), 2)
             self.assertFalse(watcher.state.is_subscribed("4242"))
 
+    def test_stats_command_answers_the_operator_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = dataclasses.replace(
+                make_config(Path(temporary)), subscriptions_enabled=True
+            )
+            logger = logging.getLogger(f"watcher-stats-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            for index in range(4):
+                watcher.state.add_subscriber(
+                    str(2000 + index), chat_type="private"
+                )
+            watcher.state.set_alert_mode("2000", ALERT_MODE_OPEN_ONLY)
+            watcher.state.set_alert_mode("2001", ALERT_MODE_SEATS_ONLY)
+            watcher.state.set_verified_seats_only("2002", True)
+
+            replies = []
+            watcher.telegram.send_message = lambda text, **kwargs: replies.append(
+                (str(kwargs.get("chat_id")), text)
+            )
+
+            def send(chat_id, text, update_id):
+                watcher.telegram.get_updates = lambda **_kwargs: [
+                    {
+                        "update_id": update_id,
+                        "message": {
+                            "text": text,
+                            "chat": {"id": chat_id, "type": "private"},
+                        },
+                    }
+                ]
+                watcher.sync_subscribers()
+
+            send(int(config.telegram_chat_id), "/stats", 1)
+            operator_reply = replies[-1][1]
+            self.assertIn("전체 5명", operator_reply)
+            self.assertIn("신규 오픈만 — 1명", operator_reply)
+            self.assertIn("잔여 좌석만 — 1명", operator_reply)
+            self.assertIn("일반 좌석이 확인된 알림만 — 1명", operator_reply)
+
+            # A subscriber gets the generic reply, so the command stays hidden.
+            send(2000, "/stats", 2)
+            self.assertIn("사용 가능한 명령어", replies[-1][1])
+            self.assertNotIn("구독 현황", replies[-1][1])
+
+            send(int(config.telegram_chat_id), "/help", 3)
+            self.assertNotIn("stats", replies[-1][1])
+
+    def test_stats_counts_subscribers_stored_before_the_settings_existed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = StateStore(Path(temporary) / "notified.json")
+            store.data["subscribers"]["9"] = {"subscribed_at": "2026-01-01T00:00:00"}
+            store.add_subscriber("10", chat_type="group")
+
+            breakdown = store.subscriber_breakdown()
+
+            self.assertEqual(breakdown["total"], 2)
+            self.assertEqual(breakdown["modes"][ALERT_MODE_ALL], 2)
+            self.assertEqual(breakdown["verified_seats_only"], 0)
+            self.assertEqual(breakdown["chat_types"]["group"], 1)
+            self.assertEqual(breakdown["chat_types"]["unknown"], 1)
+
     def test_desc_command_explains_bot_and_usage(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = dataclasses.replace(
