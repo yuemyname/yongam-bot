@@ -554,8 +554,8 @@ class ScanPlanTests(unittest.TestCase):
                     dt.date(2026, 8, 23),
                 ),
             )
-            self.assertEqual(plan.dates[3], dt.date(2026, 8, 20))
-            self.assertEqual(plan.dates[-1], self.TODAY)
+            self.assertEqual(plan.dates[3], self.TODAY)
+            self.assertEqual(plan.dates[-1], dt.date(2026, 8, 20))
             self.assertEqual(len(plan.dates), 11)
 
     def test_failed_date_outside_cursor_is_retried_after_the_probe(self):
@@ -602,8 +602,8 @@ class ScanPlanTests(unittest.TestCase):
 
             plan = watcher._plan_scan(self.TODAY)
 
-            self.assertEqual(plan.dates[0], dt.date(2026, 9, 9))
-            self.assertEqual(plan.dates[-1], self.TODAY)
+            self.assertEqual(plan.dates[0], self.TODAY)
+            self.assertEqual(plan.dates[-1], dt.date(2026, 9, 9))
             self.assertEqual(len(plan.dates), 28)
 
     def test_a_full_scan_runs_every_configured_number_of_cycles(self):
@@ -1354,14 +1354,14 @@ class WatcherIntegrationTests(unittest.TestCase):
                 self.assertEqual(
                     requested[3:],
                     [
-                        dt.date(2026, 8, 20),
-                        dt.date(2026, 8, 19),
-                        dt.date(2026, 8, 18),
-                        dt.date(2026, 8, 17),
-                        dt.date(2026, 8, 16),
-                        dt.date(2026, 8, 15),
-                        dt.date(2026, 8, 14),
                         dt.date(2026, 8, 13),
+                        dt.date(2026, 8, 14),
+                        dt.date(2026, 8, 15),
+                        dt.date(2026, 8, 16),
+                        dt.date(2026, 8, 17),
+                        dt.date(2026, 8, 18),
+                        dt.date(2026, 8, 19),
+                        dt.date(2026, 8, 20),
                     ],
                 )
 
