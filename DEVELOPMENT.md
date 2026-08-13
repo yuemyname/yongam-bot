@@ -16,6 +16,9 @@ mode - 알림 종류 확인·변경
 mode_all - 신규 오픈 + 잔여 좌석 받기
 mode_open - 신규 오픈만 받기
 mode_seats - 잔여 좌석만 받기
+seat - 좌석 알림 범위 확인·변경
+seat_all - 좌석 종류 미확인 알림도 받기
+seat_verified - 일반 좌석 확인된 알림만 받기
 desc - 봇 설명과 사용 방법
 coffee - 개발자에게 커피 후원
 help - 사용법 보기

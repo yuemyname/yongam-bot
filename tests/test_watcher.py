@@ -16,6 +16,7 @@ from watcher import (
     ALERT_MODE_SEATS_ONLY,
     ALERT_OPEN,
     ALERT_SEATS,
+    ALERT_SEATS_UNCLASSIFIED,
     ALERT_SYSTEM,
     STATE_VERSION,
     BookingSession,
@@ -395,6 +396,47 @@ class AlertModeStateTests(unittest.TestCase):
             self.assertEqual(store.subscriber_ids_for(ALERT_SEATS), ("1", "3"))
             self.assertEqual(store.subscriber_ids_for(ALERT_SYSTEM), ("1", "2", "3"))
 
+    def test_unclassified_seat_alerts_skip_verified_only_subscribers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = StateStore(Path(temporary) / "notified.json")
+            for chat_id in ("1", "2", "3"):
+                store.add_subscriber(chat_id)
+            store.set_alert_mode("3", ALERT_MODE_OPEN_ONLY)
+            self.assertTrue(store.set_verified_seats_only("2", True))
+
+            # Classified seat alerts still reach both seat subscribers.
+            self.assertEqual(store.subscriber_ids_for(ALERT_SEATS), ("1", "2"))
+            # Unclassified ones skip the subscriber who asked for verified only.
+            self.assertEqual(
+                store.subscriber_ids_for(ALERT_SEATS_UNCLASSIFIED), ("1",)
+            )
+            # The open-only subscriber is never in either seat audience.
+            self.assertNotIn("3", store.subscriber_ids_for(ALERT_SEATS))
+
+    def test_verified_seats_preference_defaults_off_and_persists(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "notified.json"
+            store = StateStore(path)
+            store.add_subscriber("111")
+
+            self.assertFalse(store.verified_seats_only("111"))
+            self.assertTrue(store.set_verified_seats_only("111", True))
+            self.assertFalse(store.set_verified_seats_only("111", True))
+            store.save()
+
+            reloaded = StateStore(path)
+            reloaded.load()
+            self.assertTrue(reloaded.verified_seats_only("111"))
+            self.assertTrue(reloaded.set_verified_seats_only("111", False))
+
+    def test_subscriber_stored_before_the_feature_accepts_unclassified(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = StateStore(Path(temporary) / "notified.json")
+            store.data["subscribers"]["999"] = {"subscribed_at": "2026-01-01T00:00:00"}
+
+            self.assertFalse(store.verified_seats_only("999"))
+            self.assertIn("999", store.subscriber_ids_for(ALERT_SEATS_UNCLASSIFIED))
+
     def test_rejects_an_unknown_mode(self):
         with tempfile.TemporaryDirectory() as temporary:
             store = StateStore(Path(temporary) / "notified.json")
@@ -701,6 +743,173 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(first.new_sessions, 1)
             self.assertEqual(second.new_sessions, 0)
             self.assertEqual(sent, [])
+
+    def _watcher_with_two_seat_audiences(self, temporary, name):
+        """Two seat-alert subscribers: 'open-info' accepts unclassified, 'strict' does not."""
+
+        config = make_config(Path(temporary))
+        logger = logging.getLogger(f"watcher-{name}-{id(self)}")
+        logger.handlers = [logging.NullHandler()]
+        watcher = Watcher(config, logger=logger)
+        watcher.state.remove_subscriber(config.telegram_chat_id)
+        for chat_id in ("open-info", "strict"):
+            watcher.state.add_subscriber(chat_id)
+        watcher.state.set_verified_seats_only("strict", True)
+        return watcher
+
+    def test_unclassified_seat_change_skips_verified_only_subscriber(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._watcher_with_two_seat_audiences(temporary, "strict-seat")
+            remaining = {"count": 10}
+            watcher.cgv.fetch_date = lambda _date: self._schedule_payload(
+                remaining["count"]
+            )
+            # No general/accessible breakdown: CGV's detail response could not be
+            # classified, so the alert carries the "좌석 종류 미확인" fallback.
+            watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
+                total=session.remaining_seats
+            )
+            sent = []
+            watcher.telegram.send_message = lambda text, **kwargs: sent.append(
+                (kwargs.get("chat_id"), text)
+            )
+
+            watcher.run_cycle()
+            sent.clear()
+            remaining["count"] = 9
+            result = watcher.run_cycle()
+
+            self.assertEqual(result.seat_changes, 1)
+            self.assertEqual({chat_id for chat_id, _ in sent}, {"open-info"})
+            self.assertIn("좌석 종류 미확인", sent[0][1])
+
+    def test_classified_seat_change_reaches_verified_only_subscriber(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._watcher_with_two_seat_audiences(temporary, "classified")
+            remaining = {"count": 10}
+            watcher.cgv.fetch_date = lambda _date: self._schedule_payload(
+                remaining["count"]
+            )
+            watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
+                total=session.remaining_seats,
+                general=session.remaining_seats - 2,
+                accessible=2,
+                mapped_total=session.remaining_seats,
+                available_rows=("B",),
+            )
+            sent = []
+            watcher.telegram.send_message = lambda text, **kwargs: sent.append(
+                (kwargs.get("chat_id"), text)
+            )
+
+            watcher.run_cycle()
+            sent.clear()
+            remaining["count"] = 9
+            result = watcher.run_cycle()
+
+            self.assertEqual(result.seat_changes, 1)
+            self.assertEqual(
+                {chat_id for chat_id, _ in sent}, {"open-info", "strict"}
+            )
+            self.assertNotIn("좌석 종류 미확인", sent[0][1])
+
+    def test_unclassified_seat_change_is_recorded_with_no_recipients(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._watcher_with_two_seat_audiences(temporary, "strict-only")
+            watcher.state.remove_subscriber("open-info")
+            remaining = {"count": 10}
+            watcher.cgv.fetch_date = lambda _date: self._schedule_payload(
+                remaining["count"]
+            )
+            watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
+                total=session.remaining_seats
+            )
+            sent = []
+            watcher.telegram.send_message = lambda text, **kwargs: sent.append(
+                (kwargs.get("chat_id"), text)
+            )
+
+            watcher.run_cycle()
+            sent.clear()
+            remaining["count"] = 9
+            second = watcher.run_cycle()
+            third = watcher.run_cycle()
+
+            # Nobody wants the alert, but the snapshot must still advance so the
+            # same change is not re-evaluated every cycle forever.
+            self.assertEqual(second.seat_changes, 1)
+            self.assertEqual(third.seat_changes, 0)
+            self.assertEqual(sent, [])
+
+    def test_seat_info_commands_change_and_report_preference(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = dataclasses.replace(
+                make_config(Path(temporary)), subscriptions_enabled=True
+            )
+            logger = logging.getLogger(f"watcher-seat-cmd-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            replies = []
+
+            def batch(update_id, text, chat_id=111222):
+                return [
+                    {
+                        "update_id": update_id,
+                        "message": {
+                            "text": text,
+                            "chat": {"id": chat_id, "type": "private"},
+                        },
+                    }
+                ]
+
+            batches = [
+                batch(1, "/seat_verified", chat_id=555),
+                batch(2, "/start"),
+                batch(3, "/seat"),
+                batch(4, "/seat_verified@YongsanBot"),
+                batch(5, "/status"),
+                batch(6, "/seat 전체"),
+                batch(7, "/seat nonsense"),
+                batch(8, "/mode_open"),
+                batch(9, "/seat_verified"),
+            ]
+            watcher.telegram.get_updates = lambda **_kwargs: batches.pop(0)
+            watcher.telegram.send_message = lambda text, **kwargs: replies.append(
+                (kwargs.get("chat_id"), text)
+            )
+
+            watcher.sync_subscribers()
+            self.assertIn("구독 중이 아닙니다", replies[-1][1])
+
+            watcher.sync_subscribers()
+            self.assertFalse(watcher.state.verified_seats_only("111222"))
+
+            watcher.sync_subscribers()
+            self.assertIn("현재 잔여 좌석 알림 범위", replies[-1][1])
+
+            watcher.sync_subscribers()
+            self.assertTrue(watcher.state.verified_seats_only("111222"))
+            self.assertIn("일반 좌석이 확인된 알림만", replies[-1][1])
+
+            watcher.sync_subscribers()
+            self.assertIn("좌석 알림 범위:", replies[-1][1])
+
+            watcher.sync_subscribers()
+            self.assertFalse(watcher.state.verified_seats_only("111222"))
+
+            watcher.sync_subscribers()
+            self.assertIn("알 수 없는 좌석 알림 범위", replies[-1][1])
+
+            # Switching to open-only alerts makes the seat preference inert, and
+            # the reply should say so rather than silently accepting it.
+            watcher.sync_subscribers()
+            watcher.sync_subscribers()
+            self.assertTrue(watcher.state.verified_seats_only("111222"))
+            self.assertIn("잔여 좌석 알림을 받지 않는 설정", replies[-1][1])
+
+            reloaded = StateStore(config.state_file)
+            reloaded.load()
+            self.assertTrue(reloaded.verified_seats_only("111222"))
 
     def test_fetch_error_alert_reaches_every_alert_mode(self):
         with tempfile.TemporaryDirectory() as temporary:

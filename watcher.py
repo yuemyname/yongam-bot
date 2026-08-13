@@ -43,6 +43,9 @@ STATE_VERSION = 5
 # notices) always reach every subscriber regardless of their preference.
 ALERT_OPEN = "open"
 ALERT_SEATS = "seats"
+# A seat-change alert CGV's detail response could not classify.  It reaches the
+# seat-alert subscribers who did not ask for verified seat information only.
+ALERT_SEATS_UNCLASSIFIED = "seats_unclassified"
 ALERT_SYSTEM = "system"
 
 # Per-subscriber alert preference.  Subscribers stored before this feature have
@@ -87,6 +90,34 @@ MODE_GUIDE = (
     "/mode_all - 신규 오픈 + 잔여 좌석 (기본)\n"
     "/mode_open - 신규 오픈만\n"
     "/mode_seats - 잔여 좌석만"
+)
+
+# Whether a subscriber accepts seat-change alerts CGV could not classify.
+# Stored per subscriber; absent means "accept them", matching old behaviour.
+SEAT_INFO_COMMAND_TARGETS = {
+    "/seat_verified": True,
+    "/seat_all": False,
+}
+SEAT_INFO_COMMANDS = {"/seat", "/seatinfo", *SEAT_INFO_COMMAND_TARGETS}
+SEAT_INFO_ALIASES = {
+    "verified": True,
+    "확인": True,
+    "일반": True,
+    "all": False,
+    "전체": False,
+    "미확인": False,
+}
+SEAT_INFO_LABELS = {
+    True: "일반 좌석이 확인된 알림만",
+    False: "좌석 종류 미확인 알림도 포함",
+}
+SEAT_INFO_GUIDE = (
+    "잔여 좌석 알림의 범위를 고를 수 있습니다.\n"
+    "/seat_all - 좌석 종류 미확인 알림도 받기 (기본)\n"
+    "/seat_verified - 일반 좌석이 확인된 알림만 받기\n\n"
+    "CGV 좌석 상세 조회가 실패하면 좌석 종류를 확인할 수 없어 "
+    "'좌석 종류 미확인' 표시로 알림이 갑니다. "
+    "/seat_verified를 고르면 이런 알림은 받지 않습니다."
 )
 
 # Keep one extra day so a subscriber in a different timezone never loses the
@@ -1179,11 +1210,40 @@ class StateStore:
             self.data["subscribers"][str(chat_id)] = updated
             return True
 
+    def verified_seats_only(self, chat_id: str) -> bool:
+        """Whether this subscriber declined unclassified seat-change alerts."""
+
+        with self._lock:
+            record = self.data["subscribers"].get(str(chat_id))
+            if not isinstance(record, Mapping):
+                return False
+            return bool(record.get("verified_seats_only", False))
+
+    def set_verified_seats_only(self, chat_id: str, value: bool) -> bool:
+        """Store the seat-detail preference; returns False when unchanged."""
+
+        with self._lock:
+            record = self.data["subscribers"].get(str(chat_id))
+            if not isinstance(record, Mapping):
+                return False
+            if bool(record.get("verified_seats_only", False)) is bool(value):
+                return False
+            updated = dict(record)
+            updated["verified_seats_only"] = bool(value)
+            self.data["subscribers"][str(chat_id)] = updated
+            return True
+
     def subscriber_ids_for(self, category: str) -> tuple[str, ...]:
         """Subscribers who opted in to this alert category."""
 
         if category == ALERT_SYSTEM:
             return self.subscriber_ids()
+        if category == ALERT_SEATS_UNCLASSIFIED:
+            return tuple(
+                chat_id
+                for chat_id in self.subscriber_ids_for(ALERT_SEATS)
+                if not self.verified_seats_only(chat_id)
+            )
         with self._lock:
             return tuple(
                 str(chat_id)
@@ -1203,6 +1263,7 @@ class StateStore:
                 "label": label[:100],
                 "chat_type": chat_type[:30],
                 "alert_mode": DEFAULT_ALERT_MODE,
+                "verified_seats_only": False,
             }
             return True
 
@@ -1602,6 +1663,44 @@ class Watcher:
             True,
         )
 
+    def _handle_seat_info_command(
+        self, chat_id: str, command: str, argument: str
+    ) -> tuple[str, bool]:
+        """Return the reply for a seat-detail command and whether state changed."""
+
+        requested = SEAT_INFO_COMMAND_TARGETS.get(command)
+        if requested is None and argument:
+            requested = SEAT_INFO_ALIASES.get(argument)
+            if requested is None:
+                return (f"알 수 없는 좌석 알림 범위입니다.\n\n{SEAT_INFO_GUIDE}", False)
+
+        if not self.state.is_subscribed(chat_id):
+            return (
+                "🔕 현재 구독 중이 아닙니다. /start로 구독한 뒤 설정할 수 있습니다."
+                f"\n\n{SEAT_INFO_GUIDE}",
+                False,
+            )
+
+        # The preference is stored either way, but it cannot take effect while
+        # seat alerts themselves are switched off.
+        note = ""
+        if ALERT_SEATS not in ALERT_MODES[self.state.alert_mode(chat_id)]:
+            note = "\n\n참고: 현재 잔여 좌석 알림을 받지 않는 설정입니다. /mode 확인"
+
+        if requested is None:
+            current = self.state.verified_seats_only(chat_id)
+            return (
+                f"💺 현재 잔여 좌석 알림 범위\n→ {SEAT_INFO_LABELS[current]}"
+                f"{note}\n\n{SEAT_INFO_GUIDE}",
+                False,
+            )
+
+        changed = self.state.set_verified_seats_only(chat_id, requested)
+        label = SEAT_INFO_LABELS[requested]
+        if not changed:
+            return (f"💺 이미 이렇게 설정되어 있습니다.\n→ {label}{note}", False)
+        return (f"✅ 잔여 좌석 알림 범위를 변경했습니다.\n→ {label}{note}", True)
+
     def sync_subscribers(self) -> None:
         """Apply Telegram /start and /stop commands to the persistent list."""
 
@@ -1675,12 +1774,18 @@ class Watcher:
                 )
             elif command == "/status":
                 if self.state.is_subscribed(chat_id):
-                    mode_label = ALERT_MODE_LABELS[self.state.alert_mode(chat_id)]
+                    mode = self.state.alert_mode(chat_id)
+                    mode_label = ALERT_MODE_LABELS[mode]
                     reply = (
                         "✅ 현재 CGV 용산 IMAX 알림을 구독 중입니다.\n"
-                        f"알림 종류: {mode_label}\n\n"
-                        "알림 종류 변경: /mode"
+                        f"알림 종류: {mode_label}"
                     )
+                    if ALERT_SEATS in ALERT_MODES[mode]:
+                        seat_label = SEAT_INFO_LABELS[
+                            self.state.verified_seats_only(chat_id)
+                        ]
+                        reply += f"\n좌석 알림 범위: {seat_label}"
+                    reply += "\n\n알림 종류 변경: /mode\n좌석 알림 범위 변경: /seat"
                 else:
                     reply = (
                         "🔕 현재 구독 중이 아닙니다. "
@@ -1691,6 +1796,11 @@ class Watcher:
                     chat_id, command, argument
                 )
                 state_changed = state_changed or mode_changed
+            elif command in SEAT_INFO_COMMANDS:
+                reply, seat_info_changed = self._handle_seat_info_command(
+                    chat_id, command, argument
+                )
+                state_changed = state_changed or seat_info_changed
             elif command == "/help":
                 reply = (
                     "🎬 CGV 용산 IMAX 알림 봇\n\n"
@@ -1698,6 +1808,7 @@ class Watcher:
                     "/stop - 알림 해지\n"
                     "/status - 구독 상태 확인\n"
                     "/mode - 알림 종류 선택\n"
+                    "/seat - 잔여 좌석 알림 범위 선택\n"
                     "/desc - 봇 설명과 사용 방법\n"
                     "/coffee - 개발자에게 커피 후원\n"
                     "/help - 사용법 보기"
@@ -1720,11 +1831,15 @@ class Watcher:
                     "• /mode_all — 신규 오픈 + 잔여 좌석 (기본)\n"
                     "• /mode_open — 신규 오픈만\n"
                     "• /mode_seats — 잔여 좌석만\n\n"
+                    "💺 잔여 좌석 알림 범위\n"
+                    "• /seat_all — 좌석 종류 미확인 알림도 받기 (기본)\n"
+                    "• /seat_verified — 일반 좌석이 확인된 알림만 받기\n\n"
                     "📌 사용 방법\n"
                     "1. /start — 알림 구독\n"
                     "2. 알림이 오면 예매 바로가기 링크 열기\n"
                     "3. CGV 화면에서 IMAX 버튼 선택 후 예매\n\n"
                     "/mode — 현재 알림 종류 확인·변경\n"
+                    "/seat — 잔여 좌석 알림 범위 확인·변경\n"
                     "/status — 구독 상태 확인\n"
                     "/stop — 알림 해지\n"
                     "/coffee — 개발자에게 커피 후원\n"
@@ -2076,7 +2191,11 @@ class Watcher:
                 continue
             delivered, failed, total = self._broadcast_message(
                 seat_change_message(session, previous, current, self.config),
-                category=ALERT_SEATS,
+                category=(
+                    ALERT_SEATS_UNCLASSIFIED
+                    if current.uses_unclassified_fallback
+                    else ALERT_SEATS
+                ),
             )
             if delivered or total == 0:
                 self.state.set_seat_snapshot(key, current)
