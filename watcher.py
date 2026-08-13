@@ -260,6 +260,7 @@ class Config:
     strict_imax_match: bool
     subscriptions_enabled: bool
     scan_mode: str
+    booking_close_margin_minutes: int
     cursor_probe_days: int
     cursor_expansion_days: int
     full_scan_every_cycles: int
@@ -421,6 +422,12 @@ class Config:
                 name="SUBSCRIPTIONS_ENABLED",
             ),
             scan_mode=_parse_scan_mode(value("SCAN_MODE", DEFAULT_SCAN_MODE)),
+            booking_close_margin_minutes=_parse_int(
+                value("BOOKING_CLOSE_MARGIN_MINUTES", "0"),
+                name="BOOKING_CLOSE_MARGIN_MINUTES",
+                minimum=0,
+                maximum=240,
+            ),
             cursor_probe_days=_parse_int(
                 value("CURSOR_PROBE_DAYS", "3"),
                 name="CURSOR_PROBE_DAYS",
@@ -449,8 +456,11 @@ class Config:
             log_file=log_file,
         )
 
+    def local_now(self) -> dt.datetime:
+        return dt.datetime.now(ZoneInfo(self.timezone_name))
+
     def local_today(self) -> dt.date:
-        return dt.datetime.now(ZoneInfo(self.timezone_name)).date()
+        return self.local_now().date()
 
     def target_range(self, *, today: dt.date | None = None) -> tuple[dt.date, dt.date]:
         if not self.dynamic_date_window:
@@ -480,6 +490,23 @@ class BookingSession:
     def notification_key(self, *, site_no: str, movie_no: str) -> str:
         # The user-visible uniqueness requirement is a show date and start time.
         return f"{site_no}:{movie_no}:{self.date}:{self.start_time}"
+
+    def start_datetime(self, timezone_name: str) -> dt.datetime | None:
+        """Local start time, or None when the schedule had no usable time."""
+
+        try:
+            day = dt.date.fromisoformat(self.date)
+            hour, minute = (int(part) for part in self.start_time.split(":", 1))
+            return dt.datetime(
+                day.year,
+                day.month,
+                day.day,
+                hour,
+                minute,
+                tzinfo=ZoneInfo(timezone_name),
+            )
+        except (TypeError, ValueError, ZoneInfoNotFoundError):
+            return None
 
 
 def _normalized_key(value: Any) -> str:
@@ -1624,6 +1651,7 @@ class CycleResult:
     seat_detail_skipped: int = 0
     requested_dates: int = 0
     full_scan: bool = True
+    suppressed_closed: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1761,6 +1789,30 @@ class Watcher:
             ):
                 session_map[(session.date, session.start_time)] = session
         return session_map
+
+    def _split_closed_sessions(
+        self, sessions: Sequence[BookingSession]
+    ) -> tuple[list[BookingSession], list[BookingSession]]:
+        """Separate showings that can still be booked from ones that cannot.
+
+        CGV keeps returning a showing after it starts, and its seat counts keep
+        moving, but nobody can book it any more.  A session whose schedule had
+        no usable start time is treated as bookable: guessing it closed would
+        silently drop a real alert.
+        """
+
+        cutoff = self.config.local_now() + dt.timedelta(
+            minutes=self.config.booking_close_margin_minutes
+        )
+        bookable: list[BookingSession] = []
+        closed: list[BookingSession] = []
+        for session in sessions:
+            starts_at = session.start_datetime(self.config.timezone_name)
+            if starts_at is not None and starts_at <= cutoff:
+                closed.append(session)
+            else:
+                bookable.append(session)
+        return bookable, closed
 
     def _advance_frontier(
         self, session_map: Mapping[tuple[str, str], BookingSession]
@@ -2116,7 +2168,14 @@ class Watcher:
             dates[-1].isoformat() if dates else "-",
         )
 
-        sessions = sorted(session_map.values())
+        sessions, closed_sessions = self._split_closed_sessions(
+            sorted(session_map.values())
+        )
+        if closed_sessions:
+            self.logger.info(
+                "알림 제외: 상영이 시작돼 예매가 마감된 회차 %d개",
+                len(closed_sessions),
+            )
         session_keys = {
             session: session.notification_key(
                 site_no=self.config.site_no, movie_no=self.config.movie_no
@@ -2463,7 +2522,8 @@ class Watcher:
         self.logger.info(
             "조회 완료: 성공 %d일, 오류 %d일, IMAX 회차 %d개, 신규 %d개, "
             "좌석변경 %d개, 장애인석만 남아 제외 %d개, A열만 남아 제외 %d개, "
-            "0석 제외 %d개, 좌석판별 대기 %d개, 미판별 7석 이상 알림 %d개, "
+            "0석 제외 %d개, 예매 마감 제외 %d개, 좌석판별 대기 %d개, "
+            "미판별 7석 이상 알림 %d개, "
             "HTTP 429 %d개, 일정 생략 %d일, 좌석상세 생략 %d개",
             len(payloads),
             len(errors),
@@ -2473,6 +2533,7 @@ class Watcher:
             suppressed_accessible_only,
             suppressed_row_a_only,
             suppressed_sold_out,
+            len(closed_sessions),
             len(deferred_seat_detail_keys),
             unclassified_fallback_alerts,
             rate_limited_requests,
@@ -2496,6 +2557,7 @@ class Watcher:
             seat_detail_skipped=seat_detail_skipped,
             requested_dates=len(dates),
             full_scan=plan.full_scan,
+            suppressed_closed=len(closed_sessions),
         )
 
 

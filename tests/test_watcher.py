@@ -9,6 +9,7 @@ import threading
 import unittest
 from unittest.mock import patch
 import urllib.parse
+from zoneinfo import ZoneInfo
 
 from watcher import (
     ALERT_MODE_ALL,
@@ -35,6 +36,13 @@ from watcher import (
     rate_limit_backoff_seconds,
     run_command_loop,
 )
+
+
+def _kst(day: dt.date, hour: int = 9, minute: int = 0) -> dt.datetime:
+    """A fixed local timestamp so time-based suppression is deterministic."""
+    return dt.datetime(
+        day.year, day.month, day.day, hour, minute, tzinfo=ZoneInfo("Asia/Seoul")
+    )
 
 
 def make_config(project_dir: Path) -> Config:
@@ -651,6 +659,15 @@ class LoggingTests(unittest.TestCase):
 
 
 class WatcherIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        # Alert suppression now depends on the wall clock, so pin it well
+        # before every show time these tests use.
+        patcher = patch.object(
+            Config, "local_now", return_value=_kst(dt.date(2026, 8, 13))
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_reports_schedule_rate_limit_for_adaptive_backoff(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = dataclasses.replace(
@@ -1062,7 +1079,7 @@ class WatcherIntegrationTests(unittest.TestCase):
     def test_cursor_scan_narrows_requests_and_expands_on_a_new_opening(self):
         today = dt.date(2026, 8, 13)
         with tempfile.TemporaryDirectory() as temporary:
-            with patch.object(Config, "local_today", return_value=today):
+            with patch.object(Config, "local_now", return_value=_kst(today)):
                 watcher = self._cursor_watcher(temporary, "expansion")
                 open_through = {"date": dt.date(2026, 8, 20)}
                 requested = []
@@ -1106,7 +1123,7 @@ class WatcherIntegrationTests(unittest.TestCase):
     def test_cursor_scan_detects_the_new_sessions_it_probes(self):
         today = dt.date(2026, 8, 13)
         with tempfile.TemporaryDirectory() as temporary:
-            with patch.object(Config, "local_today", return_value=today):
+            with patch.object(Config, "local_now", return_value=_kst(today)):
                 watcher = self._cursor_watcher(temporary, "detect")
                 open_through = {"date": dt.date(2026, 8, 20)}
                 watcher.cgv.fetch_date = lambda show_date: (
@@ -1125,7 +1142,7 @@ class WatcherIntegrationTests(unittest.TestCase):
     def test_rate_limited_partial_scan_does_not_regress_the_frontier(self):
         today = dt.date(2026, 8, 13)
         with tempfile.TemporaryDirectory() as temporary:
-            with patch.object(Config, "local_today", return_value=today):
+            with patch.object(Config, "local_now", return_value=_kst(today)):
                 watcher = self._cursor_watcher(temporary, "ratelimit")
                 watcher.cgv.fetch_date = lambda show_date: (
                     self._dated_payload(show_date)
@@ -1154,7 +1171,7 @@ class WatcherIntegrationTests(unittest.TestCase):
     def test_full_scan_mode_keeps_requesting_every_date(self):
         today = dt.date(2026, 8, 13)
         with tempfile.TemporaryDirectory() as temporary:
-            with patch.object(Config, "local_today", return_value=today):
+            with patch.object(Config, "local_now", return_value=_kst(today)):
                 watcher = self._cursor_watcher(
                     temporary, "fullmode", scan_mode=SCAN_MODE_FULL
                 )
@@ -1172,7 +1189,7 @@ class WatcherIntegrationTests(unittest.TestCase):
     def test_frontier_survives_a_restart_and_keeps_the_cursor_narrow(self):
         today = dt.date(2026, 8, 13)
         with tempfile.TemporaryDirectory() as temporary:
-            with patch.object(Config, "local_today", return_value=today):
+            with patch.object(Config, "local_now", return_value=_kst(today)):
                 watcher = self._cursor_watcher(temporary, "restart")
                 watcher.cgv.fetch_date = lambda show_date: (
                     self._dated_payload(show_date)
@@ -1190,6 +1207,129 @@ class WatcherIntegrationTests(unittest.TestCase):
                 plan = restarted._plan_scan(today)
                 self.assertFalse(plan.full_scan)
                 self.assertEqual(len(plan.dates), 11)
+
+    def _watcher_for_showtime(self, temporary, name, start_time, **overrides):
+        """A watcher whose only session starts at ``start_time`` on 2026-08-13."""
+
+        settings = {
+            "dynamic_date_window": False,
+            "target_start": dt.date(2026, 8, 13),
+            "target_end": dt.date(2026, 8, 13),
+            **overrides,
+        }
+        config = dataclasses.replace(make_config(Path(temporary)), **settings)
+        logger = logging.getLogger(f"closed-{name}-{id(self)}")
+        logger.handlers = [logging.NullHandler()]
+        watcher = Watcher(config, logger=logger)
+        remaining = {"count": 100}
+        watcher.cgv.fetch_date = lambda _date: {
+            "data": [
+                {
+                    "scnsNm": "IMAX관",
+                    "scnYmd": "20260813",
+                    "scnsrtTm": start_time,
+                    "scnsNo": "13",
+                    "scnSseq": "4",
+                    "frSeatCnt": remaining["count"],
+                    "stcnt": 200,
+                }
+            ]
+        }
+        watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
+            total=session.remaining_seats,
+            general=session.remaining_seats - 2,
+            accessible=2,
+            mapped_total=session.remaining_seats,
+            available_rows=("B",),
+        )
+        return watcher, remaining
+
+    def test_seat_change_on_a_started_showing_is_not_alerted(self):
+        now = _kst(dt.date(2026, 8, 13), hour=16)
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(Config, "local_now", return_value=now):
+                # The 14:30 showing already started; CGV still reports it.
+                watcher, remaining = self._watcher_for_showtime(
+                    temporary, "past", "1430"
+                )
+                sent = []
+                watcher.telegram.send_message = lambda text, **_k: sent.append(text)
+
+                first = watcher.run_cycle()
+                remaining["count"] = 99
+                second = watcher.run_cycle()
+
+                self.assertEqual(first.new_sessions, 0)
+                self.assertEqual(first.suppressed_closed, 1)
+                self.assertEqual(second.seat_changes, 0)
+                self.assertEqual(sent, [])
+
+    def test_seat_change_on_an_upcoming_showing_is_still_alerted(self):
+        now = _kst(dt.date(2026, 8, 13), hour=16)
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(Config, "local_now", return_value=now):
+                watcher, remaining = self._watcher_for_showtime(
+                    temporary, "future", "1900"
+                )
+                sent = []
+                watcher.telegram.send_message = lambda text, **_k: sent.append(text)
+
+                first = watcher.run_cycle()
+                remaining["count"] = 99
+                second = watcher.run_cycle()
+
+                self.assertEqual(first.new_sessions, 1)
+                self.assertEqual(first.suppressed_closed, 0)
+                self.assertEqual(second.seat_changes, 1)
+                self.assertEqual(len(sent), 2)
+
+    def test_booking_close_margin_suppresses_showings_about_to_start(self):
+        now = _kst(dt.date(2026, 8, 13), hour=16)
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(Config, "local_now", return_value=now):
+                # 16:20 is still ahead, but within a 30 minute close margin.
+                watcher, _ = self._watcher_for_showtime(
+                    temporary,
+                    "margin",
+                    "1620",
+                    booking_close_margin_minutes=30,
+                )
+                watcher.telegram.send_message = lambda text, **_k: None
+
+                result = watcher.run_cycle()
+
+                self.assertEqual(result.suppressed_closed, 1)
+                self.assertEqual(result.new_sessions, 0)
+
+    def test_showing_starting_after_the_margin_is_kept(self):
+        now = _kst(dt.date(2026, 8, 13), hour=16)
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(Config, "local_now", return_value=now):
+                watcher, _ = self._watcher_for_showtime(
+                    temporary,
+                    "margin-keep",
+                    "1640",
+                    booking_close_margin_minutes=30,
+                )
+                watcher.telegram.send_message = lambda text, **_k: None
+
+                result = watcher.run_cycle()
+
+                self.assertEqual(result.suppressed_closed, 0)
+                self.assertEqual(result.new_sessions, 1)
+
+    def test_session_without_a_usable_start_time_is_never_suppressed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            logger = logging.getLogger(f"closed-notime-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            session = BookingSession(date="2026-08-13", start_time="")
+
+            bookable, closed = watcher._split_closed_sessions([session])
+
+            self.assertEqual(bookable, [session])
+            self.assertEqual(closed, [])
 
     def test_fetch_error_alert_reaches_every_alert_mode(self):
         with tempfile.TemporaryDirectory() as temporary:

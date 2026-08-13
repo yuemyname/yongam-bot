@@ -84,6 +84,7 @@ Mac이 잠자기 상태이거나 덮개가 닫혀 있으면 감시가 중단될 
 | `TARGET_WINDOW_DAYS` | `28` | 오늘을 포함해 감시할 날짜 수 |
 | `APP_TIMEZONE` | `Asia/Seoul` | 날짜 계산 기준 시간대 |
 | `STRICT_IMAX_MATCH` | `true` | IMAX 이름 또는 코드가 있는 회차만 감지 |
+| `BOOKING_CLOSE_MARGIN_MINUTES` | `0` | 상영 시작 몇 분 전부터 예매 마감으로 볼지 |
 | `SCAN_MODE` | `full` | 조회 범위 결정 방식 (`full` 또는 `cursor`) |
 | `CURSOR_PROBE_DAYS` | `3` | `cursor` 모드에서 프론티어 뒤로 더 볼 일수 |
 | `CURSOR_EXPANSION_DAYS` | `21` | 신규 오픈 감지 시 한 번에 확장 조회할 일수 |
