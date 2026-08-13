@@ -68,7 +68,8 @@ Mac이 잠자기 상태이거나 덮개가 닫혀 있으면 감시가 중단될 
 | 이름 | 기본값 | 설명 |
 |---|---:|---|
 | `SUBSCRIPTIONS_ENABLED` | `true` | `/start`, `/stop` 자동 구독 기능 |
-| `POLL_INTERVAL_SECONDS` | `60` | CGV 조회 및 Telegram 명령 확인 주기 |
+| `POLL_INTERVAL_SECONDS` | `60` | CGV 전체 조회 주기 |
+| `TELEGRAM_COMMAND_POLL_SECONDS` | `2` | CGV 조회 중·대기 중 Telegram 명령 확인 주기 |
 | `CGV_REQUEST_SPACING_SECONDS` | `2` | 연속 CGV 요청 사이의 최소 간격 |
 | `RATE_LIMIT_BACKOFF_INITIAL_SECONDS` | `1800` | HTTP 429 발생 후 첫 대기 시간(30분) |
 | `RATE_LIMIT_BACKOFF_MAX_SECONDS` | `7200` | 연속 HTTP 429 시 최대 대기 시간(120분) |
