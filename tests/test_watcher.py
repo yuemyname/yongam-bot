@@ -1734,6 +1734,35 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(breakdown["chat_types"]["group"], 1)
             self.assertEqual(breakdown["chat_types"]["unknown"], 1)
 
+    def test_welcome_says_no_setup_is_required(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = dataclasses.replace(
+                make_config(Path(temporary)), subscriptions_enabled=True
+            )
+            logger = logging.getLogger(f"watcher-welcome-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            replies = []
+            watcher.telegram.send_message = lambda text, **_kwargs: replies.append(text)
+            watcher.telegram.get_updates = lambda **_kwargs: [
+                {
+                    "update_id": 1,
+                    "message": {
+                        "text": "/start",
+                        "chat": {"id": 777, "type": "private"},
+                    },
+                }
+            ]
+
+            watcher.sync_subscribers()
+            welcome = replies[-1]
+
+            self.assertIn("따로 설정하실 것은 없습니다", welcome)
+            # Listing every setting made a finished subscription look unfinished.
+            for command in ("/mode_all", "/mode_open", "/mode_seats", "/seat_"):
+                self.assertNotIn(command, welcome)
+            self.assertLess(len(welcome.splitlines()), 10)
+
     def test_desc_command_explains_bot_and_usage(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = dataclasses.replace(

@@ -2107,10 +2107,13 @@ class Watcher:
                     if added
                     else "✅ 이미 CGV 용산 IMAX 알림을 받고 있습니다."
                 )
+                # Lead with "nothing to configure".  Listing the settings here
+                # made a finished subscription read like an unfinished setup.
                 reply += (
-                    "\n\n예매 오픈과 좌석 수 변경을 알려드릴게요."
-                    f"\n\n{MODE_GUIDE}"
-                    "\n\n알림 해지: /stop\n구독 상태: /status"
+                    "\n\n따로 설정하실 것은 없습니다."
+                    "\n새 회차가 열리거나 잔여 좌석이 바뀌면 바로 알려드릴게요."
+                    "\n\n알림이 많다고 느껴지면 /mode 로 종류를 줄일 수 있어요."
+                    "\n자세한 설명 /desc · 해지 /stop"
                 )
             elif command in {"/stop", "/unsubscribe"}:
                 removed = self.state.remove_subscriber(chat_id)
@@ -2166,7 +2169,9 @@ class Watcher:
                     "/seat - 잔여 좌석 알림 범위 선택\n"
                     "/desc - 봇 설명과 사용 방법\n"
                     "/coffee - 개발자에게 커피 후원\n"
-                    "/help - 사용법 보기"
+                    "/help - 사용법 보기\n\n"
+                    "/mode 와 /seat 은 선택 사항입니다.\n"
+                    "그대로 두시면 모든 알림을 받습니다."
                 )
             elif command in {"/desc", "/description"}:
                 reply = (
@@ -2182,11 +2187,12 @@ class Watcher:
                     "• 장애인석만 남은 경우\n"
                     "• A열만 남은 경우\n"
                     "• 잔여 좌석이 0석인 경우\n\n"
-                    "🔧 알림 종류 선택\n"
+                    "🔧 알림 종류 선택 (선택 사항)\n"
+                    "그대로 두시면 아래 알림을 모두 받습니다.\n"
                     "• /mode_all — 신규 오픈 + 잔여 좌석 (기본)\n"
                     "• /mode_open — 신규 오픈만\n"
                     "• /mode_seats — 잔여 좌석만\n\n"
-                    "💺 잔여 좌석 알림 범위\n"
+                    "💺 잔여 좌석 알림 범위 (선택 사항)\n"
                     "• /seat_all — 좌석 종류 미확인 알림도 받기 (기본)\n"
                     "• /seat_verified — 일반 좌석이 확인된 알림만 받기\n\n"
                     "📌 사용 방법\n"
