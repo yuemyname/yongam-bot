@@ -21,6 +21,7 @@ import re
 import signal
 import ssl
 import sys
+import threading
 import time
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 import urllib.error
@@ -978,6 +979,7 @@ class TelegramClient:
 class StateStore:
     def __init__(self, path: Path):
         self.path = path
+        self._lock = threading.RLock()
         self.data: dict[str, Any] = {
             "version": 4,
             "notified": {},
@@ -990,150 +992,167 @@ class StateStore:
         }
 
     def load(self) -> None:
-        if not self.path.exists():
-            return
-        try:
-            loaded = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise RuntimeError(
-                f"중복 방지 상태 파일을 읽을 수 없습니다: {self.path}"
-            ) from exc
-        if not isinstance(loaded, dict) or not isinstance(loaded.get("notified", {}), dict):
-            raise RuntimeError(f"중복 방지 상태 파일 형식이 올바르지 않습니다: {self.path}")
-        if not isinstance(loaded.get("seat_counts", {}), dict):
-            raise RuntimeError(f"좌석 수 상태 파일 형식이 올바르지 않습니다: {self.path}")
-        if not isinstance(loaded.get("subscribers", {}), dict):
-            raise RuntimeError(f"구독자 상태 파일 형식이 올바르지 않습니다: {self.path}")
-        self.data.update(loaded)
-        self.data["version"] = 4
-        self.data.setdefault("seat_counts", {})
-        self.data.setdefault("subscribers", {})
-        self.data.setdefault("subscribers_initialized", False)
-        self.data.setdefault("telegram_update_offset", 0)
+        with self._lock:
+            if not self.path.exists():
+                return
+            try:
+                loaded = json.loads(self.path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"중복 방지 상태 파일을 읽을 수 없습니다: {self.path}"
+                ) from exc
+            if not isinstance(loaded, dict) or not isinstance(loaded.get("notified", {}), dict):
+                raise RuntimeError(f"중복 방지 상태 파일 형식이 올바르지 않습니다: {self.path}")
+            if not isinstance(loaded.get("seat_counts", {}), dict):
+                raise RuntimeError(f"좌석 수 상태 파일 형식이 올바르지 않습니다: {self.path}")
+            if not isinstance(loaded.get("subscribers", {}), dict):
+                raise RuntimeError(f"구독자 상태 파일 형식이 올바르지 않습니다: {self.path}")
+            self.data.update(loaded)
+            self.data["version"] = 4
+            self.data.setdefault("seat_counts", {})
+            self.data.setdefault("subscribers", {})
+            self.data.setdefault("subscribers_initialized", False)
+            self.data.setdefault("telegram_update_offset", 0)
 
     def was_notified(self, key: str) -> bool:
-        return key in self.data["notified"]
+        with self._lock:
+            return key in self.data["notified"]
 
     def mark_notified(self, key: str, session: BookingSession) -> None:
-        self.data["notified"][key] = {
-            "notified_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "date": session.date,
-            "start_time": session.start_time,
-            "screen_name": session.screen_name,
-            "remaining_seats": session.remaining_seats,
-            "total_seats": session.total_seats,
-        }
+        with self._lock:
+            self.data["notified"][key] = {
+                "notified_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "date": session.date,
+                "start_time": session.start_time,
+                "screen_name": session.screen_name,
+                "remaining_seats": session.remaining_seats,
+                "total_seats": session.total_seats,
+            }
 
     @property
     def subscribers_initialized(self) -> bool:
-        return bool(self.data.get("subscribers_initialized", False))
+        with self._lock:
+            return bool(self.data.get("subscribers_initialized", False))
 
     def initialize_subscribers(self, initial_chat_id: str) -> None:
-        if initial_chat_id:
-            self.add_subscriber(initial_chat_id, label="초기 관리자")
-        self.data["subscribers_initialized"] = True
+        with self._lock:
+            if initial_chat_id:
+                self.add_subscriber(initial_chat_id, label="초기 관리자")
+            self.data["subscribers_initialized"] = True
 
     def subscriber_ids(self) -> tuple[str, ...]:
-        return tuple(str(chat_id) for chat_id in self.data["subscribers"])
+        with self._lock:
+            return tuple(str(chat_id) for chat_id in self.data["subscribers"])
 
     def is_subscribed(self, chat_id: str) -> bool:
-        return str(chat_id) in self.data["subscribers"]
+        with self._lock:
+            return str(chat_id) in self.data["subscribers"]
 
     def add_subscriber(
         self, chat_id: str, *, label: str = "", chat_type: str = ""
     ) -> bool:
-        key = str(chat_id)
-        if key in self.data["subscribers"]:
-            return False
-        self.data["subscribers"][key] = {
-            "subscribed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "label": label[:100],
-            "chat_type": chat_type[:30],
-        }
-        return True
+        with self._lock:
+            key = str(chat_id)
+            if key in self.data["subscribers"]:
+                return False
+            self.data["subscribers"][key] = {
+                "subscribed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "label": label[:100],
+                "chat_type": chat_type[:30],
+            }
+            return True
 
     def remove_subscriber(self, chat_id: str) -> bool:
-        return self.data["subscribers"].pop(str(chat_id), None) is not None
+        with self._lock:
+            return self.data["subscribers"].pop(str(chat_id), None) is not None
 
     @property
     def telegram_update_offset(self) -> int:
-        value = self.data.get("telegram_update_offset", 0)
-        return value if isinstance(value, int) and value >= 0 else 0
+        with self._lock:
+            value = self.data.get("telegram_update_offset", 0)
+            return value if isinstance(value, int) and value >= 0 else 0
 
     def set_telegram_update_offset(self, offset: int) -> None:
-        self.data["telegram_update_offset"] = max(0, int(offset))
+        with self._lock:
+            self.data["telegram_update_offset"] = max(0, int(offset))
 
     def seat_snapshot(self, key: str) -> SeatSnapshot | None:
-        raw = self.data["seat_counts"].get(key)
-        if not isinstance(raw, Mapping):
-            return None
-        total = _nonnegative_int(raw.get("total"))
-        if total is None:
-            return None
-        raw_rows = raw.get("available_rows")
-        available_rows = None
-        if isinstance(raw_rows, list) and all(
-            isinstance(row, str) for row in raw_rows
-        ):
-            available_rows = tuple(raw_rows)
-        return SeatSnapshot(
-            total=total,
-            general=_nonnegative_int(raw.get("general")),
-            accessible=_nonnegative_int(raw.get("accessible")),
-            mapped_total=_nonnegative_int(raw.get("mapped_total")),
-            available_rows=available_rows,
-        )
+        with self._lock:
+            raw = self.data["seat_counts"].get(key)
+            if not isinstance(raw, Mapping):
+                return None
+            total = _nonnegative_int(raw.get("total"))
+            if total is None:
+                return None
+            raw_rows = raw.get("available_rows")
+            available_rows = None
+            if isinstance(raw_rows, list) and all(
+                isinstance(row, str) for row in raw_rows
+            ):
+                available_rows = tuple(raw_rows)
+            return SeatSnapshot(
+                total=total,
+                general=_nonnegative_int(raw.get("general")),
+                accessible=_nonnegative_int(raw.get("accessible")),
+                mapped_total=_nonnegative_int(raw.get("mapped_total")),
+                available_rows=available_rows,
+            )
 
     def set_seat_snapshot(self, key: str, snapshot: SeatSnapshot) -> None:
-        self.data["seat_counts"][key] = {
-            "observed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "total": snapshot.total,
-            "general": snapshot.general,
-            "accessible": snapshot.accessible,
-            "mapped_total": snapshot.mapped_total,
-            "available_rows": (
-                list(snapshot.available_rows)
-                if snapshot.available_rows is not None
-                else None
-            ),
-        }
+        with self._lock:
+            self.data["seat_counts"][key] = {
+                "observed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "total": snapshot.total,
+                "general": snapshot.general,
+                "accessible": snapshot.accessible,
+                "mapped_total": snapshot.mapped_total,
+                "available_rows": (
+                    list(snapshot.available_rows)
+                    if snapshot.available_rows is not None
+                    else None
+                ),
+            }
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_name(f".{self.path.name}.tmp")
-        rendered = json.dumps(self.data, ensure_ascii=False, indent=2, sort_keys=True)
-        with temporary.open("w", encoding="utf-8") as handle:
-            handle.write(rendered)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.replace(self.path)
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_name(f".{self.path.name}.tmp")
+            rendered = json.dumps(self.data, ensure_ascii=False, indent=2, sort_keys=True)
+            with temporary.open("w", encoding="utf-8") as handle:
+                handle.write(rendered)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.replace(self.path)
 
     def should_notify_error(self, fingerprint: str, cooldown_seconds: int) -> bool:
-        if fingerprint != self.data.get("last_error_fingerprint", ""):
-            return True
-        raw_last = self.data.get("last_error_notified_at", "")
-        try:
-            last = dt.datetime.fromisoformat(raw_last)
-        except (TypeError, ValueError):
-            return True
-        if last.tzinfo is None:
-            last = last.replace(tzinfo=dt.timezone.utc)
-        elapsed = dt.datetime.now(dt.timezone.utc) - last
-        return elapsed.total_seconds() >= cooldown_seconds
+        with self._lock:
+            if fingerprint != self.data.get("last_error_fingerprint", ""):
+                return True
+            raw_last = self.data.get("last_error_notified_at", "")
+            try:
+                last = dt.datetime.fromisoformat(raw_last)
+            except (TypeError, ValueError):
+                return True
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=dt.timezone.utc)
+            elapsed = dt.datetime.now(dt.timezone.utc) - last
+            return elapsed.total_seconds() >= cooldown_seconds
 
     def mark_error_notified(self, fingerprint: str) -> None:
-        self.data["last_error_fingerprint"] = fingerprint
-        self.data["last_error_notified_at"] = dt.datetime.now(
-            dt.timezone.utc
-        ).isoformat()
+        with self._lock:
+            self.data["last_error_fingerprint"] = fingerprint
+            self.data["last_error_notified_at"] = dt.datetime.now(
+                dt.timezone.utc
+            ).isoformat()
 
     def clear_error(self) -> bool:
-        if not self.data.get("last_error_fingerprint"):
-            return False
-        self.data["last_error_fingerprint"] = ""
-        self.data["last_error_notified_at"] = ""
-        return True
+        with self._lock:
+            if not self.data.get("last_error_fingerprint"):
+                return False
+            self.data["last_error_fingerprint"] = ""
+            self.data["last_error_notified_at"] = ""
+            return True
 
 
 def _session_line(session: BookingSession) -> str:
@@ -1348,7 +1367,6 @@ class Watcher:
         )
         self.state = StateStore(config.state_file)
         self._last_cgv_request_finished_at: float | None = None
-        self._last_telegram_sync_at: float | None = None
         self.state.load()
         if not self.state.subscribers_initialized:
             self.state.initialize_subscribers(config.telegram_chat_id)
@@ -1396,8 +1414,6 @@ class Watcher:
         except TelegramError as exc:
             self.logger.warning("%s", exc)
             return
-        finally:
-            self._last_telegram_sync_at = time.monotonic()
 
         state_changed = False
         for update in sorted(
@@ -1515,19 +1531,7 @@ class Watcher:
                 len(self.state.subscriber_ids()),
             )
 
-    def _maybe_sync_subscribers(self) -> None:
-        """Poll Telegram commands independently of the long CGV scan cadence."""
-
-        if self.dry_run or not self.config.subscriptions_enabled:
-            return
-        if self._last_telegram_sync_at is not None:
-            elapsed = time.monotonic() - self._last_telegram_sync_at
-            if elapsed < self.config.telegram_command_poll_seconds:
-                return
-        self.sync_subscribers()
-
     def run_cycle(self) -> CycleResult:
-        self.sync_subscribers()
         dates = self.config.target_dates()
         payloads: dict[dt.date, Any] = {}
         errors: dict[dt.date, str] = {}
@@ -1553,7 +1557,6 @@ class Watcher:
                 errors[show_date] = f"예상하지 못한 조회 오류: {type(exc).__name__}"
             finally:
                 self._mark_cgv_request_finished()
-                self._maybe_sync_subscribers()
 
         session_map: dict[tuple[str, str], BookingSession] = {}
         for show_date, payload in payloads.items():
@@ -1650,7 +1653,6 @@ class Watcher:
                     )
                 finally:
                     self._mark_cgv_request_finished()
-                    self._maybe_sync_subscribers()
 
         if seat_detail_errors:
             self.logger.warning(
@@ -1967,6 +1969,17 @@ def rate_limit_backoff_seconds(config: Config, consecutive_cycles: int) -> int:
     )
 
 
+def run_command_loop(watcher: Watcher, stop_event: threading.Event) -> None:
+    """Keep Telegram commands responsive without delaying CGV requests."""
+
+    while not stop_event.is_set():
+        try:
+            watcher.sync_subscribers()
+        except Exception:
+            watcher.logger.exception("Telegram 명령 처리 중 예상하지 못한 오류")
+        stop_event.wait(watcher.config.telegram_command_poll_seconds)
+
+
 def configure_logging(config: Config, *, verbose: bool = False) -> logging.Logger:
     logger = logging.getLogger("cgv_watcher")
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
@@ -2131,6 +2144,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     if args.once:
+        watcher.sync_subscribers()
         result = watcher.run_cycle()
         return 0 if result.successful_dates else 3
 
@@ -2143,6 +2157,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
 
+    command_stop_event = threading.Event()
+    command_thread: threading.Thread | None = None
+    if config.subscriptions_enabled and not args.dry_run:
+        command_thread = threading.Thread(
+            target=run_command_loop,
+            args=(watcher, command_stop_event),
+            name="telegram-command-poller",
+            daemon=True,
+        )
+        command_thread.start()
+
     consecutive_rate_limit_cycles = 0
     while not stop_requested:
         if (
@@ -2150,7 +2175,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             and config.local_today() > config.target_end
         ):
             logger.info("감시 대상 마지막 날짜가 지나 정상 종료합니다.")
-            return 0
+            break
         started = time.monotonic()
         result = watcher.run_cycle()
         if result.rate_limited_requests:
@@ -2177,9 +2202,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         sleep_seconds = max(0.5, next_interval - elapsed)
         deadline = time.monotonic() + sleep_seconds
         while not stop_requested and time.monotonic() < deadline:
-            watcher._maybe_sync_subscribers()
             time.sleep(min(0.5, deadline - time.monotonic()))
 
+    command_stop_event.set()
+    if command_thread is not None:
+        command_thread.join(timeout=config.request_timeout_seconds + 1)
     logger.info("사용자 요청으로 감시기를 종료합니다.")
     return 0
 
