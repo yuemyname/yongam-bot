@@ -146,6 +146,7 @@ class Config:
     target_start: dt.date
     target_end: dt.date
     poll_interval_seconds: int
+    telegram_command_poll_seconds: int
     cgv_request_spacing_seconds: int
     rate_limit_backoff_initial_seconds: int
     rate_limit_backoff_max_seconds: int
@@ -271,6 +272,12 @@ class Config:
                 name="POLL_INTERVAL_SECONDS",
                 minimum=30,
                 maximum=86400,
+            ),
+            telegram_command_poll_seconds=_parse_int(
+                value("TELEGRAM_COMMAND_POLL_SECONDS", "2"),
+                name="TELEGRAM_COMMAND_POLL_SECONDS",
+                minimum=1,
+                maximum=60,
             ),
             cgv_request_spacing_seconds=_parse_int(
                 value("CGV_REQUEST_SPACING_SECONDS", "2"),
@@ -1341,6 +1348,7 @@ class Watcher:
         )
         self.state = StateStore(config.state_file)
         self._last_cgv_request_finished_at: float | None = None
+        self._last_telegram_sync_at: float | None = None
         self.state.load()
         if not self.state.subscribers_initialized:
             self.state.initialize_subscribers(config.telegram_chat_id)
@@ -1388,6 +1396,8 @@ class Watcher:
         except TelegramError as exc:
             self.logger.warning("%s", exc)
             return
+        finally:
+            self._last_telegram_sync_at = time.monotonic()
 
         state_changed = False
         for update in sorted(
@@ -1505,6 +1515,17 @@ class Watcher:
                 len(self.state.subscriber_ids()),
             )
 
+    def _maybe_sync_subscribers(self) -> None:
+        """Poll Telegram commands independently of the long CGV scan cadence."""
+
+        if self.dry_run or not self.config.subscriptions_enabled:
+            return
+        if self._last_telegram_sync_at is not None:
+            elapsed = time.monotonic() - self._last_telegram_sync_at
+            if elapsed < self.config.telegram_command_poll_seconds:
+                return
+        self.sync_subscribers()
+
     def run_cycle(self) -> CycleResult:
         self.sync_subscribers()
         dates = self.config.target_dates()
@@ -1532,6 +1553,7 @@ class Watcher:
                 errors[show_date] = f"예상하지 못한 조회 오류: {type(exc).__name__}"
             finally:
                 self._mark_cgv_request_finished()
+                self._maybe_sync_subscribers()
 
         session_map: dict[tuple[str, str], BookingSession] = {}
         for show_date, payload in payloads.items():
@@ -1628,6 +1650,7 @@ class Watcher:
                     )
                 finally:
                     self._mark_cgv_request_finished()
+                    self._maybe_sync_subscribers()
 
         if seat_detail_errors:
             self.logger.warning(
@@ -2101,6 +2124,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         config.poll_interval_seconds,
     )
     logger.info("CGV 로그인 토큰과 로그인 쿠키는 사용하지 않습니다.")
+    if config.subscriptions_enabled:
+        logger.info(
+            "Telegram 명령은 CGV 조회와 별도로 %d초 간격으로 확인합니다.",
+            config.telegram_command_poll_seconds,
+        )
 
     if args.once:
         result = watcher.run_cycle()
@@ -2149,6 +2177,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         sleep_seconds = max(0.5, next_interval - elapsed)
         deadline = time.monotonic() + sleep_seconds
         while not stop_requested and time.monotonic() < deadline:
+            watcher._maybe_sync_subscribers()
             time.sleep(min(0.5, deadline - time.monotonic()))
 
     logger.info("사용자 요청으로 감시기를 종료합니다.")
