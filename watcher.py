@@ -1694,6 +1694,9 @@ class _CycleTally:
     # A key can be deferred both as a new session and as a seat change; a set
     # keeps the reported count to one per showing.
     deferred_keys: set[str] = dataclasses.field(default_factory=set)
+    # One entry per showing, emitted as a single DEBUG line at the end of the
+    # cycle.  Only collected when DEBUG is on, so normal runs build nothing.
+    verdicts: list[str] = dataclasses.field(default_factory=list)
     dirty: bool = False
 
 
@@ -2151,6 +2154,29 @@ class Watcher:
                 len(self.state.subscriber_ids()),
             )
 
+    def _record_verdicts(
+        self,
+        tally: "_CycleTally",
+        sessions: Sequence[BookingSession],
+        verdicts: Mapping[str, str],
+        session_keys: Mapping[BookingSession, str],
+        snapshots: Mapping[str, SeatSnapshot],
+    ) -> None:
+        """Note what happened to each showing, for the end-of-cycle DEBUG line."""
+
+        if not self.logger.isEnabledFor(logging.DEBUG):
+            return
+        for session in sessions:
+            key = session_keys[session]
+            snapshot = snapshots.get(key)
+            remaining = snapshot.total if snapshot else session.remaining_seats
+            tally.verdicts.append(
+                f"{session.date[5:]} {session.start_time} "
+                f"{remaining if remaining is not None else '?'}"
+                f"/{session.total_seats or '?'} "
+                f"{verdicts.get(key, '변화없음')}"
+            )
+
     def _flush_state(self, tally: "_CycleTally") -> None:
         """Persist as soon as a date is done, not once the whole cycle is.
 
@@ -2217,6 +2243,17 @@ class Watcher:
             )
             if closed_sessions:
                 tally.suppressed_closed += len(closed_sessions)
+                closed_keys = {
+                    session: f"closed:{index}"
+                    for index, session in enumerate(closed_sessions)
+                }
+                self._record_verdicts(
+                    tally,
+                    closed_sessions,
+                    {key: "제외·예매 마감" for key in closed_keys.values()},
+                    closed_keys,
+                    {},
+                )
                 self.logger.info(
                     "알림 제외: %s 상영이 시작돼 예매가 마감된 회차 %d개",
                     show_date.isoformat(),
@@ -2245,6 +2282,7 @@ class Watcher:
             key: self.state.seat_snapshot(key) for key in session_keys.values()
         }
 
+        verdicts: dict[str, str] = {}
         snapshots: dict[str, SeatSnapshot] = {}
         seat_candidates: list[BookingSession] = []
         for session in sessions:
@@ -2355,6 +2393,16 @@ class Watcher:
             and snapshots[session_keys[session]].alertable
         ]
 
+        for session in sold_out_new_sessions:
+            verdicts[session_keys[session]] = "제외·매진"
+        for session in suppressed_new_sessions:
+            snapshot = snapshots[session_keys[session]]
+            verdicts[session_keys[session]] = (
+                "제외·장애인석만" if snapshot.accessible_only else "제외·A열만"
+            )
+        for session in deferred_new_sessions:
+            verdicts[session_keys[session]] = "보류·좌석종류 미확인"
+
         tally.suppressed_sold_out += len(sold_out_new_sessions)
         tally.deferred_keys.update(
             session_keys[session] for session in deferred_new_sessions
@@ -2412,6 +2460,7 @@ class Watcher:
                         break
                     for session in chunk_sessions:
                         self.state.mark_notified(session_keys[session], session)
+                        verdicts[session_keys[session]] = "발송·예매 오픈"
                         tally.dirty = True
                     tally.new_sessions += len(chunk_sessions)
                     self.logger.info(
@@ -2428,6 +2477,7 @@ class Watcher:
                 continue
             previous = previous_snapshots.get(key)
             if previous is None:
+                verdicts.setdefault(key, "첫 관측·기록만")
                 if not self.dry_run:
                     self.state.set_seat_snapshot(key, current)
                     tally.dirty = True
@@ -2436,6 +2486,7 @@ class Watcher:
                 continue
 
             if current.total == 0:
+                verdicts[key] = "제외·매진"
                 tally.suppressed_sold_out += 1
                 self.logger.info(
                     "좌석 변경 알림 제외: %s 잔여 좌석이 0석입니다.",
@@ -2448,8 +2499,10 @@ class Watcher:
 
             if current.should_suppress:
                 if current.accessible_only:
+                    verdicts[key] = "제외·장애인석만"
                     tally.suppressed_accessible_only += 1
                 elif current.row_a_only:
+                    verdicts[key] = "제외·A열만"
                     tally.suppressed_row_a_only += 1
                 self.logger.info(
                     "좌석 변경 알림 제외: %s %s",
@@ -2462,6 +2515,7 @@ class Watcher:
                 continue
 
             if not current.alertable:
+                verdicts[key] = "보류·좌석종류 미확인"
                 tally.deferred_keys.add(key)
                 self.logger.info(
                     "좌석 변경 알림 보류: %s 좌석 종류 판별 실패 후 잔여 6석 이하입니다.",
@@ -2473,6 +2527,7 @@ class Watcher:
             # alert above.  Do not send a second seat-change message for the same
             # observation.
             if key not in previously_notified:
+                verdicts.setdefault(key, "오픈 알림으로 갈음")
                 if not self.dry_run:
                     self.state.set_seat_snapshot(key, current)
                     tally.dirty = True
@@ -2504,6 +2559,7 @@ class Watcher:
             )
             if delivered or total == 0:
                 self.state.set_seat_snapshot(key, current)
+                verdicts[key] = f"발송·좌석 변경 {previous.total}→{current.total}"
                 tally.dirty = True
                 self.logger.info(
                     "Telegram 좌석 변경 알림 전송: %s (%d석 -> %d석), "
@@ -2514,6 +2570,8 @@ class Watcher:
                     delivered,
                     failed,
                 )
+
+        self._record_verdicts(tally, sessions, verdicts, session_keys, snapshots)
 
     def run_cycle(self) -> CycleResult:
         today = self.config.local_today()
@@ -2615,6 +2673,13 @@ class Watcher:
             tally.dirty = True
 
         self._flush_state(tally)
+
+        if tally.verdicts:
+            self.logger.debug(
+                "회차 판정 %d건 | %s",
+                len(tally.verdicts),
+                " | ".join(tally.verdicts),
+            )
 
         self.logger.info(
             "조회 완료: 성공 %d일, 오류 %d일, IMAX 회차 %d개, 신규 %d개, "

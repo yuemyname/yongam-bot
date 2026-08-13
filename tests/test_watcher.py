@@ -1434,6 +1434,81 @@ class WatcherIntegrationTests(unittest.TestCase):
             # so a crash mid-cycle cannot resend what already went out.
             self.assertEqual(seen_on_disk, [0, 1, 2])
 
+    def _run_cycle_capturing(self, level, *, times, now=None):
+        """Run one cycle at the given log level and return the emitted records."""
+
+        records = []
+
+        class Capture(logging.Handler):
+            def emit(self, record):
+                records.append((record.levelno, record.getMessage()))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = dataclasses.replace(
+                make_config(Path(temporary)),
+                dynamic_date_window=True,
+                target_window_days=1,
+            )
+            logger = logging.getLogger(f"watcher-verdict-{level}-{id(self)}")
+            logger.handlers = [Capture()]
+            logger.setLevel(level)
+            watcher = Watcher(config, logger=logger)
+            watcher.telegram.send_message = lambda text, **_kwargs: None
+            watcher.cgv.fetch_date = lambda show_date: {
+                "data": [
+                    {
+                        "scnsNm": "IMAX관",
+                        "scnYmd": show_date.strftime("%Y%m%d"),
+                        "scnsrtTm": start,
+                        "scnsNo": "13",
+                        "scnSseq": str(index),
+                        "frSeatCnt": remaining,
+                        "stcnt": 624,
+                    }
+                    for index, (start, remaining) in enumerate(times)
+                ]
+            }
+            watcher.cgv.fetch_seat_snapshot = lambda session: (
+                SeatSnapshot(total=session.remaining_seats)
+                if session.remaining_seats <= 6
+                else SeatSnapshot(
+                    total=session.remaining_seats,
+                    general=session.remaining_seats - 2,
+                    accessible=2,
+                    mapped_total=session.remaining_seats,
+                    available_rows=("B",),
+                )
+            )
+            watcher.run_cycle()
+        return records
+
+    def test_verbose_runs_summarise_every_showing_in_one_line(self):
+        now = _kst(dt.date(2026, 8, 13))
+        with patch.object(Config, "local_now", return_value=now):
+            records = self._run_cycle_capturing(
+                logging.DEBUG,
+                # already started, normal, nearly sold out
+                times=[("0700", 400), ("1900", 412), ("2200", 5)],
+            )
+
+        verdicts = [msg for level, msg in records if msg.startswith("회차 판정")]
+        self.assertEqual(len(verdicts), 1, "판정 요약은 주기당 한 줄이어야 합니다")
+        line = verdicts[0]
+        self.assertIn("회차 판정 3건", line)
+        self.assertIn("07:00 400/624 제외·예매 마감", line)
+        self.assertIn("19:00 412/624 발송·예매 오픈", line)
+        self.assertIn("22:00 5/624 보류·좌석종류 미확인", line)
+
+    def test_normal_runs_do_not_carry_the_per_showing_summary(self):
+        now = _kst(dt.date(2026, 8, 13))
+        with patch.object(Config, "local_now", return_value=now):
+            records = self._run_cycle_capturing(
+                logging.INFO, times=[("1900", 412), ("2200", 5)]
+            )
+
+        self.assertFalse([m for _l, m in records if m.startswith("회차 판정")])
+        self.assertTrue([m for _l, m in records if m.startswith("조회 완료")])
+
     def test_fetch_error_alert_reaches_every_alert_mode(self):
         with tempfile.TemporaryDirectory() as temporary:
             watcher = self._watcher_with_three_alert_modes(temporary, "error-fanout")
