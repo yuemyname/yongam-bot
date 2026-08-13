@@ -1665,12 +1665,36 @@ class ScanPlan:
     open_end: dt.date | None = None
     window_end: dt.date | None = None
 
-    def probe_hit(self, session_map: Mapping[tuple[str, str], BookingSession]) -> bool:
-        if self.open_end is None:
+    def probe_hit(self, latest_session_date: str) -> bool:
+        if self.open_end is None or not latest_session_date:
             return False
-        return any(
-            date_text > self.open_end.isoformat() for date_text, _ in session_map
-        )
+        return latest_session_date > self.open_end.isoformat()
+
+
+@dataclasses.dataclass
+class _CycleTally:
+    """Totals a cycle accumulates while walking the schedule date by date."""
+
+    successful_dates: int = 0
+    matching_sessions: int = 0
+    new_sessions: int = 0
+    seat_changes: int = 0
+    suppressed_accessible_only: int = 0
+    suppressed_row_a_only: int = 0
+    suppressed_sold_out: int = 0
+    suppressed_closed: int = 0
+    unclassified_fallback_alerts: int = 0
+    seat_detail_errors: int = 0
+    seat_detail_error_sample: str = ""
+    rate_limited_requests: int = 0
+    schedule_skipped_dates: int = 0
+    seat_detail_skipped: int = 0
+    rate_limited: bool = False
+    latest_session_date: str = ""
+    # A key can be deferred both as a new session and as a seat change; a set
+    # keeps the reported count to one per showing.
+    deferred_keys: set[str] = dataclasses.field(default_factory=set)
+    dirty: bool = False
 
 
 class Watcher:
@@ -2127,64 +2151,87 @@ class Watcher:
                 len(self.state.subscriber_ids()),
             )
 
-    def run_cycle(self) -> CycleResult:
-        today = self.config.local_today()
-        plan = self._plan_scan(today)
-        dates = list(plan.dates)
-        pruned_records = 0 if self.dry_run else self.state.prune_expired(today)
-        if pruned_records:
-            self.logger.info(
-                "지난 상영일 상태 기록 %d개를 정리했습니다.", pruned_records
+    def _flush_state(self, tally: "_CycleTally") -> None:
+        """Persist as soon as a date is done, not once the whole cycle is.
+
+        Alerts now go out mid-scan, so a crash between sending and saving
+        would resend them on the next cycle.  Saving per date keeps that
+        window to one date's worth of work.
+        """
+
+        if tally.dirty and not self.dry_run:
+            self.state.save()
+            tally.dirty = False
+
+    def _scan_and_alert(
+        self,
+        dates: Sequence[dt.date],
+        errors: dict[dt.date, str],
+        tally: "_CycleTally",
+    ) -> None:
+        """Fetch each date and alert on it before moving to the next.
+
+        Alerting per date rather than after the whole sweep is what keeps the
+        delay between reading a seat count and sending it near zero.  Today is
+        requested first, so the showings closest to their start time — the ones
+        whose seats move fastest — are also the ones alerted soonest.
+        """
+
+        for index, show_date in enumerate(dates):
+            if tally.rate_limited:
+                tally.schedule_skipped_dates += len(dates) - index
+                break
+
+            payload = None
+            self._wait_for_cgv_request_slot()
+            try:
+                payload = self.cgv.fetch_date(show_date)
+            except FetchError as exc:
+                message = str(exc)
+                errors[show_date] = message
+                if "HTTP 429" in message:
+                    # The guard at the top of the next iteration is what counts
+                    # the skipped dates; adding them here too would double them.
+                    tally.rate_limited = True
+                    tally.rate_limited_requests += 1
+                    self.logger.warning(
+                        "CGV HTTP 429 감지: 남은 일정 조회 %d일을 즉시 생략합니다.",
+                        len(dates) - index - 1,
+                    )
+            except Exception as exc:  # Keep a single malformed date from stopping the watcher.
+                errors[show_date] = f"예상하지 못한 조회 오류: {type(exc).__name__}"
+            finally:
+                self._mark_cgv_request_finished()
+
+            if payload is None:
+                continue
+            tally.successful_dates += 1
+
+            session_map = self._extract_sessions({show_date: payload})
+            for date_text, _start_time in session_map:
+                if date_text > tally.latest_session_date:
+                    tally.latest_session_date = date_text
+
+            sessions, closed_sessions = self._split_closed_sessions(
+                sorted(session_map.values())
             )
-        payloads: dict[dt.date, Any] = {}
-        errors: dict[dt.date, str] = {}
-
-        rate_limit_detected, schedule_skipped_dates = self._fetch_schedules(
-            dates, payloads, errors
-        )
-        session_map = self._extract_sessions(payloads)
-
-        # The probe found a session past the frontier, so a new booking opening
-        # started.  Widen the scan now to find where the newly opened range
-        # ends, instead of creeping forward a few days per cycle.
-        if (
-            not plan.full_scan
-            and not rate_limit_detected
-            and plan.probe_hit(session_map)
-        ):
-            expansion = self._expansion_dates(plan)
-            if expansion:
+            if closed_sessions:
+                tally.suppressed_closed += len(closed_sessions)
                 self.logger.info(
-                    "예매 오픈 감지: %s까지 확장 조회합니다(%d일).",
-                    expansion[-1].isoformat(),
-                    len(expansion),
+                    "알림 제외: %s 상영이 시작돼 예매가 마감된 회차 %d개",
+                    show_date.isoformat(),
+                    len(closed_sessions),
                 )
-                expansion_limited, expansion_skipped = self._fetch_schedules(
-                    expansion, payloads, errors
-                )
-                rate_limit_detected = rate_limit_detected or expansion_limited
-                schedule_skipped_dates += expansion_skipped
-                dates.extend(expansion)
-                session_map = self._extract_sessions(payloads)
+            tally.matching_sessions += len(sessions)
+            if sessions:
+                self._alert_for_sessions(sessions, tally)
+            self._flush_state(tally)
 
-        frontier_advanced = self._advance_frontier(session_map)
-        self._cycle_index += 1
-        self.logger.info(
-            "조회 범위: %s 모드, %d일 요청 (%s~%s)",
-            "전체" if plan.full_scan else "커서",
-            len(dates),
-            dates[0].isoformat() if dates else "-",
-            dates[-1].isoformat() if dates else "-",
-        )
+    def _alert_for_sessions(
+        self, sessions: Sequence[BookingSession], tally: "_CycleTally"
+    ) -> None:
+        """Read seat detail for one date's sessions and send what qualifies."""
 
-        sessions, closed_sessions = self._split_closed_sessions(
-            sorted(session_map.values())
-        )
-        if closed_sessions:
-            self.logger.info(
-                "알림 제외: 상영이 시작돼 예매가 마감된 회차 %d개",
-                len(closed_sessions),
-            )
         session_keys = {
             session: session.notification_key(
                 site_no=self.config.site_no, movie_no=self.config.movie_no
@@ -2199,7 +2246,6 @@ class Watcher:
         }
 
         snapshots: dict[str, SeatSnapshot] = {}
-        seat_detail_errors: dict[str, str] = {}
         seat_candidates: list[BookingSession] = []
         for session in sessions:
             key = session_keys[session]
@@ -2227,9 +2273,8 @@ class Watcher:
                 # minute, which can trigger CGV's HTTP 429 rate limit.
                 snapshots[key] = previous
 
-        seat_detail_skipped = 0
-        if rate_limit_detected:
-            seat_detail_skipped = len(seat_candidates)
+        if tally.rate_limited:
+            tally.seat_detail_skipped += len(seat_candidates)
             for session in seat_candidates:
                 snapshots[session_keys[session]] = SeatSnapshot(
                     total=session.remaining_seats or 0
@@ -2242,26 +2287,32 @@ class Watcher:
                     snapshots[key] = self.cgv.fetch_seat_snapshot(session)
                 except FetchError as exc:
                     message = str(exc)
-                    seat_detail_errors[key] = message
+                    tally.seat_detail_errors += 1
+                    tally.seat_detail_error_sample = (
+                        tally.seat_detail_error_sample or message
+                    )
                     snapshots[key] = SeatSnapshot(
                         total=session.remaining_seats or 0
                     )
                     if "HTTP 429" in message:
-                        rate_limit_detected = True
+                        tally.rate_limited = True
+                        tally.rate_limited_requests += 1
                         remaining_sessions = seat_candidates[index + 1 :]
-                        seat_detail_skipped = len(remaining_sessions)
+                        tally.seat_detail_skipped += len(remaining_sessions)
                         for skipped_session in remaining_sessions:
                             snapshots[session_keys[skipped_session]] = SeatSnapshot(
                                 total=skipped_session.remaining_seats or 0
                             )
                         self.logger.warning(
                             "CGV HTTP 429 감지: 남은 좌석 상세 조회 %d개를 즉시 생략합니다.",
-                            seat_detail_skipped,
+                            len(remaining_sessions),
                         )
                         break
                 except Exception as exc:
-                    seat_detail_errors[key] = (
-                        f"예상하지 못한 좌석 조회 오류: {type(exc).__name__}"
+                    tally.seat_detail_errors += 1
+                    tally.seat_detail_error_sample = (
+                        tally.seat_detail_error_sample
+                        or f"예상하지 못한 좌석 조회 오류: {type(exc).__name__}"
                     )
                     snapshots[key] = SeatSnapshot(
                         total=session.remaining_seats or 0
@@ -2269,25 +2320,10 @@ class Watcher:
                 finally:
                     self._mark_cgv_request_finished()
 
-        if seat_detail_errors:
-            self.logger.warning(
-                "좌석 상세 조회 오류 %d개: %s "
-                "(6석 이하는 보류, 7석 이상은 전체 잔여 수 기준 알림)",
-                len(seat_detail_errors),
-                next(iter(seat_detail_errors.values())),
-            )
-
-        rate_limited_requests = sum(
-            "HTTP 429" in message
-            for message in (*errors.values(), *seat_detail_errors.values())
-        )
-
         detected_new_sessions = [
             session
             for session in sessions
-            if not self.state.was_notified(
-                session_keys[session]
-            )
+            if session_keys[session] not in previously_notified
         ]
         sold_out_new_sessions = [
             session
@@ -2319,24 +2355,21 @@ class Watcher:
             and snapshots[session_keys[session]].alertable
         ]
 
-        state_changed = bool(pruned_records) or (
-            frontier_advanced and not self.dry_run
-        )
-        suppressed_sold_out = len(sold_out_new_sessions)
-        deferred_seat_detail_keys = {
+        tally.suppressed_sold_out += len(sold_out_new_sessions)
+        tally.deferred_keys.update(
             session_keys[session] for session in deferred_new_sessions
-        }
+        )
         unclassified_new_keys = {
             session_keys[session]
             for session in new_sessions
             if snapshots[session_keys[session]].uses_unclassified_fallback
         }
-        unclassified_fallback_alerts = len(unclassified_new_keys)
-        suppressed_accessible_only = sum(
+        tally.unclassified_fallback_alerts += len(unclassified_new_keys)
+        tally.suppressed_accessible_only += sum(
             snapshots[session_keys[session]].accessible_only
             for session in suppressed_new_sessions
         )
-        suppressed_row_a_only = sum(
+        tally.suppressed_row_a_only += sum(
             snapshots[session_keys[session]].row_a_only
             and not snapshots[session_keys[session]].accessible_only
             for session in suppressed_new_sessions
@@ -2365,6 +2398,7 @@ class Watcher:
                 self.logger.info("드라이런: 새 회차 %d개(메시지/상태 저장 생략)", len(new_sessions))
                 for session in new_sessions:
                     self.logger.info("드라이런 회차: %s", _session_line(session))
+                tally.new_sessions += len(new_sessions)
             else:
                 for text, chunk_sessions in message_chunks(
                     new_sessions,
@@ -2377,11 +2411,9 @@ class Watcher:
                     if total and not delivered:
                         break
                     for session in chunk_sessions:
-                        key = session.notification_key(
-                            site_no=self.config.site_no, movie_no=self.config.movie_no
-                        )
-                        self.state.mark_notified(key, session)
-                        state_changed = True
+                        self.state.mark_notified(session_keys[session], session)
+                        tally.dirty = True
+                    tally.new_sessions += len(chunk_sessions)
                     self.logger.info(
                         "Telegram 신규 회차 알림 %d개 전송: 성공 %d명, 실패 %d명",
                         len(chunk_sessions),
@@ -2389,7 +2421,6 @@ class Watcher:
                         failed,
                     )
 
-        seat_changes = 0
         for session in sessions:
             key = session_keys[session]
             current = snapshots.get(key)
@@ -2399,27 +2430,27 @@ class Watcher:
             if previous is None:
                 if not self.dry_run:
                     self.state.set_seat_snapshot(key, current)
-                    state_changed = True
+                    tally.dirty = True
                 continue
             if not _seat_snapshot_changed(previous, current):
                 continue
 
             if current.total == 0:
-                suppressed_sold_out += 1
+                tally.suppressed_sold_out += 1
                 self.logger.info(
                     "좌석 변경 알림 제외: %s 잔여 좌석이 0석입니다.",
                     _session_line(session),
                 )
                 if not self.dry_run:
                     self.state.set_seat_snapshot(key, current)
-                    state_changed = True
+                    tally.dirty = True
                 continue
 
             if current.should_suppress:
                 if current.accessible_only:
-                    suppressed_accessible_only += 1
+                    tally.suppressed_accessible_only += 1
                 elif current.row_a_only:
-                    suppressed_row_a_only += 1
+                    tally.suppressed_row_a_only += 1
                 self.logger.info(
                     "좌석 변경 알림 제외: %s %s",
                     _session_line(session),
@@ -2427,11 +2458,11 @@ class Watcher:
                 )
                 if not self.dry_run:
                     self.state.set_seat_snapshot(key, current)
-                    state_changed = True
+                    tally.dirty = True
                 continue
 
             if not current.alertable:
-                deferred_seat_detail_keys.add(key)
+                tally.deferred_keys.add(key)
                 self.logger.info(
                     "좌석 변경 알림 보류: %s 좌석 종류 판별 실패 후 잔여 6석 이하입니다.",
                     _session_line(session),
@@ -2444,17 +2475,17 @@ class Watcher:
             if key not in previously_notified:
                 if not self.dry_run:
                     self.state.set_seat_snapshot(key, current)
-                    state_changed = True
+                    tally.dirty = True
                 continue
 
             if current.uses_unclassified_fallback:
-                unclassified_fallback_alerts += 1
+                tally.unclassified_fallback_alerts += 1
                 self.logger.info(
                     "좌석 종류 미확인 알림 허용: %s 잔여 7석 이상입니다.",
                     _session_line(session),
                 )
 
-            seat_changes += 1
+            tally.seat_changes += 1
             if self.dry_run:
                 self.logger.info(
                     "드라이런 좌석 변경: %s (%d석 -> %d석)",
@@ -2473,7 +2504,7 @@ class Watcher:
             )
             if delivered or total == 0:
                 self.state.set_seat_snapshot(key, current)
-                state_changed = True
+                tally.dirty = True
                 self.logger.info(
                     "Telegram 좌석 변경 알림 전송: %s (%d석 -> %d석), "
                     "성공 %d명, 실패 %d명",
@@ -2483,6 +2514,64 @@ class Watcher:
                     delivered,
                     failed,
                 )
+
+    def run_cycle(self) -> CycleResult:
+        today = self.config.local_today()
+        plan = self._plan_scan(today)
+        dates = list(plan.dates)
+        tally = _CycleTally()
+        pruned_records = 0 if self.dry_run else self.state.prune_expired(today)
+        if pruned_records:
+            self.logger.info(
+                "지난 상영일 상태 기록 %d개를 정리했습니다.", pruned_records
+            )
+            tally.dirty = True
+        errors: dict[dt.date, str] = {}
+
+        self.logger.info(
+            "조회 시작: %s 모드, %d일 (%s~%s)",
+            "전체" if plan.full_scan else "커서",
+            len(dates),
+            dates[0].isoformat() if dates else "-",
+            dates[-1].isoformat() if dates else "-",
+        )
+        self._scan_and_alert(dates, errors, tally)
+
+        # The probe found a session past the frontier, so a new booking opening
+        # started.  Widen the scan now to find where the newly opened range
+        # ends, instead of creeping forward a few days per cycle.
+        if (
+            not plan.full_scan
+            and not tally.rate_limited
+            and plan.probe_hit(tally.latest_session_date)
+        ):
+            expansion = self._expansion_dates(plan)
+            if expansion:
+                self.logger.info(
+                    "예매 오픈 감지: %s까지 확장 조회합니다(%d일).",
+                    expansion[-1].isoformat(),
+                    len(expansion),
+                )
+                self._scan_and_alert(expansion, errors, tally)
+                dates.extend(expansion)
+
+        if tally.latest_session_date:
+            try:
+                observed = dt.date.fromisoformat(tally.latest_session_date)
+            except ValueError:
+                observed = None
+            if observed is not None and self.state.advance_frontier(observed):
+                self.logger.info("예매 오픈 관측 최대 상영일: %s", observed.isoformat())
+                tally.dirty = tally.dirty or not self.dry_run
+        self._cycle_index += 1
+
+        if tally.seat_detail_errors:
+            self.logger.warning(
+                "좌석 상세 조회 오류 %d개: %s "
+                "(6석 이하는 보류, 7석 이상은 전체 잔여 수 기준 알림)",
+                tally.seat_detail_errors,
+                tally.seat_detail_error_sample,
+            )
 
         if errors:
             unique_errors = sorted(set(errors.values()))
@@ -2510,8 +2599,8 @@ class Watcher:
                     f"{status_word} 날짜 조회에 실패했습니다 ({len(errors)}/{len(dates)}일).\n"
                     f"원인: {unique_errors[0]}\n"
                     + (
-                        f"요청 제한으로 남은 {schedule_skipped_dates}일 조회를 생략했습니다.\n"
-                        if schedule_skipped_dates
+                        f"요청 제한으로 남은 {tally.schedule_skipped_dates}일 조회를 생략했습니다.\n"
+                        if tally.schedule_skipped_dates
                         else ""
                     )
                     + "감시기는 계속 실행되며 자동 대기 후 다시 시도합니다."
@@ -2521,12 +2610,11 @@ class Watcher:
                 )
                 if delivered or total == 0:
                     self.state.mark_error_notified(fingerprint)
-                    state_changed = True
+                    tally.dirty = True
         elif self.state.clear_error():
-            state_changed = True
+            tally.dirty = True
 
-        if state_changed:
-            self.state.save()
+        self._flush_state(tally)
 
         self.logger.info(
             "조회 완료: 성공 %d일, 오류 %d일, IMAX 회차 %d개, 신규 %d개, "
@@ -2534,39 +2622,39 @@ class Watcher:
             "0석 제외 %d개, 예매 마감 제외 %d개, 좌석판별 대기 %d개, "
             "미판별 7석 이상 알림 %d개, "
             "HTTP 429 %d개, 일정 생략 %d일, 좌석상세 생략 %d개",
-            len(payloads),
+            tally.successful_dates,
             len(errors),
-            len(sessions),
-            len(new_sessions),
-            seat_changes,
-            suppressed_accessible_only,
-            suppressed_row_a_only,
-            suppressed_sold_out,
-            len(closed_sessions),
-            len(deferred_seat_detail_keys),
-            unclassified_fallback_alerts,
-            rate_limited_requests,
-            schedule_skipped_dates,
-            seat_detail_skipped,
+            tally.matching_sessions,
+            tally.new_sessions,
+            tally.seat_changes,
+            tally.suppressed_accessible_only,
+            tally.suppressed_row_a_only,
+            tally.suppressed_sold_out,
+            tally.suppressed_closed,
+            len(tally.deferred_keys),
+            tally.unclassified_fallback_alerts,
+            tally.rate_limited_requests,
+            tally.schedule_skipped_dates,
+            tally.seat_detail_skipped,
         )
         return CycleResult(
-            successful_dates=len(payloads),
+            successful_dates=tally.successful_dates,
             failed_dates=len(errors),
-            matching_sessions=len(sessions),
-            new_sessions=len(new_sessions),
-            seat_changes=seat_changes,
-            suppressed_accessible_only=suppressed_accessible_only,
-            suppressed_row_a_only=suppressed_row_a_only,
-            suppressed_sold_out=suppressed_sold_out,
-            deferred_seat_details=len(deferred_seat_detail_keys),
-            unclassified_fallback_alerts=unclassified_fallback_alerts,
-            seat_detail_errors=len(seat_detail_errors),
-            rate_limited_requests=rate_limited_requests,
-            schedule_skipped_dates=schedule_skipped_dates,
-            seat_detail_skipped=seat_detail_skipped,
+            matching_sessions=tally.matching_sessions,
+            new_sessions=tally.new_sessions,
+            seat_changes=tally.seat_changes,
+            suppressed_accessible_only=tally.suppressed_accessible_only,
+            suppressed_row_a_only=tally.suppressed_row_a_only,
+            suppressed_sold_out=tally.suppressed_sold_out,
+            deferred_seat_details=len(tally.deferred_keys),
+            unclassified_fallback_alerts=tally.unclassified_fallback_alerts,
+            seat_detail_errors=tally.seat_detail_errors,
+            rate_limited_requests=tally.rate_limited_requests,
+            schedule_skipped_dates=tally.schedule_skipped_dates,
+            seat_detail_skipped=tally.seat_detail_skipped,
             requested_dates=len(dates),
             full_scan=plan.full_scan,
-            suppressed_closed=len(closed_sessions),
+            suppressed_closed=tally.suppressed_closed,
         )
 
 

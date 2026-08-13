@@ -1331,6 +1331,109 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(bookable, [session])
             self.assertEqual(closed, [])
 
+    def test_alerts_are_sent_during_the_scan_not_after_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = dataclasses.replace(
+                make_config(Path(temporary)),
+                dynamic_date_window=True,
+                target_window_days=3,
+            )
+            logger = logging.getLogger(f"watcher-interleave-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+
+            events = []
+
+            def fetch(show_date):
+                events.append(("fetch", show_date.isoformat()))
+                return {
+                    "data": [
+                        {
+                            "scnsNm": "IMAX관",
+                            "scnYmd": show_date.strftime("%Y%m%d"),
+                            "scnsrtTm": "2200",
+                            "scnsNo": "13",
+                            "scnSseq": "4",
+                            "frSeatCnt": 100,
+                            "stcnt": 200,
+                        }
+                    ]
+                }
+
+            watcher.cgv.fetch_date = fetch
+            watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
+                total=session.remaining_seats,
+                general=session.remaining_seats - 2,
+                accessible=2,
+                mapped_total=session.remaining_seats,
+                available_rows=("B",),
+            )
+            watcher.telegram.send_message = lambda text, **_kwargs: events.append(
+                ("send", text)
+            )
+
+            result = watcher.run_cycle()
+
+            self.assertEqual(result.new_sessions, 3)
+            kinds = [kind for kind, _ in events]
+            last_fetch = len(kinds) - 1 - kinds[::-1].index("fetch")
+            first_send = kinds.index("send")
+            # The delay between reading a seat count and sending it is only
+            # small because the first date's alert goes out before the last
+            # date is even requested.
+            self.assertLess(first_send, last_fetch)
+            self.assertEqual(
+                events[0], ("fetch", dt.date(2026, 8, 13).isoformat())
+            )
+            self.assertEqual(events[1][0], "send")
+
+    def test_state_is_saved_as_each_date_finishes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = dataclasses.replace(
+                make_config(Path(temporary)),
+                dynamic_date_window=True,
+                target_window_days=3,
+            )
+            logger = logging.getLogger(f"watcher-flush-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            seen_on_disk = []
+
+            def fetch(show_date):
+                # What a crash at this moment would leave behind.
+                reloaded = StateStore(config.state_file)
+                reloaded.load()
+                seen_on_disk.append(len(reloaded.data["notified"]))
+                return {
+                    "data": [
+                        {
+                            "scnsNm": "IMAX관",
+                            "scnYmd": show_date.strftime("%Y%m%d"),
+                            "scnsrtTm": "2200",
+                            "scnsNo": "13",
+                            "scnSseq": "4",
+                            "frSeatCnt": 100,
+                            "stcnt": 200,
+                        }
+                    ]
+                }
+
+            watcher.cgv.fetch_date = fetch
+            watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
+                total=session.remaining_seats,
+                general=session.remaining_seats - 2,
+                accessible=2,
+                mapped_total=session.remaining_seats,
+                available_rows=("B",),
+            )
+            watcher.telegram.send_message = lambda text, **_kwargs: None
+
+            watcher.run_cycle()
+
+            # Each date's alert is on disk before the next date is requested,
+            # so a crash mid-cycle cannot resend what already went out.
+            self.assertEqual(seen_on_disk, [0, 1, 2])
+
     def test_fetch_error_alert_reaches_every_alert_mode(self):
         with tempfile.TemporaryDirectory() as temporary:
             watcher = self._watcher_with_three_alert_modes(temporary, "error-fanout")
