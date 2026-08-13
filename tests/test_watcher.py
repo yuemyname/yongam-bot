@@ -18,6 +18,8 @@ from watcher import (
     ALERT_SEATS,
     ALERT_SEATS_UNCLASSIFIED,
     ALERT_SYSTEM,
+    SCAN_MODE_CURSOR,
+    SCAN_MODE_FULL,
     STATE_VERSION,
     BookingSession,
     CgvClient,
@@ -443,6 +445,115 @@ class AlertModeStateTests(unittest.TestCase):
             store.add_subscriber("1")
             with self.assertRaises(ValueError):
                 store.set_alert_mode("1", "nope")
+
+
+class ScanPlanTests(unittest.TestCase):
+    TODAY = dt.date(2026, 8, 13)
+
+    def _watcher(self, temporary, **overrides):
+        settings = {
+            "dynamic_date_window": True,
+            "target_window_days": 28,
+            "scan_mode": SCAN_MODE_CURSOR,
+            **overrides,
+        }
+        config = dataclasses.replace(make_config(Path(temporary)), **settings)
+        logger = logging.getLogger(f"scan-plan-{id(self)}")
+        logger.handlers = [logging.NullHandler()]
+        return Watcher(config, logger=logger)
+
+    def test_full_mode_always_requests_the_whole_window(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._watcher(temporary, scan_mode=SCAN_MODE_FULL)
+            watcher.state.advance_frontier(dt.date(2026, 8, 20))
+
+            plan = watcher._plan_scan(self.TODAY)
+
+            self.assertTrue(plan.full_scan)
+            self.assertEqual(len(plan.dates), 28)
+
+    def test_cursor_mode_sweeps_the_window_when_no_frontier_is_known(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._watcher(temporary)
+
+            plan = watcher._plan_scan(self.TODAY)
+
+            self.assertTrue(plan.full_scan)
+            self.assertEqual(len(plan.dates), 28)
+
+    def test_cursor_mode_requests_open_range_plus_probe(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._watcher(temporary)
+            watcher.state.advance_frontier(dt.date(2026, 8, 20))
+            watcher._cycle_index = 1
+
+            plan = watcher._plan_scan(self.TODAY)
+
+            self.assertFalse(plan.full_scan)
+            self.assertEqual(plan.open_end, dt.date(2026, 8, 20))
+            # 08-13..08-20 open, then a three-day probe through 08-23.
+            self.assertEqual(plan.dates[0], self.TODAY)
+            self.assertEqual(plan.dates[-1], dt.date(2026, 8, 23))
+            self.assertEqual(len(plan.dates), 11)
+
+    def test_probe_stays_anchored_to_today_when_the_frontier_has_passed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._watcher(temporary)
+            watcher.state.advance_frontier(dt.date(2026, 1, 1))
+            watcher._cycle_index = 1
+
+            plan = watcher._plan_scan(self.TODAY)
+
+            self.assertFalse(plan.full_scan)
+            self.assertEqual(plan.open_end, self.TODAY - dt.timedelta(days=1))
+            self.assertEqual(plan.dates[0], self.TODAY)
+            self.assertEqual(plan.dates[-1], dt.date(2026, 8, 15))
+
+    def test_probe_is_clamped_to_the_window_end(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._watcher(temporary)
+            watcher.state.advance_frontier(dt.date(2026, 9, 9))
+            watcher._cycle_index = 1
+
+            plan = watcher._plan_scan(self.TODAY)
+
+            self.assertEqual(plan.dates[-1], dt.date(2026, 9, 9))
+            self.assertEqual(len(plan.dates), 28)
+
+    def test_a_full_scan_runs_every_configured_number_of_cycles(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._watcher(temporary, full_scan_every_cycles=10)
+            watcher.state.advance_frontier(dt.date(2026, 8, 20))
+
+            full_scan_cycles = []
+            for index in range(21):
+                watcher._cycle_index = index
+                if watcher._plan_scan(self.TODAY).full_scan:
+                    full_scan_cycles.append(index)
+
+            self.assertEqual(full_scan_cycles, [0, 10, 20])
+
+    def test_expansion_covers_the_rest_of_the_configured_reach(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._watcher(temporary, cursor_expansion_days=21)
+            watcher.state.advance_frontier(dt.date(2026, 8, 20))
+            watcher._cycle_index = 1
+
+            expansion = watcher._expansion_dates(watcher._plan_scan(self.TODAY))
+
+            # Probe ended at 08-23; expansion continues to 08-20 + 21 days.
+            self.assertEqual(expansion[0], dt.date(2026, 8, 24))
+            self.assertEqual(expansion[-1], dt.date(2026, 9, 9))
+
+    def test_frontier_only_moves_forward(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._watcher(temporary)
+
+            self.assertTrue(watcher.state.advance_frontier(dt.date(2026, 8, 20)))
+            self.assertFalse(watcher.state.advance_frontier(dt.date(2026, 8, 15)))
+            self.assertFalse(watcher.state.advance_frontier(dt.date(2026, 8, 20)))
+            self.assertTrue(watcher.state.advance_frontier(dt.date(2026, 8, 21)))
+            self.assertEqual(watcher.state.frontier_date, dt.date(2026, 8, 21))
 
 
 class ConfigTests(unittest.TestCase):
@@ -910,6 +1021,175 @@ class WatcherIntegrationTests(unittest.TestCase):
             reloaded = StateStore(config.state_file)
             reloaded.load()
             self.assertTrue(reloaded.verified_seats_only("111222"))
+
+    def _cursor_watcher(self, temporary, name, **overrides):
+        settings = {
+            "dynamic_date_window": True,
+            "target_window_days": 28,
+            "scan_mode": SCAN_MODE_CURSOR,
+            **overrides,
+        }
+        config = dataclasses.replace(make_config(Path(temporary)), **settings)
+        logger = logging.getLogger(f"cursor-{name}-{id(self)}")
+        logger.handlers = [logging.NullHandler()]
+        watcher = Watcher(config, logger=logger)
+        watcher.telegram.send_message = lambda text, **_kwargs: None
+        watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
+            total=session.remaining_seats,
+            general=session.remaining_seats - 2,
+            accessible=2,
+            mapped_total=session.remaining_seats,
+            available_rows=("B",),
+        )
+        return watcher
+
+    @staticmethod
+    def _dated_payload(show_date):
+        return {
+            "data": [
+                {
+                    "scnsNm": "IMAX관",
+                    "scnYmd": show_date.strftime("%Y%m%d"),
+                    "scnsrtTm": "1430",
+                    "scnsNo": "13",
+                    "scnSseq": "4",
+                    "frSeatCnt": 100,
+                    "stcnt": 200,
+                }
+            ]
+        }
+
+    def test_cursor_scan_narrows_requests_and_expands_on_a_new_opening(self):
+        today = dt.date(2026, 8, 13)
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(Config, "local_today", return_value=today):
+                watcher = self._cursor_watcher(temporary, "expansion")
+                open_through = {"date": dt.date(2026, 8, 20)}
+                requested = []
+
+                def fetch(show_date):
+                    requested.append(show_date)
+                    if show_date <= open_through["date"]:
+                        return self._dated_payload(show_date)
+                    return {"data": []}
+
+                watcher.cgv.fetch_date = fetch
+
+                first = watcher.run_cycle()
+                self.assertTrue(first.full_scan)
+                self.assertEqual(first.requested_dates, 28)
+                self.assertEqual(
+                    watcher.state.frontier_date, dt.date(2026, 8, 20)
+                )
+
+                # Nothing new opened: the cursor asks for the open range plus a
+                # three-day probe only.
+                requested.clear()
+                second = watcher.run_cycle()
+                self.assertFalse(second.full_scan)
+                self.assertEqual(second.requested_dates, 11)
+                self.assertEqual(requested[-1], dt.date(2026, 8, 23))
+
+                # CGV opens further ahead; the probe catches it and the cycle
+                # widens to find the new end of the open range.
+                open_through["date"] = dt.date(2026, 8, 30)
+                requested.clear()
+                third = watcher.run_cycle()
+
+                self.assertFalse(third.full_scan)
+                self.assertGreater(third.requested_dates, 11)
+                self.assertIn(dt.date(2026, 8, 30), requested)
+                self.assertEqual(
+                    watcher.state.frontier_date, dt.date(2026, 8, 30)
+                )
+
+    def test_cursor_scan_detects_the_new_sessions_it_probes(self):
+        today = dt.date(2026, 8, 13)
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(Config, "local_today", return_value=today):
+                watcher = self._cursor_watcher(temporary, "detect")
+                open_through = {"date": dt.date(2026, 8, 20)}
+                watcher.cgv.fetch_date = lambda show_date: (
+                    self._dated_payload(show_date)
+                    if show_date <= open_through["date"]
+                    else {"data": []}
+                )
+
+                watcher.run_cycle()
+                open_through["date"] = dt.date(2026, 8, 24)
+                result = watcher.run_cycle()
+
+                # 08-21 through 08-24 opened; all four must be reported.
+                self.assertEqual(result.new_sessions, 4)
+
+    def test_rate_limited_partial_scan_does_not_regress_the_frontier(self):
+        today = dt.date(2026, 8, 13)
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(Config, "local_today", return_value=today):
+                watcher = self._cursor_watcher(temporary, "ratelimit")
+                watcher.cgv.fetch_date = lambda show_date: (
+                    self._dated_payload(show_date)
+                    if show_date <= dt.date(2026, 8, 20)
+                    else {"data": []}
+                )
+                watcher.run_cycle()
+                self.assertEqual(
+                    watcher.state.frontier_date, dt.date(2026, 8, 20)
+                )
+
+                # Every later request fails, so this cycle observes only 08-14.
+                def limited(show_date):
+                    if show_date > dt.date(2026, 8, 14):
+                        raise FetchError("CGV 응답 오류: HTTP 429")
+                    return self._dated_payload(show_date)
+
+                watcher.cgv.fetch_date = limited
+                result = watcher.run_cycle()
+
+                self.assertGreater(result.rate_limited_requests, 0)
+                self.assertEqual(
+                    watcher.state.frontier_date, dt.date(2026, 8, 20)
+                )
+
+    def test_full_scan_mode_keeps_requesting_every_date(self):
+        today = dt.date(2026, 8, 13)
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(Config, "local_today", return_value=today):
+                watcher = self._cursor_watcher(
+                    temporary, "fullmode", scan_mode=SCAN_MODE_FULL
+                )
+                watcher.cgv.fetch_date = lambda show_date: (
+                    self._dated_payload(show_date)
+                    if show_date <= dt.date(2026, 8, 20)
+                    else {"data": []}
+                )
+
+                for _ in range(3):
+                    result = watcher.run_cycle()
+                    self.assertTrue(result.full_scan)
+                    self.assertEqual(result.requested_dates, 28)
+
+    def test_frontier_survives_a_restart_and_keeps_the_cursor_narrow(self):
+        today = dt.date(2026, 8, 13)
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(Config, "local_today", return_value=today):
+                watcher = self._cursor_watcher(temporary, "restart")
+                watcher.cgv.fetch_date = lambda show_date: (
+                    self._dated_payload(show_date)
+                    if show_date <= dt.date(2026, 8, 20)
+                    else {"data": []}
+                )
+                watcher.run_cycle()
+
+                # A fresh process reads the frontier back from the state file,
+                # so only the first cycle after a restart sweeps the window.
+                restarted = self._cursor_watcher(temporary, "restart-2")
+                restarted.cgv.fetch_date = watcher.cgv.fetch_date
+                restarted._cycle_index = 1
+
+                plan = restarted._plan_scan(today)
+                self.assertFalse(plan.full_scan)
+                self.assertEqual(len(plan.dates), 11)
 
     def test_fetch_error_alert_reaches_every_alert_mode(self):
         with tempfile.TemporaryDirectory() as temporary:

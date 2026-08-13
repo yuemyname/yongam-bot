@@ -37,7 +37,15 @@ DEFAULT_BOOKING_URL = "https://cgv.co.kr/cnm/movieBook/movie"
 DEFAULT_SEAT_PAGE_URL = "https://cgv.co.kr/cnm/selectVisitorCnt"
 DEFAULT_SITE_NAME = "용산아이파크몰"
 UNCLASSIFIED_ALERT_MIN_SEATS = 7
-STATE_VERSION = 5
+STATE_VERSION = 6
+
+# Scanning strategy.  "full" requests every date in the window each cycle.
+# "cursor" requests only the already-open range plus a short probe past the
+# frontier, which is where a new booking opening can first appear.
+SCAN_MODE_FULL = "full"
+SCAN_MODE_CURSOR = "cursor"
+SCAN_MODES = (SCAN_MODE_FULL, SCAN_MODE_CURSOR)
+DEFAULT_SCAN_MODE = SCAN_MODE_FULL
 
 # Alert categories a broadcast can belong to.  "system" messages (fetch error
 # notices) always reach every subscriber regardless of their preference.
@@ -163,6 +171,15 @@ def _parse_int(value: str, *, name: str, minimum: int, maximum: int) -> int:
     return parsed
 
 
+def _parse_scan_mode(value: str) -> str:
+    mode = str(value).strip().lower()
+    if mode not in SCAN_MODES:
+        raise ConfigurationError(
+            f"SCAN_MODE 값은 {' 또는 '.join(SCAN_MODES)} 여야 합니다."
+        )
+    return mode
+
+
 def _parse_date(value: str, *, name: str) -> dt.date:
     try:
         return dt.date.fromisoformat(value)
@@ -242,6 +259,10 @@ class Config:
     imax_code_values: tuple[str, ...]
     strict_imax_match: bool
     subscriptions_enabled: bool
+    scan_mode: str
+    cursor_probe_days: int
+    cursor_expansion_days: int
+    full_scan_every_cycles: int
     error_alert_cooldown_seconds: int
     state_file: Path
     log_file: Path
@@ -398,6 +419,25 @@ class Config:
             subscriptions_enabled=_parse_bool(
                 value("SUBSCRIPTIONS_ENABLED", "true"),
                 name="SUBSCRIPTIONS_ENABLED",
+            ),
+            scan_mode=_parse_scan_mode(value("SCAN_MODE", DEFAULT_SCAN_MODE)),
+            cursor_probe_days=_parse_int(
+                value("CURSOR_PROBE_DAYS", "3"),
+                name="CURSOR_PROBE_DAYS",
+                minimum=1,
+                maximum=28,
+            ),
+            cursor_expansion_days=_parse_int(
+                value("CURSOR_EXPANSION_DAYS", "21"),
+                name="CURSOR_EXPANSION_DAYS",
+                minimum=1,
+                maximum=60,
+            ),
+            full_scan_every_cycles=_parse_int(
+                value("FULL_SCAN_EVERY_CYCLES", "10"),
+                name="FULL_SCAN_EVERY_CYCLES",
+                minimum=1,
+                maximum=1440,
             ),
             error_alert_cooldown_seconds=_parse_int(
                 value("ERROR_ALERT_COOLDOWN_SECONDS", "21600"),
@@ -1097,6 +1137,7 @@ class StateStore:
             "subscribers": {},
             "subscribers_initialized": False,
             "telegram_update_offset": 0,
+            "frontier_date": "",
             "last_error_fingerprint": "",
             "last_error_notified_at": "",
         }
@@ -1123,6 +1164,7 @@ class StateStore:
             self.data.setdefault("subscribers", {})
             self.data.setdefault("subscribers_initialized", False)
             self.data.setdefault("telegram_update_offset", 0)
+            self.data.setdefault("frontier_date", "")
 
     def was_notified(self, key: str) -> bool:
         with self._lock:
@@ -1280,6 +1322,35 @@ class StateStore:
     def set_telegram_update_offset(self, offset: int) -> None:
         with self._lock:
             self.data["telegram_update_offset"] = max(0, int(offset))
+
+    @property
+    def frontier_date(self) -> dt.date | None:
+        """Latest show date an IMAX session was ever observed on."""
+
+        with self._lock:
+            raw = self.data.get("frontier_date", "")
+            if not isinstance(raw, str) or not raw:
+                return None
+            try:
+                return dt.date.fromisoformat(raw)
+            except ValueError:
+                return None
+
+    def advance_frontier(self, observed: dt.date) -> bool:
+        """Move the frontier forward only.
+
+        A cycle cut short by HTTP 429 sees fewer dates than it asked for, so
+        letting the frontier fall back to that partial maximum would make the
+        watcher re-probe ground it already covered — and, worse, treat already
+        known sessions as new.  Only advancing keeps a failed scan harmless.
+        """
+
+        with self._lock:
+            current = self.frontier_date
+            if current is not None and observed <= current:
+                return False
+            self.data["frontier_date"] = observed.isoformat()
+            return True
 
     def seat_snapshot(self, key: str) -> SeatSnapshot | None:
         with self._lock:
@@ -1551,6 +1622,27 @@ class CycleResult:
     rate_limited_requests: int = 0
     schedule_skipped_dates: int = 0
     seat_detail_skipped: int = 0
+    requested_dates: int = 0
+    full_scan: bool = True
+
+
+@dataclasses.dataclass(frozen=True)
+class ScanPlan:
+    """Which dates one cycle requests, and how far it may widen."""
+
+    dates: tuple[dt.date, ...]
+    full_scan: bool
+    # Last already-open date. Anything past it is probe territory: a session
+    # found there means a new booking opening.
+    open_end: dt.date | None = None
+    window_end: dt.date | None = None
+
+    def probe_hit(self, session_map: Mapping[tuple[str, str], BookingSession]) -> bool:
+        if self.open_end is None:
+            return False
+        return any(
+            date_text > self.open_end.isoformat() for date_text, _ in session_map
+        )
 
 
 class Watcher:
@@ -1572,11 +1664,118 @@ class Watcher:
         )
         self.state = StateStore(config.state_file)
         self._last_cgv_request_finished_at: float | None = None
+        # Cycle 0 always sweeps the full window; a cursor scan runs in between.
+        self._cycle_index = 0
         self.state.load()
         if not self.state.subscribers_initialized:
             self.state.initialize_subscribers(config.telegram_chat_id)
             if not self.dry_run:
                 self.state.save()
+
+    def _plan_scan(self, today: dt.date) -> ScanPlan:
+        """Choose the dates to request this cycle.
+
+        Full scans cover the whole window.  Cursor scans cover the open range
+        plus a short probe, which is contiguous because ``open_end`` is never
+        older than yesterday.
+        """
+
+        window = self.config.target_dates(today=today)
+        if not window or self.config.scan_mode == SCAN_MODE_FULL:
+            return ScanPlan(dates=tuple(window), full_scan=True)
+
+        frontier = self.state.frontier_date
+        # No frontier yet (first run, or a wiped volume) means there is nothing
+        # to probe past, so the window has to be swept once to establish one.
+        if frontier is None:
+            return ScanPlan(dates=tuple(window), full_scan=True)
+        if self._cycle_index % self.config.full_scan_every_cycles == 0:
+            return ScanPlan(dates=tuple(window), full_scan=True)
+
+        window_end = window[-1]
+        # Yesterday as the floor keeps the probe anchored to today once every
+        # observed show has played.
+        open_end = min(max(frontier, today - dt.timedelta(days=1)), window_end)
+        probe_end = min(
+            open_end + dt.timedelta(days=self.config.cursor_probe_days), window_end
+        )
+        return ScanPlan(
+            dates=tuple(date for date in window if date <= probe_end),
+            full_scan=False,
+            open_end=open_end,
+            window_end=window_end,
+        )
+
+    def _expansion_dates(self, plan: ScanPlan) -> list[dt.date]:
+        if plan.open_end is None or plan.window_end is None or not plan.dates:
+            return []
+        expansion_end = min(
+            plan.open_end + dt.timedelta(days=self.config.cursor_expansion_days),
+            plan.window_end,
+        )
+        start = plan.dates[-1] + dt.timedelta(days=1)
+        return [
+            start + dt.timedelta(days=offset)
+            for offset in range((expansion_end - start).days + 1)
+        ]
+
+    def _fetch_schedules(
+        self,
+        dates: Sequence[dt.date],
+        payloads: dict[dt.date, Any],
+        errors: dict[dt.date, str],
+    ) -> tuple[bool, int]:
+        """Request each date in order; returns (rate limited, dates skipped)."""
+
+        for index, show_date in enumerate(dates):
+            self._wait_for_cgv_request_slot()
+            try:
+                payloads[show_date] = self.cgv.fetch_date(show_date)
+            except FetchError as exc:
+                message = str(exc)
+                errors[show_date] = message
+                if "HTTP 429" in message:
+                    skipped = len(dates) - index - 1
+                    self.logger.warning(
+                        "CGV HTTP 429 감지: 남은 일정 조회 %d일을 즉시 생략합니다.",
+                        skipped,
+                    )
+                    return True, skipped
+            except Exception as exc:  # Keep a single malformed date from stopping the watcher.
+                errors[show_date] = f"예상하지 못한 조회 오류: {type(exc).__name__}"
+            finally:
+                self._mark_cgv_request_finished()
+        return False, 0
+
+    def _extract_sessions(
+        self, payloads: Mapping[dt.date, Any]
+    ) -> dict[tuple[str, str], BookingSession]:
+        session_map: dict[tuple[str, str], BookingSession] = {}
+        for show_date, payload in payloads.items():
+            for session in extract_sessions(
+                payload,
+                requested_date=show_date,
+                keywords=self.config.imax_keywords,
+                code_values=self.config.imax_code_values,
+                strict_imax_match=self.config.strict_imax_match,
+            ):
+                session_map[(session.date, session.start_time)] = session
+        return session_map
+
+    def _advance_frontier(
+        self, session_map: Mapping[tuple[str, str], BookingSession]
+    ) -> bool:
+        if not session_map:
+            return False
+        latest = max(date_text for date_text, _ in session_map)
+        try:
+            observed = dt.date.fromisoformat(latest)
+        except ValueError:
+            return False
+        if not self.state.advance_frontier(observed):
+            return False
+        self.logger.info("예매 오픈 관측 최대 상영일: %s", observed.isoformat())
+        return True
 
     def _wait_for_cgv_request_slot(self) -> None:
         """Keep CGV requests spaced apart instead of sending them in a burst."""
@@ -1868,49 +2067,54 @@ class Watcher:
             )
 
     def run_cycle(self) -> CycleResult:
-        dates = self.config.target_dates()
-        pruned_records = (
-            0 if self.dry_run else self.state.prune_expired(self.config.local_today())
-        )
+        today = self.config.local_today()
+        plan = self._plan_scan(today)
+        dates = list(plan.dates)
+        pruned_records = 0 if self.dry_run else self.state.prune_expired(today)
         if pruned_records:
             self.logger.info(
                 "지난 상영일 상태 기록 %d개를 정리했습니다.", pruned_records
             )
         payloads: dict[dt.date, Any] = {}
         errors: dict[dt.date, str] = {}
-        schedule_skipped_dates = 0
-        rate_limit_detected = False
 
-        for index, show_date in enumerate(dates):
-            self._wait_for_cgv_request_slot()
-            try:
-                payloads[show_date] = self.cgv.fetch_date(show_date)
-            except FetchError as exc:
-                message = str(exc)
-                errors[show_date] = message
-                if "HTTP 429" in message:
-                    rate_limit_detected = True
-                    schedule_skipped_dates = len(dates) - index - 1
-                    self.logger.warning(
-                        "CGV HTTP 429 감지: 남은 일정 조회 %d일을 즉시 생략합니다.",
-                        schedule_skipped_dates,
-                    )
-                    break
-            except Exception as exc:  # Keep a single malformed date from stopping the watcher.
-                errors[show_date] = f"예상하지 못한 조회 오류: {type(exc).__name__}"
-            finally:
-                self._mark_cgv_request_finished()
+        rate_limit_detected, schedule_skipped_dates = self._fetch_schedules(
+            dates, payloads, errors
+        )
+        session_map = self._extract_sessions(payloads)
 
-        session_map: dict[tuple[str, str], BookingSession] = {}
-        for show_date, payload in payloads.items():
-            for session in extract_sessions(
-                payload,
-                requested_date=show_date,
-                keywords=self.config.imax_keywords,
-                code_values=self.config.imax_code_values,
-                strict_imax_match=self.config.strict_imax_match,
-            ):
-                session_map[(session.date, session.start_time)] = session
+        # The probe found a session past the frontier, so a new booking opening
+        # started.  Widen the scan now to find where the newly opened range
+        # ends, instead of creeping forward a few days per cycle.
+        if (
+            not plan.full_scan
+            and not rate_limit_detected
+            and plan.probe_hit(session_map)
+        ):
+            expansion = self._expansion_dates(plan)
+            if expansion:
+                self.logger.info(
+                    "예매 오픈 감지: %s까지 확장 조회합니다(%d일).",
+                    expansion[-1].isoformat(),
+                    len(expansion),
+                )
+                expansion_limited, expansion_skipped = self._fetch_schedules(
+                    expansion, payloads, errors
+                )
+                rate_limit_detected = rate_limit_detected or expansion_limited
+                schedule_skipped_dates += expansion_skipped
+                dates.extend(expansion)
+                session_map = self._extract_sessions(payloads)
+
+        frontier_advanced = self._advance_frontier(session_map)
+        self._cycle_index += 1
+        self.logger.info(
+            "조회 범위: %s 모드, %d일 요청 (%s~%s)",
+            "전체" if plan.full_scan else "커서",
+            len(dates),
+            dates[0].isoformat() if dates else "-",
+            dates[-1].isoformat() if dates else "-",
+        )
 
         sessions = sorted(session_map.values())
         session_keys = {
@@ -2047,7 +2251,9 @@ class Watcher:
             and snapshots[session_keys[session]].alertable
         ]
 
-        state_changed = bool(pruned_records)
+        state_changed = bool(pruned_records) or (
+            frontier_advanced and not self.dry_run
+        )
         suppressed_sold_out = len(sold_out_new_sessions)
         deferred_seat_detail_keys = {
             session_keys[session] for session in deferred_new_sessions
@@ -2288,6 +2494,8 @@ class Watcher:
             rate_limited_requests=rate_limited_requests,
             schedule_skipped_dates=schedule_skipped_dates,
             seat_detail_skipped=seat_detail_skipped,
+            requested_dates=len(dates),
+            full_scan=plan.full_scan,
         )
 
 
