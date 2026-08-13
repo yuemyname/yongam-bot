@@ -1,5 +1,6 @@
 import datetime as dt
 import dataclasses
+import http.client
 import json
 import logging
 import os
@@ -322,6 +323,21 @@ class StateStoreTests(unittest.TestCase):
             parsed = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertEqual(parsed["notified"][key]["start_time"], "14:30")
 
+    def test_persists_failed_schedule_dates_until_they_succeed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "notified.json"
+            failed_date = dt.date(2026, 9, 1)
+            store = StateStore(state_path)
+
+            self.assertTrue(store.note_schedule_failure(failed_date))
+            store.save()
+
+            reloaded = StateStore(state_path)
+            reloaded.load()
+            self.assertEqual(reloaded.failed_schedule_dates(), (failed_date,))
+            self.assertTrue(reloaded.clear_schedule_failure(failed_date))
+            self.assertEqual(reloaded.failed_schedule_dates(), ())
+
     def test_migrates_v1_state_and_persists_seat_snapshot(self):
         with tempfile.TemporaryDirectory() as temporary:
             state_path = Path(temporary) / "notified.json"
@@ -542,6 +558,29 @@ class ScanPlanTests(unittest.TestCase):
             self.assertEqual(plan.dates[-1], dt.date(2026, 8, 20))
             self.assertEqual(len(plan.dates), 11)
 
+    def test_failed_date_outside_cursor_is_retried_after_the_probe(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._watcher(temporary)
+            watcher.state.advance_frontier(dt.date(2026, 8, 20))
+            watcher.state.note_schedule_failure(dt.date(2026, 9, 1))
+            watcher._cycle_index = 1
+
+            plan = watcher._plan_scan(self.TODAY)
+
+            self.assertEqual(
+                plan.dates[:4],
+                (
+                    dt.date(2026, 8, 21),
+                    dt.date(2026, 8, 22),
+                    dt.date(2026, 8, 23),
+                    dt.date(2026, 9, 1),
+                ),
+            )
+            # A far-away retry must not move the ordinary expansion start.
+            self.assertEqual(
+                watcher._expansion_dates(plan)[0], dt.date(2026, 8, 24)
+            )
+
     def test_probe_stays_anchored_to_today_when_the_frontier_has_passed(self):
         with tempfile.TemporaryDirectory() as temporary:
             watcher = self._watcher(temporary)
@@ -728,6 +767,31 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(result.rate_limited_requests, 1)
             self.assertEqual(result.schedule_skipped_dates, 2)
             self.assertEqual(attempted_dates, [dt.date(2026, 8, 26)])
+
+    def test_failed_schedule_date_is_saved_and_cleared_after_retry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            logger = logging.getLogger(f"watcher-schedule-retry-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            watcher.telegram.send_message = lambda *_args, **_kwargs: None
+            failed_date = dt.date(2026, 8, 26)
+
+            watcher.cgv.fetch_date = lambda _date: (_ for _ in ()).throw(
+                FetchError("일시적인 일정 오류")
+            )
+            first = watcher.run_cycle()
+
+            self.assertEqual(first.failed_dates, 1)
+            persisted = StateStore(config.state_file)
+            persisted.load()
+            self.assertEqual(persisted.failed_schedule_dates(), (failed_date,))
+
+            watcher.cgv.fetch_date = lambda _date: {"data": []}
+            second = watcher.run_cycle()
+
+            self.assertEqual(second.failed_dates, 0)
+            self.assertEqual(watcher.state.failed_schedule_dates(), ())
 
     def test_stops_remaining_seat_requests_after_first_rate_limit(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -935,6 +999,40 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(attempts.count("retry"), 2)
             self.assertEqual(successful, ["ok", "retry"])
             self.assertEqual(restarted.state.pending_deliveries(), ())
+
+    def test_broadcasts_to_multiple_subscribers_concurrently(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            logger = logging.getLogger(f"watcher-parallel-send-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            watcher.state.remove_subscriber(config.telegram_chat_id)
+            for chat_id in ("1", "2", "3", "4"):
+                watcher.state.add_subscriber(chat_id)
+
+            lock = threading.Lock()
+            release = threading.Event()
+            active = 0
+            max_active = 0
+
+            def blocked_send(_text, **_kwargs):
+                nonlocal active, max_active
+                with lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                    if active >= 2:
+                        release.set()
+                self.assertTrue(release.wait(timeout=1))
+                with lock:
+                    active -= 1
+
+            watcher.telegram.send_message = blocked_send
+            delivered, failed, total = watcher._broadcast_message(
+                "test", category=ALERT_OPEN
+            )
+
+            self.assertGreaterEqual(max_active, 2)
+            self.assertEqual((delivered, failed, total), (4, 0, 4))
 
     def test_partial_seat_delivery_retries_without_repeating_for_others(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1597,6 +1695,83 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(len(sent), 2)
             self.assertIn("예매 오픈 감지", sent[0])
             self.assertIn("잔여 좌석 변경", sent[1])
+
+    def test_all_dates_are_checked_before_existing_seat_details(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = dataclasses.replace(
+                make_config(Path(temporary)),
+                target_start=dt.date(2026, 8, 26),
+                target_end=dt.date(2026, 8, 27),
+                scan_mode=SCAN_MODE_FULL,
+            )
+            logger = logging.getLogger(f"watcher-discovery-first-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            existing = BookingSession(
+                date="2026-08-26",
+                start_time="10:00",
+                screen_name="IMAX관",
+                screen_no="13",
+                screen_sequence="1",
+                remaining_seats=101,
+                total_seats=624,
+            )
+            existing_key = existing.notification_key(
+                site_no=config.site_no, movie_no=config.movie_no
+            )
+            watcher.state.mark_notified(existing_key, existing)
+            watcher.state.set_seat_snapshot(
+                existing_key,
+                SeatSnapshot(
+                    total=101,
+                    general=101,
+                    accessible=0,
+                    mapped_total=101,
+                    available_rows=("B",),
+                ),
+            )
+
+            events = []
+
+            def fetch_date(show_date):
+                events.append(f"schedule:{show_date.isoformat()}")
+                if show_date == dt.date(2026, 8, 26):
+                    return {
+                        "data": [
+                            {
+                                "scnsNm": "IMAX관",
+                                "scnYmd": "20260826",
+                                "scnsrtTm": "1000",
+                                "scnsNo": "13",
+                                "scnSseq": "1",
+                                "frSeatCnt": 100,
+                                "stcnt": 624,
+                            }
+                        ]
+                    }
+                return {"data": []}
+
+            watcher.cgv.fetch_date = fetch_date
+
+            def fetch_seats(session):
+                events.append(f"seats:{session.date}")
+                return SeatSnapshot(
+                    total=100,
+                    general=100,
+                    accessible=0,
+                    mapped_total=100,
+                    available_rows=("B",),
+                )
+
+            watcher.cgv.fetch_seat_snapshot = fetch_seats
+            watcher._broadcast_message = lambda *_args, **_kwargs: (1, 0, 1)
+
+            watcher.run_cycle()
+
+            self.assertLess(
+                events.index("schedule:2026-08-27"),
+                events.index("seats:2026-08-26"),
+            )
 
     def test_state_is_saved_as_each_date_finishes(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2578,31 +2753,112 @@ class WatcherIntegrationTests(unittest.TestCase):
 
 
 class CgvClientTests(unittest.TestCase):
-    def test_anonymous_request_has_expected_query_and_no_login_headers(self):
+    def test_reuses_one_https_connection_for_multiple_cgv_requests(self):
         class FakeResponse:
             status = 200
-            headers = {"Content-Type": "application/json"}
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, _exc_type, _exc, _traceback):
-                return False
 
             def read(self, _limit):
                 return b'{"data": []}'
 
+            def getheader(self, name, default=""):
+                return "application/json" if name == "Content-Type" else default
+
+        class FakeConnection:
+            def __init__(self):
+                self.requests = 0
+
+            def request(self, _method, _target, *, headers):
+                self.requests += 1
+                self.assert_no_login(headers)
+
+            @staticmethod
+            def assert_no_login(headers):
+                lowered = {key.lower() for key in headers}
+                if "authorization" in lowered or "cookie" in lowered:
+                    raise AssertionError("login headers must not be sent")
+
+            def getresponse(self):
+                return FakeResponse()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            client = CgvClient(make_config(Path(temporary)))
+            connection = FakeConnection()
+            with patch(
+                "watcher.http.client.HTTPSConnection", return_value=connection
+            ) as created:
+                client.fetch_date(dt.date(2026, 8, 26))
+                client.fetch_date(dt.date(2026, 8, 27))
+
+            self.assertEqual(created.call_count, 1)
+            self.assertEqual(connection.requests, 2)
+
+    def test_reconnects_once_when_a_pooled_connection_was_closed(self):
+        class FakeResponse:
+            status = 200
+
+            def read(self, _limit):
+                return b'{"data": []}'
+
+            def getheader(self, name, default=""):
+                return "application/json" if name == "Content-Type" else default
+
+        class ClosedConnection:
+            def request(self, *_args, **_kwargs):
+                raise http.client.RemoteDisconnected("closed")
+
+            def close(self):
+                return None
+
+        class HealthyConnection:
+            def request(self, *_args, **_kwargs):
+                return None
+
+            def getresponse(self):
+                return FakeResponse()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            client = CgvClient(make_config(Path(temporary)))
+            with patch(
+                "watcher.http.client.HTTPSConnection",
+                side_effect=[ClosedConnection(), HealthyConnection()],
+            ) as created:
+                payload = client.fetch_date(dt.date(2026, 8, 26))
+
+            self.assertEqual(payload, {"data": []})
+            self.assertEqual(created.call_count, 2)
+
+    def test_anonymous_request_has_expected_query_and_no_login_headers(self):
+        class FakeResponse:
+            status = 200
+
+            def read(self, _limit):
+                return b'{"data": []}'
+
+            def getheader(self, name, default=""):
+                return "application/json" if name == "Content-Type" else default
+
+        class FakeConnection:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, method, target, *, headers):
+                self.calls.append((method, target, headers))
+
+            def getresponse(self):
+                return FakeResponse()
+
         with tempfile.TemporaryDirectory() as temporary:
             config = make_config(Path(temporary))
             client = CgvClient(config)
-            with patch("watcher.urllib.request.urlopen", return_value=FakeResponse()) as opened:
+            connection = FakeConnection()
+            with patch.object(client, "_connection_for", return_value=connection):
                 payload = client.fetch_date(dt.date(2026, 8, 26))
 
-            request = opened.call_args.args[0]
-            headers = {key.lower(): value for key, value in request.header_items()}
+            _method, target, request_headers = connection.calls[0]
+            headers = {key.lower(): value for key, value in request_headers.items()}
             query = dict(
                 urllib.parse.parse_qsl(
-                    urllib.parse.urlsplit(request.full_url).query,
+                    urllib.parse.urlsplit(target).query,
                     keep_blank_values=True,
                 )
             )
@@ -2616,16 +2872,22 @@ class CgvClientTests(unittest.TestCase):
     def test_seat_request_is_anonymous_and_uses_schedule_identifiers(self):
         class FakeResponse:
             status = 200
-            headers = {"Content-Type": "application/json"}
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, _exc_type, _exc, _traceback):
-                return False
 
             def read(self, _limit):
                 return b'{"data": {"items": []}}'
+
+            def getheader(self, name, default=""):
+                return "application/json" if name == "Content-Type" else default
+
+        class FakeConnection:
+            def __init__(self):
+                self.calls = []
+
+            def request(self, method, target, *, headers):
+                self.calls.append((method, target, headers))
+
+            def getresponse(self):
+                return FakeResponse()
 
         with tempfile.TemporaryDirectory() as temporary:
             config = make_config(Path(temporary))
@@ -2637,14 +2899,15 @@ class CgvClientTests(unittest.TestCase):
                 screen_sequence="4",
                 remaining_seats=182,
             )
-            with patch("watcher.urllib.request.urlopen", return_value=FakeResponse()) as opened:
+            connection = FakeConnection()
+            with patch.object(client, "_connection_for", return_value=connection):
                 snapshot = client.fetch_seat_snapshot(session)
 
-            request = opened.call_args.args[0]
-            headers = {key.lower(): value for key, value in request.header_items()}
+            _method, target, request_headers = connection.calls[0]
+            headers = {key.lower(): value for key, value in request_headers.items()}
             query = dict(
                 urllib.parse.parse_qsl(
-                    urllib.parse.urlsplit(request.full_url).query,
+                    urllib.parse.urlsplit(target).query,
                     keep_blank_values=True,
                 )
             )

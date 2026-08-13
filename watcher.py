@@ -8,10 +8,12 @@ credentials are neither accepted nor sent.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import dataclasses
 import datetime as dt
 import getpass
 import hashlib
+import http.client
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -37,7 +39,8 @@ DEFAULT_BOOKING_URL = "https://cgv.co.kr/cnm/movieBook/movie"
 DEFAULT_SEAT_PAGE_URL = "https://cgv.co.kr/cnm/selectVisitorCnt"
 DEFAULT_SITE_NAME = "용산아이파크몰"
 UNCLASSIFIED_ALERT_MIN_SEATS = 7
-STATE_VERSION = 7
+STATE_VERSION = 8
+TELEGRAM_BROADCAST_WORKERS = 4
 
 # Scanning strategy.  "full" requests every date in the window each cycle.
 # "cursor" requests only the already-open range plus a short probe past the
@@ -956,47 +959,115 @@ class CgvClient:
     def __init__(self, config: Config):
         self.config = config
         self.ssl_context = ssl.create_default_context()
+        self._connections: dict[
+            tuple[str, str, int | None], http.client.HTTPConnection
+        ] = {}
 
-    def _get_json(self, url: str, *, referer: str) -> Any:
-        request = urllib.request.Request(
-            url,
-            method="GET",
-            headers={
-                "Accept": "application/json",
-                "Accept-Language": "ko-KR",
-                "Cache-Control": "no-cache",
-                "Pragma": "no-cache",
-                "Referer": referer,
-                "User-Agent": USER_AGENT,
-            },
-        )
+    def _connection_key(self, url: str) -> tuple[str, str, int | None]:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise FetchError("CGV API 주소 형식이 올바르지 않습니다.")
+        return parsed.scheme, parsed.hostname, parsed.port
 
-        try:
-            with urllib.request.urlopen(
-                request,
+    def _connection_for(self, url: str) -> http.client.HTTPConnection:
+        key = self._connection_key(url)
+        connection = self._connections.get(key)
+        if connection is not None:
+            return connection
+        scheme, hostname, port = key
+        if scheme == "https":
+            connection = http.client.HTTPSConnection(
+                hostname,
+                port=port,
                 timeout=self.config.request_timeout_seconds,
                 context=self.ssl_context,
-            ) as response:
-                status = getattr(response, "status", 200)
-                body = response.read(5_000_000)
-                content_type = response.headers.get("Content-Type", "")
-        except urllib.error.HTTPError as exc:
-            body = exc.read(30_000).decode("utf-8", errors="replace")
-            if exc.code == 403 and (
-                "비정상적으로 CGV에 접속" in body
-                or "cloudflare" in body.lower()
+            )
+        else:
+            connection = http.client.HTTPConnection(
+                hostname,
+                port=port,
+                timeout=self.config.request_timeout_seconds,
+            )
+        self._connections[key] = connection
+        return connection
+
+    def _drop_connection(self, url: str) -> None:
+        connection = self._connections.pop(self._connection_key(url), None)
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError:
+                pass
+
+    def _request(
+        self, url: str, *, headers: Mapping[str, str]
+    ) -> tuple[int, bytes, str, str]:
+        parsed = urllib.parse.urlsplit(url)
+        target = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+        last_error: Exception | None = None
+        for attempt in range(2):
+            connection = self._connection_for(url)
+            try:
+                connection.request("GET", target, headers=dict(headers))
+                response = connection.getresponse()
+                body = response.read(5_000_001)
+                status = response.status
+                content_type = response.getheader("Content-Type", "")
+                location = response.getheader("Location", "")
+                if response.getheader("Connection", "").lower() == "close":
+                    self._drop_connection(url)
+                return status, body, content_type, location
+            except (http.client.HTTPException, TimeoutError, OSError) as exc:
+                last_error = exc
+                self._drop_connection(url)
+                if attempt == 0:
+                    continue
+        assert last_error is not None
+        raise last_error
+
+    def _get_json(self, url: str, *, referer: str) -> Any:
+        headers = {
+            "Accept": "application/json",
+            "Accept-Language": "ko-KR",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Referer": referer,
+            "User-Agent": USER_AGENT,
+        }
+
+        current_url = url
+        try:
+            for redirect_count in range(4):
+                status, body, content_type, location = self._request(
+                    current_url, headers=headers
+                )
+                if status not in {301, 302, 303, 307, 308}:
+                    break
+                if redirect_count == 3 or not location:
+                    raise FetchError("CGV API 주소 전환이 너무 많습니다.")
+                current_url = urllib.parse.urljoin(current_url, location)
+            else:  # pragma: no cover - the redirect guard above always exits.
+                raise FetchError("CGV API 주소 전환에 실패했습니다.")
+        except FetchError:
+            raise
+        except (http.client.HTTPException, TimeoutError, OSError) as exc:
+            reason_text = str(exc)
+            reason_text = re.sub(r"https?://\S+", "CGV 주소", reason_text)
+            raise FetchError(f"CGV 연결 실패: {reason_text[:180]}") from exc
+
+        if len(body) > 5_000_000:
+            self._drop_connection(current_url)
+            raise FetchError("CGV 응답 크기가 안전 제한을 초과했습니다.")
+        if status == 403:
+            error_body = body[:30_000].decode("utf-8", errors="replace")
+            if (
+                "비정상적으로 CGV에 접속" in error_body
+                or "cloudflare" in error_body.lower()
             ):
                 raise FetchError(
                     "CGV가 자동 조회를 차단했습니다(HTTP 403). "
                     "잠시 후 다시 시도하거나 네트워크를 바꿔 보세요."
-                ) from exc
-            raise FetchError(f"CGV 응답 오류: HTTP {exc.code}") from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            reason = getattr(exc, "reason", None)
-            reason_text = str(reason or exc)
-            reason_text = re.sub(r"https?://\S+", "CGV 주소", reason_text)
-            raise FetchError(f"CGV 연결 실패: {reason_text[:180]}") from exc
-
+                )
         if status != 200:
             raise FetchError(f"CGV 응답 오류: HTTP {status}")
         if "json" not in content_type.lower() and body.lstrip().startswith(b"<"):
@@ -1180,6 +1251,7 @@ class StateStore:
             "subscribers_initialized": False,
             "telegram_update_offset": 0,
             "frontier_date": "",
+            "failed_schedule_dates": {},
             "deferred": {},
             "pending_deliveries": {},
             "last_error_fingerprint": "",
@@ -1204,6 +1276,8 @@ class StateStore:
                 raise RuntimeError(f"구독자 상태 파일 형식이 올바르지 않습니다: {self.path}")
             if not isinstance(loaded.get("deferred", {}), dict):
                 raise RuntimeError(f"보류 상태 파일 형식이 올바르지 않습니다: {self.path}")
+            if not isinstance(loaded.get("failed_schedule_dates", {}), dict):
+                raise RuntimeError(f"일정 재조회 상태 파일 형식이 올바르지 않습니다: {self.path}")
             if not isinstance(loaded.get("pending_deliveries", {}), dict):
                 raise RuntimeError(f"재전송 상태 파일 형식이 올바르지 않습니다: {self.path}")
             self.data.update(loaded)
@@ -1213,6 +1287,7 @@ class StateStore:
             self.data.setdefault("subscribers_initialized", False)
             self.data.setdefault("telegram_update_offset", 0)
             self.data.setdefault("frontier_date", "")
+            self.data.setdefault("failed_schedule_dates", {})
             self.data.setdefault("deferred", {})
             self.data.setdefault("pending_deliveries", {})
 
@@ -1242,7 +1317,12 @@ class StateStore:
         cutoff = today - dt.timedelta(days=STATE_RETENTION_DAYS)
         removed = 0
         with self._lock:
-            for bucket in ("notified", "seat_counts", "deferred"):
+            for bucket in (
+                "notified",
+                "seat_counts",
+                "deferred",
+                "failed_schedule_dates",
+            ):
                 records = self.data.get(bucket)
                 if not isinstance(records, dict):
                     continue
@@ -1383,6 +1463,36 @@ class StateStore:
                 "queued_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             }
             return True
+
+    def note_schedule_failure(self, show_date: dt.date) -> bool:
+        """Persist a failed or skipped date so the next cycle prioritizes it."""
+
+        date_text = show_date.isoformat()
+        with self._lock:
+            bucket = self.data.setdefault("failed_schedule_dates", {})
+            if date_text in bucket:
+                return False
+            bucket[date_text] = {
+                "date": date_text,
+                "failed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            }
+            return True
+
+    def clear_schedule_failure(self, show_date: dt.date) -> bool:
+        with self._lock:
+            bucket = self.data.setdefault("failed_schedule_dates", {})
+            return bucket.pop(show_date.isoformat(), None) is not None
+
+    def failed_schedule_dates(self) -> tuple[dt.date, ...]:
+        with self._lock:
+            bucket = self.data.setdefault("failed_schedule_dates", {})
+            dates: list[dt.date] = []
+            for date_text in bucket:
+                try:
+                    dates.append(dt.date.fromisoformat(str(date_text)))
+                except ValueError:
+                    continue
+            return tuple(sorted(dates))
 
     def pending_deliveries(self) -> tuple[tuple[str, dict[str, str]], ...]:
         """Return a stable copy so Telegram calls happen outside the state lock."""
@@ -1801,6 +1911,7 @@ class ScanPlan:
     # found there means a new booking opening.
     open_end: dt.date | None = None
     window_end: dt.date | None = None
+    probe_end: dt.date | None = None
 
     def probe_hit(self, latest_session_date: str) -> bool:
         if self.open_end is None or not latest_session_date:
@@ -1877,11 +1988,26 @@ class Watcher:
         if not window:
             return ScanPlan(dates=tuple(window), full_scan=True)
 
+        retry_set = set(self.state.failed_schedule_dates())
+        retry_dates = [date for date in window if date in retry_set]
+
+        def ordered_unique(*groups: Sequence[dt.date]) -> tuple[dt.date, ...]:
+            seen: set[dt.date] = set()
+            ordered: list[dt.date] = []
+            for group in groups:
+                for date in group:
+                    if date not in seen:
+                        seen.add(date)
+                        ordered.append(date)
+            return tuple(ordered)
+
         frontier = self.state.frontier_date
         # No frontier yet (first run, or a wiped volume) means there is nothing
         # to probe past, so the window has to be swept once to establish one.
         if frontier is None:
-            return ScanPlan(dates=tuple(window), full_scan=True)
+            return ScanPlan(
+                dates=ordered_unique(retry_dates, window), full_scan=True
+            )
 
         window_end = window[-1]
         # Yesterday as the floor keeps the probe anchored to today once every
@@ -1899,14 +2025,18 @@ class Watcher:
         )
         if full_scan:
             return ScanPlan(
-                dates=tuple(probe_dates + remaining_dates + open_dates),
+                dates=ordered_unique(
+                    probe_dates, retry_dates, remaining_dates, open_dates
+                ),
                 full_scan=True,
+                probe_end=probe_end,
             )
         return ScanPlan(
-            dates=tuple(probe_dates + open_dates),
+            dates=ordered_unique(probe_dates, retry_dates, open_dates),
             full_scan=False,
             open_end=open_end,
             window_end=window_end,
+            probe_end=probe_end,
         )
 
     def _expansion_dates(self, plan: ScanPlan) -> list[dt.date]:
@@ -1916,7 +2046,7 @@ class Watcher:
             plan.open_end + dt.timedelta(days=self.config.cursor_expansion_days),
             plan.window_end,
         )
-        start = max(plan.dates) + dt.timedelta(days=1)
+        start = (plan.probe_end or max(plan.dates)) + dt.timedelta(days=1)
         return [
             start + dt.timedelta(days=offset)
             for offset in range((expansion_end - start).days + 1)
@@ -2030,14 +2160,28 @@ class Watcher:
         subscriber_ids = self.state.subscriber_ids_for(category)
         delivered = 0
         failed = 0
-        for chat_id in subscriber_ids:
+
+        def send(chat_id: str) -> tuple[str, TelegramError | None]:
             try:
                 self.telegram.send_message(text, chat_id=chat_id)
             except TelegramError as exc:
+                return chat_id, exc
+            return chat_id, None
+
+        results: list[tuple[str, TelegramError | None]] = []
+        if subscriber_ids:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(TELEGRAM_BROADCAST_WORKERS, len(subscriber_ids)),
+                thread_name_prefix="telegram-broadcast",
+            ) as executor:
+                results = list(executor.map(send, subscriber_ids))
+
+        for chat_id, error in results:
+            if error is not None:
                 failed += 1
                 self.state.queue_pending_delivery(chat_id, text, category)
                 self.logger.error(
-                    "구독자 Telegram 전송 실패(다음 주기 재시도): %s", exc
+                    "구독자 Telegram 전송 실패(다음 주기 재시도): %s", error
                 )
             else:
                 delivered += 1
@@ -2052,23 +2196,51 @@ class Watcher:
                 )
         return delivered, failed, len(subscriber_ids)
 
-    def _retry_pending_deliveries(self) -> None:
+    def _retry_pending_deliveries(
+        self,
+        pending: Sequence[tuple[str, Mapping[str, str]]] | None = None,
+    ) -> None:
         """Retry only recipients who missed an earlier broadcast."""
 
         if self.dry_run:
             return
         changed = False
-        for key, record in self.state.pending_deliveries():
+        eligible_records: list[tuple[str, Mapping[str, str]]] = []
+        for key, record in (
+            self.state.pending_deliveries() if pending is None else pending
+        ):
             chat_id = record["chat_id"]
             category = record["category"]
             eligible = set(self.state.subscriber_ids_for(category))
             if chat_id not in eligible:
                 changed = self.state.remove_pending_delivery(key) or changed
                 continue
+            eligible_records.append((key, record))
+
+        def resend(
+            item: tuple[str, Mapping[str, str]],
+        ) -> tuple[str, str, TelegramError | None]:
+            key, record = item
+            chat_id = record["chat_id"]
             try:
                 self.telegram.send_message(record["text"], chat_id=chat_id)
             except TelegramError as exc:
-                self.logger.warning("Telegram 알림 재전송 실패: %s", exc)
+                return key, chat_id, exc
+            return key, chat_id, None
+
+        results: list[tuple[str, str, TelegramError | None]] = []
+        if eligible_records:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(
+                    TELEGRAM_BROADCAST_WORKERS, len(eligible_records)
+                ),
+                thread_name_prefix="telegram-retry",
+            ) as executor:
+                results = list(executor.map(resend, eligible_records))
+
+        for key, chat_id, error in results:
+            if error is not None:
+                self.logger.warning("Telegram 알림 재전송 실패: %s", error)
                 continue
             changed = self.state.remove_pending_delivery(key) or changed
             self.logger.info("Telegram 미수신 알림 재전송 성공: chat_id=%s", chat_id)
@@ -2422,17 +2594,26 @@ class Watcher:
         errors: dict[dt.date, str],
         tally: "_CycleTally",
     ) -> None:
-        """Fetch each date and alert on it before moving to the next.
+        """Sweep schedules first while alerting newly opened sessions immediately.
 
-        Alerting per date rather than after the whole sweep is what keeps the
-        delay between reading a seat count and sending it near zero.  Probe
-        dates just beyond the booking frontier are requested first so a newly
-        opened session wins over ordinary seat-count changes.
+        Probe dates just beyond the booking frontier are requested first. New
+        sessions are classified and announced as soon as their date is read;
+        existing sessions' cancellation-ticket details wait until every date
+        in this batch has been checked so they cannot delay open discovery.
         """
 
+        existing_batches: list[list[BookingSession]] = []
         for index, show_date in enumerate(dates):
             if tally.rate_limited:
-                tally.schedule_skipped_dates += len(dates) - index
+                skipped_dates = dates[index:]
+                tally.schedule_skipped_dates += len(skipped_dates)
+                if not self.dry_run:
+                    for skipped_date in skipped_dates:
+                        tally.dirty = (
+                            self.state.note_schedule_failure(skipped_date)
+                            or tally.dirty
+                        )
+                    self._flush_state(tally)
                 break
 
             payload = None
@@ -2442,6 +2623,10 @@ class Watcher:
             except FetchError as exc:
                 message = str(exc)
                 errors[show_date] = message
+                if not self.dry_run:
+                    tally.dirty = (
+                        self.state.note_schedule_failure(show_date) or tally.dirty
+                    )
                 if "HTTP 429" in message:
                     # The guard at the top of the next iteration is what counts
                     # the skipped dates; adding them here too would double them.
@@ -2453,11 +2638,18 @@ class Watcher:
                     )
             except Exception as exc:  # Keep a single malformed date from stopping the watcher.
                 errors[show_date] = f"예상하지 못한 조회 오류: {type(exc).__name__}"
+                if not self.dry_run:
+                    tally.dirty = (
+                        self.state.note_schedule_failure(show_date) or tally.dirty
+                    )
             finally:
                 self._mark_cgv_request_finished()
 
             if payload is None:
+                self._flush_state(tally)
                 continue
+            if not self.dry_run and self.state.clear_schedule_failure(show_date):
+                tally.dirty = True
             tally.successful_dates += 1
 
             session_map = self._extract_sessions({show_date: payload})
@@ -2507,7 +2699,19 @@ class Watcher:
                     # tickets, both for priority and crash-safe de-duplication.
                     self._flush_state(tally)
                 if existing_sessions:
-                    self._alert_for_sessions(existing_sessions, tally)
+                    # Existing seat changes are secondary to discovering a new
+                    # showing on every remaining date. Process them only after
+                    # the schedule sweep has finished.
+                    existing_batches.append(existing_sessions)
+            self._flush_state(tally)
+
+        # A schedule-side 429 means CGV asked us to stop. Keep every saved seat
+        # snapshot unchanged so the next cycle sees the same changes and tries
+        # them again instead of spending more requests during the cooldown.
+        if tally.rate_limited:
+            return
+        for existing_sessions in existing_batches:
+            self._alert_for_sessions(existing_sessions, tally)
             self._flush_state(tally)
 
     def _alert_for_sessions(
@@ -2856,7 +3060,9 @@ class Watcher:
         self._record_verdicts(tally, sessions, verdicts, session_keys, snapshots)
 
     def run_cycle(self) -> CycleResult:
-        self._retry_pending_deliveries()
+        # Snapshot before sending anything this cycle. A fresh failure should
+        # wait until the next cycle instead of being retried immediately.
+        pending_retries = self.state.pending_deliveries()
         today = self.config.local_today()
         plan = self._plan_scan(today)
         dates = list(plan.dates)
@@ -2884,7 +3090,12 @@ class Watcher:
             # Expand immediately after a probe hit, before spending any time on
             # cancellation-ticket changes in the already-open range.
             if not tally.rate_limited and plan.probe_hit(tally.latest_session_date):
-                expansion = self._expansion_dates(plan)
+                already_requested = set(probe_dates)
+                expansion = [
+                    date
+                    for date in self._expansion_dates(plan)
+                    if date not in already_requested
+                ]
                 if expansion:
                     self.logger.info(
                         "예매 오픈 감지: %s까지 확장 조회합니다(%d일).",
@@ -2959,6 +3170,9 @@ class Watcher:
             tally.dirty = True
 
         self._flush_state(tally)
+        # Old Telegram failures must never hold up this cycle's highest-priority
+        # work: discovering and announcing a newly opened showing.
+        self._retry_pending_deliveries(pending_retries)
 
         if tally.verdicts:
             self.logger.debug(
