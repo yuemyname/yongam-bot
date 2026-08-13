@@ -33,6 +33,7 @@ from watcher import (
     TimezoneFormatter,
     Watcher,
     booking_url_for_session,
+    _seat_snapshot_changed,
     extract_seat_snapshot,
     extract_sessions,
     rate_limit_backoff_seconds,
@@ -171,8 +172,7 @@ class SeatSnapshotTests(unittest.TestCase):
     def test_alertable_requires_matching_counts_and_complete_row_labels(self):
         complete = SeatSnapshot(
             total=2,
-            general=2,
-            accessible=0,
+            usable=2,
             mapped_total=2,
             available_rows=("B",),
         )
@@ -191,7 +191,7 @@ class SeatSnapshotTests(unittest.TestCase):
         self.assertTrue(unclassified_seven.uses_unclassified_fallback)
         self.assertFalse(sold_out.alertable)
 
-    def test_counts_available_general_and_accessible_seats(self):
+    def test_counts_saleable_non_a_seats_without_using_sale_form_code(self):
         payload = {
             "data": {
                 "items": [
@@ -199,18 +199,21 @@ class SeatSnapshotTests(unittest.TestCase):
                         "seats": [
                             {
                                 "seatLocNo": "1",
+                                "seatRowNm": "B",
                                 "seatStusCd": "00",
                                 "seatSaleYn": "Y",
                                 "seatSalfrmCd": "01",
                             },
                             {
                                 "seatLocNo": "2",
+                                "seatRowNm": "A",
                                 "seatStusCd": "00",
                                 "seatSaleYn": "Y",
                                 "seatSalfrmCd": "04",
                             },
                             {
                                 "seatLocNo": "3",
+                                "seatRowNm": "C",
                                 "seatStusCd": "02",
                                 "seatSaleYn": "Y",
                                 "seatSalfrmCd": "01",
@@ -221,14 +224,16 @@ class SeatSnapshotTests(unittest.TestCase):
             }
         }
         snapshot = extract_seat_snapshot(payload, scheduled_remaining=2)
-        self.assertEqual(snapshot.general, 1)
-        self.assertEqual(snapshot.accessible, 1)
-        self.assertFalse(snapshot.accessible_only)
+        self.assertEqual(snapshot.usable, 1)
+        self.assertEqual(snapshot.mapped_total, 2)
+        self.assertEqual(snapshot.available_rows, ("A", "B"))
+        self.assertFalse(snapshot.row_a_only)
 
-    def test_accessible_only_requires_map_total_to_match_schedule(self):
+    def test_row_a_only_ignores_sale_form_code(self):
         seats = [
             {
                 "seatLocNo": "W1",
+                "seatRowNm": "A",
                 "seatStusCd": "00",
                 "seatSaleYn": "Y",
                 "seatSalfrmCd": "04",
@@ -240,8 +245,8 @@ class SeatSnapshotTests(unittest.TestCase):
         partial = extract_seat_snapshot(
             {"data": {"items": [{"seats": seats}]}}, scheduled_remaining=2
         )
-        self.assertTrue(matching.accessible_only)
-        self.assertFalse(partial.accessible_only)
+        self.assertTrue(matching.row_a_only)
+        self.assertFalse(partial.row_a_only)
 
     def test_row_a_only_requires_complete_matching_map(self):
         def seat(number, row):
@@ -276,7 +281,7 @@ class SeatSnapshotTests(unittest.TestCase):
         self.assertFalse(missing_row.row_a_only)
         self.assertFalse(count_mismatch.row_a_only)
 
-    def test_row_a_only_ignores_accessible_seats_in_other_rows(self):
+    def test_sale_form_code_does_not_override_the_actual_row(self):
         payload = {
             "data": {
                 "seats": [
@@ -300,11 +305,10 @@ class SeatSnapshotTests(unittest.TestCase):
 
         snapshot = extract_seat_snapshot(payload, scheduled_remaining=2)
 
-        self.assertEqual(snapshot.general, 1)
-        self.assertEqual(snapshot.accessible, 1)
-        self.assertEqual(snapshot.available_rows, ("A",))
-        self.assertTrue(snapshot.row_a_only)
-        self.assertTrue(snapshot.should_suppress)
+        self.assertEqual(snapshot.usable, 1)
+        self.assertEqual(snapshot.available_rows, ("A", "B"))
+        self.assertFalse(snapshot.row_a_only)
+        self.assertFalse(snapshot.should_suppress)
 
 
 class StateStoreTests(unittest.TestCase):
@@ -350,8 +354,7 @@ class StateStoreTests(unittest.TestCase):
                 "session",
                 SeatSnapshot(
                     total=5,
-                    general=3,
-                    accessible=2,
+                    usable=3,
                     mapped_total=5,
                     available_rows=("A", "B"),
                 ),
@@ -361,10 +364,56 @@ class StateStoreTests(unittest.TestCase):
             reloaded = StateStore(state_path)
             reloaded.load()
             self.assertEqual(reloaded.data["version"], STATE_VERSION)
-            self.assertEqual(reloaded.seat_snapshot("session").general, 3)
+            self.assertEqual(reloaded.seat_snapshot("session").usable, 3)
             self.assertEqual(
                 reloaded.seat_snapshot("session").available_rows, ("A", "B")
             )
+            record = json.loads(state_path.read_text(encoding="utf-8"))["seat_counts"][
+                "session"
+            ]
+            self.assertEqual(record["usable"], 3)
+            self.assertNotIn("general", record)
+            self.assertNotIn("accessible", record)
+
+    def test_old_seat_breakdown_loads_without_guessing_usable_count(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "notified.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "version": 8,
+                        "notified": {},
+                        "seat_counts": {
+                            "session": {
+                                "total": 5,
+                                "general": 3,
+                                "accessible": 2,
+                                "mapped_total": 5,
+                                "available_rows": ["A", "B"],
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            store = StateStore(state_path)
+            store.load()
+
+            snapshot = store.seat_snapshot("session")
+            self.assertEqual(snapshot.total, 5)
+            self.assertIsNone(snapshot.usable)
+            self.assertFalse(snapshot.seat_map_complete)
+
+    def test_change_detection_compares_non_a_usable_count(self):
+        previous = SeatSnapshot(
+            total=5, usable=2, mapped_total=5, available_rows=("A", "B")
+        )
+        same = dataclasses.replace(previous)
+        changed = dataclasses.replace(previous, usable=3)
+
+        self.assertFalse(_seat_snapshot_changed(previous, same))
+        self.assertTrue(_seat_snapshot_changed(previous, changed))
 
 class StatePruningTests(unittest.TestCase):
     @staticmethod
@@ -925,8 +974,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             )
             watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
                 total=session.remaining_seats,
-                general=session.remaining_seats - 2,
-                accessible=2,
+                usable=session.remaining_seats - 2,
                 mapped_total=session.remaining_seats,
                 available_rows=("B",),
             )
@@ -959,8 +1007,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             watcher.cgv.fetch_date = lambda _date: self._schedule_payload(10)
             watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
                 total=session.remaining_seats,
-                general=session.remaining_seats,
-                accessible=0,
+                usable=session.remaining_seats,
                 mapped_total=session.remaining_seats,
                 available_rows=("B",),
             )
@@ -1050,8 +1097,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             )
             watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
                 total=session.remaining_seats,
-                general=session.remaining_seats,
-                accessible=0,
+                usable=session.remaining_seats,
                 mapped_total=session.remaining_seats,
                 available_rows=("B",),
             )
@@ -1090,8 +1136,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             watcher.cgv.fetch_date = lambda _date: self._schedule_payload(10)
             watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
                 total=session.remaining_seats,
-                general=session.remaining_seats - 2,
-                accessible=2,
+                usable=session.remaining_seats - 2,
                 mapped_total=session.remaining_seats,
                 available_rows=("B",),
             )
@@ -1130,8 +1175,8 @@ class WatcherIntegrationTests(unittest.TestCase):
             watcher.cgv.fetch_date = lambda _date: self._schedule_payload(
                 remaining["count"]
             )
-            # No general/accessible breakdown: CGV's detail response could not be
-            # classified, so the alert carries the "좌석 종류 미확인" fallback.
+            # No A-row breakdown: CGV's detail response could not be classified,
+            # so the alert carries the "A열 여부 미확인" fallback.
             watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
                 total=session.remaining_seats
             )
@@ -1147,7 +1192,7 @@ class WatcherIntegrationTests(unittest.TestCase):
 
             self.assertEqual(result.seat_changes, 1)
             self.assertEqual({chat_id for chat_id, _ in sent}, {"open-info"})
-            self.assertIn("좌석 종류 미확인", sent[0][1])
+            self.assertIn("A열 여부 미확인", sent[0][1])
 
     def test_classified_seat_change_reaches_verified_only_subscriber(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1158,8 +1203,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             )
             watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
                 total=session.remaining_seats,
-                general=session.remaining_seats - 2,
-                accessible=2,
+                usable=session.remaining_seats - 2,
                 mapped_total=session.remaining_seats,
                 available_rows=("B",),
             )
@@ -1177,7 +1221,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(
                 {chat_id for chat_id, _ in sent}, {"open-info", "strict"}
             )
-            self.assertNotIn("좌석 종류 미확인", sent[0][1])
+            self.assertNotIn("A열 여부 미확인", sent[0][1])
 
     def test_unclassified_seat_change_is_recorded_with_no_recipients(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1255,7 +1299,7 @@ class WatcherIntegrationTests(unittest.TestCase):
 
             watcher.sync_subscribers()
             self.assertTrue(watcher.state.verified_seats_only("111222"))
-            self.assertIn("일반 좌석이 확인된 알림만", replies[-1][1])
+            self.assertIn("A열 제외 좌석이 확인된 알림만", replies[-1][1])
 
             watcher.sync_subscribers()
             self.assertIn("좌석 알림 범위:", replies[-1][1])
@@ -1291,8 +1335,7 @@ class WatcherIntegrationTests(unittest.TestCase):
         watcher.telegram.send_message = lambda text, **_kwargs: None
         watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
             total=session.remaining_seats,
-            general=session.remaining_seats - 2,
-            accessible=2,
+            usable=session.remaining_seats - 2,
             mapped_total=session.remaining_seats,
             available_rows=("B",),
         )
@@ -1500,8 +1543,7 @@ class WatcherIntegrationTests(unittest.TestCase):
         }
         watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
             total=session.remaining_seats,
-            general=session.remaining_seats - 2,
-            accessible=2,
+            usable=session.remaining_seats - 2,
             mapped_total=session.remaining_seats,
             available_rows=("B",),
         )
@@ -1626,8 +1668,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             watcher.cgv.fetch_date = fetch
             watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
                 total=session.remaining_seats,
-                general=session.remaining_seats - 2,
-                accessible=2,
+                usable=session.remaining_seats - 2,
                 mapped_total=session.remaining_seats,
                 available_rows=("B",),
             )
@@ -1691,8 +1732,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             watcher.cgv.fetch_date = fetch
             watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
                 total=session.remaining_seats,
-                general=session.remaining_seats,
-                accessible=0,
+                usable=session.remaining_seats,
                 mapped_total=session.remaining_seats,
                 available_rows=("B",),
             )
@@ -1738,8 +1778,7 @@ class WatcherIntegrationTests(unittest.TestCase):
                 existing_key,
                 SeatSnapshot(
                     total=101,
-                    general=101,
-                    accessible=0,
+                    usable=101,
                     mapped_total=101,
                     available_rows=("B",),
                 ),
@@ -1771,8 +1810,7 @@ class WatcherIntegrationTests(unittest.TestCase):
                 events.append(f"seats:{session.date}")
                 return SeatSnapshot(
                     total=100,
-                    general=100,
-                    accessible=0,
+                    usable=100,
                     mapped_total=100,
                     available_rows=("B",),
                 )
@@ -1821,8 +1859,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             watcher.cgv.fetch_date = fetch
             watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
                 total=session.remaining_seats,
-                general=session.remaining_seats - 2,
-                accessible=2,
+                usable=session.remaining_seats - 2,
                 mapped_total=session.remaining_seats,
                 available_rows=("B",),
             )
@@ -1873,8 +1910,7 @@ class WatcherIntegrationTests(unittest.TestCase):
                 if session.remaining_seats <= 6
                 else SeatSnapshot(
                     total=session.remaining_seats,
-                    general=session.remaining_seats - 2,
-                    accessible=2,
+                    usable=session.remaining_seats - 2,
                     mapped_total=session.remaining_seats,
                     available_rows=("B",),
                 )
@@ -1897,7 +1933,7 @@ class WatcherIntegrationTests(unittest.TestCase):
         self.assertIn("회차 판정 3건", line)
         self.assertIn("07:00 400/624 제외·예매 마감", line)
         self.assertIn("19:00 412/624 발송·예매 오픈", line)
-        self.assertIn("22:00 5/624 보류·좌석종류 미확인", line)
+        self.assertIn("22:00 5/624 보류·A열 여부 미확인", line)
 
     def test_normal_runs_do_not_carry_the_per_showing_summary(self):
         now = _kst(dt.date(2026, 8, 13))
@@ -1944,8 +1980,7 @@ class WatcherIntegrationTests(unittest.TestCase):
                 return SeatSnapshot(total=session.remaining_seats)
             return SeatSnapshot(
                 total=session.remaining_seats,
-                general=session.remaining_seats - 2,
-                accessible=2,
+                usable=session.remaining_seats - 2,
                 mapped_total=session.remaining_seats,
                 available_rows=("B",),
             )
@@ -2205,7 +2240,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertIn("전체 5명", operator_reply)
             self.assertIn("신규 오픈만 — 1명", operator_reply)
             self.assertIn("잔여 좌석만 — 1명", operator_reply)
-            self.assertIn("일반 좌석이 확인된 알림만 — 1명", operator_reply)
+            self.assertIn("A열 제외 좌석이 확인된 알림만 — 1명", operator_reply)
 
             # A subscriber gets the generic reply, so the command stays hidden.
             send(2000, "/stats", 2)
@@ -2291,7 +2326,6 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertIn("CGV 용산아이파크몰 IMAX", description)
             self.assertIn("오디세이 예매 오픈", description)
             self.assertIn("오늘부터 28일", description)
-            self.assertIn("장애인석만 남은 경우", description)
             self.assertIn("A열만 남은 경우", description)
             self.assertIn("/start — 알림 구독", description)
             self.assertIn("예매 바로가기 링크 열기", description)
@@ -2407,8 +2441,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             }
             watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
                 total=session.remaining_seats,
-                general=session.remaining_seats,
-                accessible=0,
+                usable=session.remaining_seats,
                 mapped_total=session.remaining_seats,
                 available_rows=("B",),
             )
@@ -2463,8 +2496,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             }
             watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
                 total=session.remaining_seats,
-                general=session.remaining_seats - 2,
-                accessible=2,
+                usable=session.remaining_seats - 2,
                 mapped_total=session.remaining_seats,
                 available_rows=("B",),
             )
@@ -2495,13 +2527,13 @@ class WatcherIntegrationTests(unittest.TestCase):
                 sent_messages[1].index("극장: 용산아이파크몰"),
             )
 
-    def test_suppresses_change_when_only_accessible_seats_remain(self):
+    def test_suppresses_change_when_only_a_row_seats_remain(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = make_config(Path(temporary))
-            logger = logging.getLogger(f"watcher-accessible-{id(self)}")
+            logger = logging.getLogger(f"watcher-a-row-change-{id(self)}")
             logger.handlers = [logging.NullHandler()]
             watcher = Watcher(config, logger=logger)
-            availability = {"total": 3, "general": 1, "accessible": 2}
+            availability = {"total": 3, "usable": 1, "rows": ("A", "B")}
 
             watcher.cgv.fetch_date = lambda _date: {
                 "data": [
@@ -2518,10 +2550,9 @@ class WatcherIntegrationTests(unittest.TestCase):
             }
             watcher.cgv.fetch_seat_snapshot = lambda _session: SeatSnapshot(
                 total=availability["total"],
-                general=availability["general"],
-                accessible=availability["accessible"],
-                mapped_total=availability["general"] + availability["accessible"],
-                available_rows=("B",),
+                usable=availability["usable"],
+                mapped_total=availability["total"],
+                available_rows=availability["rows"],
             )
             sent_messages = []
             watcher.telegram.send_message = (
@@ -2529,12 +2560,12 @@ class WatcherIntegrationTests(unittest.TestCase):
             )
 
             watcher.run_cycle()
-            availability.update(total=2, general=0, accessible=2)
+            availability.update(total=2, usable=0, rows=("A",))
             second = watcher.run_cycle()
 
             self.assertEqual(len(sent_messages), 1)
             self.assertEqual(second.seat_changes, 0)
-            self.assertEqual(second.suppressed_accessible_only, 1)
+            self.assertEqual(second.suppressed_row_a_only, 1)
 
     def test_suppresses_new_session_when_only_row_a_remains(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2558,8 +2589,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             }
             watcher.cgv.fetch_seat_snapshot = lambda _session: SeatSnapshot(
                 total=2,
-                general=2,
-                accessible=0,
+                usable=0,
                 mapped_total=2,
                 available_rows=("A",),
             )
@@ -2600,8 +2630,7 @@ class WatcherIntegrationTests(unittest.TestCase):
                     raise FetchError("CGV 응답 오류: HTTP 429")
                 return SeatSnapshot(
                     total=2,
-                    general=2,
-                    accessible=0,
+                    usable=2,
                     mapped_total=2,
                     available_rows=("B",),
                 )
@@ -2668,7 +2697,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(result.unclassified_fallback_alerts, 1)
             self.assertEqual(len(sent_messages), 1)
             self.assertIn("7/200석", sent_messages[0])
-            self.assertIn("좌석 종류 미확인", sent_messages[0])
+            self.assertIn("A열 여부 미확인", sent_messages[0])
             self.assertTrue(watcher.state.was_notified(key))
 
     def test_alerts_seat_change_with_seven_seats_after_detail_error(self):
@@ -2697,8 +2726,7 @@ class WatcherIntegrationTests(unittest.TestCase):
                     raise FetchError("CGV 응답 오류: HTTP 429")
                 return SeatSnapshot(
                     total=8,
-                    general=8,
-                    accessible=0,
+                    usable=8,
                     mapped_total=8,
                     available_rows=("B",),
                 )
@@ -2720,7 +2748,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(second.unclassified_fallback_alerts, 1)
             self.assertEqual(len(sent_messages), 2)
             self.assertIn("7/200석 (이전 8/200석)", sent_messages[1])
-            self.assertIn("좌석 종류 미확인", sent_messages[1])
+            self.assertIn("A열 여부 미확인", sent_messages[1])
 
     def test_suppresses_change_to_zero_remaining_seats(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2744,8 +2772,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             }
             watcher.cgv.fetch_seat_snapshot = lambda _session: SeatSnapshot(
                 total=1,
-                general=1,
-                accessible=0,
+                usable=1,
                 mapped_total=1,
                 available_rows=("B",),
             )
