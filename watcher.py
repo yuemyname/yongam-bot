@@ -39,7 +39,7 @@ DEFAULT_BOOKING_URL = "https://cgv.co.kr/cnm/movieBook/movie"
 DEFAULT_SEAT_PAGE_URL = "https://cgv.co.kr/cnm/selectVisitorCnt"
 DEFAULT_SITE_NAME = "용산아이파크몰"
 UNCLASSIFIED_ALERT_MIN_SEATS = 7
-STATE_VERSION = 8
+STATE_VERSION = 9
 TELEGRAM_BROADCAST_WORKERS = 4
 
 # Scanning strategy.  "full" requests every date in the window each cycle.
@@ -119,17 +119,17 @@ SEAT_INFO_ALIASES = {
     "미확인": False,
 }
 SEAT_INFO_LABELS = {
-    True: "일반 좌석이 확인된 알림만",
-    False: "좌석 종류 미확인 알림도 포함",
+    True: "A열 제외 좌석이 확인된 알림만",
+    False: "A열 여부 미확인 알림도 포함",
 }
 # Operator-only. Deliberately left out of /help and the BotFather command list.
 ADMIN_STATS_COMMANDS = {"/stats", "/subscribers"}
 SEAT_INFO_GUIDE = (
     "잔여 좌석 알림의 범위를 고를 수 있습니다.\n"
-    "/seat_all - 좌석 종류 미확인 알림도 받기 (기본)\n"
-    "/seat_verified - 일반 좌석이 확인된 알림만 받기\n\n"
-    "CGV 좌석 상세 조회가 실패하면 좌석 종류를 확인할 수 없어 "
-    "'좌석 종류 미확인' 표시로 알림이 갑니다. "
+    "/seat_all - A열 여부 미확인 알림도 받기 (기본)\n"
+    "/seat_verified - A열 제외 좌석이 확인된 알림만 받기\n\n"
+    "CGV 좌석 상세 조회가 실패하면 A열 여부를 확인할 수 없어 "
+    "'A열 여부 미확인' 표시로 알림이 갑니다. "
     "/seat_verified를 고르면 이런 알림은 받지 않습니다."
 )
 
@@ -803,8 +803,7 @@ class SeatSnapshot:
     """Seat totals observed for one screening."""
 
     total: int
-    general: int | None = None
-    accessible: int | None = None
+    usable: int | None = None
     mapped_total: int | None = None
     available_rows: tuple[str, ...] | None = None
 
@@ -812,45 +811,22 @@ class SeatSnapshot:
     def seat_map_complete(self) -> bool:
         """Whether the detail response can safely classify an alert.
 
-        Counts must agree with the schedule, and row labels are required when
-        at least one general seat remains so A-row-only availability can be
-        excluded without guessing.
+        Counts must agree with the schedule, and every saleable seat needs a
+        row label so A-row availability can be excluded without guessing.
         """
         return (
             self.total > 0
-            and self.general is not None
-            and self.accessible is not None
+            and self.usable is not None
             and self.mapped_total == self.total
-            and (self.general == 0 or self.available_rows is not None)
-        )
-
-    @property
-    def accessible_only(self) -> bool:
-        # Suppress only when the seat-map count exactly agrees with the total
-        # shown in CGV's schedule.  A partial/changed response must not hide an
-        # alert for a normal seat.
-        return (
-            self.general == 0
-            and self.accessible is not None
-            and self.accessible > 0
-            and self.mapped_total == self.total
+            and self.available_rows is not None
         )
 
     @property
     def row_a_only(self) -> bool:
-        # As with accessible-only detection, require a complete seat map before
-        # suppressing an alert. Missing row labels or a count mismatch leave the
-        # alert enabled so an incomplete response cannot hide a useful seat.
-        return (
-            self.total > 0
-            and self.mapped_total == self.total
-            and self.available_rows == ("A",)
-        )
+        return self.seat_map_complete and self.usable == 0
 
     @property
     def suppression_reason(self) -> str | None:
-        if self.accessible_only:
-            return "잔여 좌석이 장애인석뿐입니다."
         if self.row_a_only:
             return "잔여 좌석이 모두 A열입니다."
         return None
@@ -887,11 +863,7 @@ def _normalize_seat_row(value: Any) -> str:
 
 
 def extract_seat_snapshot(payload: Any, *, scheduled_remaining: int) -> SeatSnapshot:
-    """Count anonymously viewable seats using CGV's own seat-map codes.
-
-    CGV's booking UI treats ``seatStusCd=00`` as available and
-    ``seatSalfrmCd=04`` as an accessible/preferential seat.
-    """
+    """Count saleable non-A-row seats from CGV's anonymous seat map."""
 
     seats: dict[str, Mapping[str, Any]] = {}
     for mapping, _context in _walk_mappings(payload):
@@ -911,11 +883,8 @@ def extract_seat_snapshot(payload: Any, *, scheduled_remaining: int) -> SeatSnap
     if not seats:
         return SeatSnapshot(total=scheduled_remaining)
 
-    general = 0
-    accessible = 0
-    # A-row suppression applies to seats a general customer can book.  An
-    # accessible seat in another row must not make "general seats are A-only"
-    # look false, so accessible rows are deliberately kept out of this set.
+    usable = 0
+    mapped_total = 0
     available_rows: set[str] = set()
     row_labels_complete = True
     for seat in seats.values():
@@ -926,24 +895,18 @@ def extract_seat_snapshot(payload: Any, *, scheduled_remaining: int) -> SeatSnap
         disabled = str(_direct_value(seat, {"isdisabled"}) or "").strip().lower()
         if disabled in {"1", "true", "y", "yes"}:
             continue
-        is_accessible = (
-            str(_direct_value(seat, {"seatsalfrmcd"}) or "").strip() == "04"
-        )
-        if is_accessible:
-            accessible += 1
+        mapped_total += 1
+        seat_row = _normalize_seat_row(_direct_value(seat, {"seatrownm"}))
+        if seat_row:
+            available_rows.add(seat_row)
+            if seat_row != "A":
+                usable += 1
         else:
-            general += 1
-            seat_row = _normalize_seat_row(_direct_value(seat, {"seatrownm"}))
-            if seat_row:
-                available_rows.add(seat_row)
-            else:
-                row_labels_complete = False
+            row_labels_complete = False
 
-    mapped_total = general + accessible
     return SeatSnapshot(
         total=scheduled_remaining,
-        general=general,
-        accessible=accessible,
+        usable=usable if row_labels_complete else None,
         mapped_total=mapped_total,
         available_rows=(
             tuple(sorted(available_rows))
@@ -1641,8 +1604,7 @@ class StateStore:
                 available_rows = tuple(raw_rows)
             return SeatSnapshot(
                 total=total,
-                general=_nonnegative_int(raw.get("general")),
-                accessible=_nonnegative_int(raw.get("accessible")),
+                usable=_nonnegative_int(raw.get("usable")),
                 mapped_total=_nonnegative_int(raw.get("mapped_total")),
                 available_rows=available_rows,
             )
@@ -1652,8 +1614,7 @@ class StateStore:
             self.data["seat_counts"][key] = {
                 "observed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                 "total": snapshot.total,
-                "general": snapshot.general,
-                "accessible": snapshot.accessible,
+                "usable": snapshot.usable,
                 "mapped_total": snapshot.mapped_total,
                 "available_rows": (
                     list(snapshot.available_rows)
@@ -1728,7 +1689,7 @@ def _alert_session_line(
 ) -> str:
     line = f"• 상영 시작시간 {session.start_time} — {_seat_ratio(session)}"
     if seat_detail_unclassified:
-        line += " ⚠️ 좌석 종류 미확인 · 전체 잔여 수 기준"
+        line += " ⚠️ A열 여부 미확인 · 전체 잔여 수 기준"
     return line
 
 
@@ -1792,9 +1753,9 @@ def _seat_snapshot_changed(previous: SeatSnapshot, current: SeatSnapshot) -> boo
     if previous.total != current.total:
         return True
     if (
-        previous.general is not None
-        and current.general is not None
-        and previous.general != current.general
+        previous.usable is not None
+        and current.usable is not None
+        and previous.usable != current.usable
     ):
         return True
     return False
@@ -1819,12 +1780,10 @@ def seat_change_message(
             f"(이전 {_seat_ratio(session, remaining=previous.total)})"
         ),
     ]
-    if previous.general is not None and current.general is not None:
-        lines.append(f"일반 예매 가능: {previous.general}석 → {current.general}석")
-    if current.accessible is not None:
-        lines.append(f"장애인석: {current.accessible}석 (장애인석만 남으면 알림 제외)")
+    if previous.usable is not None and current.usable is not None:
+        lines.append(f"A열 제외 예매 가능: {previous.usable}석 → {current.usable}석")
     if current.uses_unclassified_fallback:
-        lines.append("⚠️ 좌석 종류 미확인 · 전체 잔여 수 기준 알림")
+        lines.append("⚠️ A열 여부 미확인 · 전체 잔여 수 기준 알림")
     lines.extend(["", f"예매 바로가기: {booking_url_for_session(session, config)}"])
     return "\n".join(lines)
 
@@ -1886,7 +1845,6 @@ class CycleResult:
     matching_sessions: int
     new_sessions: int
     seat_changes: int = 0
-    suppressed_accessible_only: int = 0
     suppressed_row_a_only: int = 0
     suppressed_sold_out: int = 0
     deferred_seat_details: int = 0
@@ -1927,7 +1885,6 @@ class _CycleTally:
     matching_sessions: int = 0
     new_sessions: int = 0
     seat_changes: int = 0
-    suppressed_accessible_only: int = 0
     suppressed_row_a_only: int = 0
     suppressed_sold_out: int = 0
     suppressed_closed: int = 0
@@ -2506,10 +2463,9 @@ class Watcher:
                     "한국시간 기준 오늘부터 28일간의 상영 회차를 감시합니다.\n\n"
                     "🔔 알려드리는 내용\n"
                     "• 새 IMAX 상영 회차 예매 오픈\n"
-                    "• 잔여 좌석 또는 일반 예매 가능 좌석 변경\n"
+                    "• 잔여 좌석 또는 A열 제외 예매 가능 좌석 변경\n"
                     "• 상영일·시작시간·잔여좌석/총좌석·예매 링크\n\n"
                     "🚫 알림 제외\n"
-                    "• 장애인석만 남은 경우\n"
                     "• A열만 남은 경우\n"
                     "• 잔여 좌석이 0석인 경우\n\n"
                     "🔧 알림 종류 선택 (선택 사항)\n"
@@ -2518,8 +2474,8 @@ class Watcher:
                     "• /mode_open — 신규 오픈만\n"
                     "• /mode_seats — 잔여 좌석만\n\n"
                     "💺 잔여 좌석 알림 범위 (선택 사항)\n"
-                    "• /seat_all — 좌석 종류 미확인 알림도 받기 (기본)\n"
-                    "• /seat_verified — 일반 좌석이 확인된 알림만 받기\n\n"
+                    "• /seat_all — A열 여부 미확인 알림도 받기 (기본)\n"
+                    "• /seat_verified — A열 제외 좌석이 확인된 알림만 받기\n\n"
                     "📌 사용 방법\n"
                     "1. /start — 알림 구독\n"
                     "2. 알림이 오면 예매 바로가기 링크 열기\n"
@@ -2887,12 +2843,9 @@ class Watcher:
         for session in sold_out_new_sessions:
             verdicts[session_keys[session]] = "제외·매진"
         for session in suppressed_new_sessions:
-            snapshot = snapshots[session_keys[session]]
-            verdicts[session_keys[session]] = (
-                "제외·장애인석만" if snapshot.accessible_only else "제외·A열만"
-            )
+            verdicts[session_keys[session]] = "제외·A열만"
         for session in deferred_new_sessions:
-            verdicts[session_keys[session]] = "보류·좌석종류 미확인"
+            verdicts[session_keys[session]] = "보류·A열 여부 미확인"
 
         tally.suppressed_sold_out += len(sold_out_new_sessions)
         tally.deferred_keys.update(
@@ -2904,13 +2857,8 @@ class Watcher:
             if snapshots[session_keys[session]].uses_unclassified_fallback
         }
         tally.unclassified_fallback_alerts += len(unclassified_new_keys)
-        tally.suppressed_accessible_only += sum(
-            snapshots[session_keys[session]].accessible_only
-            for session in suppressed_new_sessions
-        )
         tally.suppressed_row_a_only += sum(
             snapshots[session_keys[session]].row_a_only
-            and not snapshots[session_keys[session]].accessible_only
             for session in suppressed_new_sessions
         )
         for session in suppressed_new_sessions:
@@ -2928,7 +2876,7 @@ class Watcher:
             )
         if deferred_new_sessions:
             self.logger.info(
-                "알림 보류: 좌석 종류 판별 실패 후 잔여 6석 이하인 신규 회차 %d개",
+                "알림 보류: A열 여부 판별 실패 후 잔여 6석 이하인 신규 회차 %d개",
                 len(deferred_new_sessions),
             )
 
@@ -2987,12 +2935,8 @@ class Watcher:
                 continue
 
             if current.should_suppress:
-                if current.accessible_only:
-                    verdicts[key] = "제외·장애인석만"
-                    tally.suppressed_accessible_only += 1
-                elif current.row_a_only:
-                    verdicts[key] = "제외·A열만"
-                    tally.suppressed_row_a_only += 1
+                verdicts[key] = "제외·A열만"
+                tally.suppressed_row_a_only += 1
                 self.logger.info(
                     "좌석 변경 알림 제외: %s %s",
                     _session_line(session),
@@ -3004,10 +2948,10 @@ class Watcher:
                 continue
 
             if not current.alertable:
-                verdicts[key] = "보류·좌석종류 미확인"
+                verdicts[key] = "보류·A열 여부 미확인"
                 tally.deferred_keys.add(key)
                 self.logger.info(
-                    "좌석 변경 알림 보류: %s 좌석 종류 판별 실패 후 잔여 6석 이하입니다.",
+                    "좌석 변경 알림 보류: %s A열 여부 판별 실패 후 잔여 6석 이하입니다.",
                     _session_line(session),
                 )
                 continue
@@ -3025,7 +2969,7 @@ class Watcher:
             if current.uses_unclassified_fallback:
                 tally.unclassified_fallback_alerts += 1
                 self.logger.info(
-                    "좌석 종류 미확인 알림 허용: %s 잔여 7석 이상입니다.",
+                    "A열 여부 미확인 알림 허용: %s 잔여 7석 이상입니다.",
                     _session_line(session),
                 )
 
@@ -3186,7 +3130,7 @@ class Watcher:
 
         self.logger.info(
             "조회 완료: 성공 %d일, 오류 %d일, IMAX 회차 %d개, 신규 %d개, "
-            "좌석변경 %d개, 장애인석만 남아 제외 %d개, A열만 남아 제외 %d개, "
+            "좌석변경 %d개, A열만 남아 제외 %d개, "
             "0석 제외 %d개, 예매 마감 제외 %d개, 좌석판별 대기 %d개, "
             "미판별 7석 이상 알림 %d개, "
             "HTTP 429 %d개, 일정 생략 %d일, 좌석상세 생략 %d개, "
@@ -3196,7 +3140,6 @@ class Watcher:
             tally.matching_sessions,
             tally.new_sessions,
             tally.seat_changes,
-            tally.suppressed_accessible_only,
             tally.suppressed_row_a_only,
             tally.suppressed_sold_out,
             tally.suppressed_closed,
@@ -3213,7 +3156,6 @@ class Watcher:
             matching_sessions=tally.matching_sessions,
             new_sessions=tally.new_sessions,
             seat_changes=tally.seat_changes,
-            suppressed_accessible_only=tally.suppressed_accessible_only,
             suppressed_row_a_only=tally.suppressed_row_a_only,
             suppressed_sold_out=tally.suppressed_sold_out,
             deferred_seat_details=len(tally.deferred_keys),
