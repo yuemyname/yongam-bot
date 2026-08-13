@@ -45,7 +45,7 @@ STATE_VERSION = 7
 SCAN_MODE_FULL = "full"
 SCAN_MODE_CURSOR = "cursor"
 SCAN_MODES = (SCAN_MODE_FULL, SCAN_MODE_CURSOR)
-DEFAULT_SCAN_MODE = SCAN_MODE_FULL
+DEFAULT_SCAN_MODE = SCAN_MODE_CURSOR
 
 # Alert categories a broadcast can belong to.  "system" messages (fetch error
 # notices) always reach every subscriber regardless of their preference.
@@ -910,6 +910,9 @@ def extract_seat_snapshot(payload: Any, *, scheduled_remaining: int) -> SeatSnap
 
     general = 0
     accessible = 0
+    # A-row suppression applies to seats a general customer can book.  An
+    # accessible seat in another row must not make "general seats are A-only"
+    # look false, so accessible rows are deliberately kept out of this set.
     available_rows: set[str] = set()
     row_labels_complete = True
     for seat in seats.values():
@@ -920,15 +923,18 @@ def extract_seat_snapshot(payload: Any, *, scheduled_remaining: int) -> SeatSnap
         disabled = str(_direct_value(seat, {"isdisabled"}) or "").strip().lower()
         if disabled in {"1", "true", "y", "yes"}:
             continue
-        seat_row = _normalize_seat_row(_direct_value(seat, {"seatrownm"}))
-        if seat_row:
-            available_rows.add(seat_row)
-        else:
-            row_labels_complete = False
-        if str(_direct_value(seat, {"seatsalfrmcd"}) or "").strip() == "04":
+        is_accessible = (
+            str(_direct_value(seat, {"seatsalfrmcd"}) or "").strip() == "04"
+        )
+        if is_accessible:
             accessible += 1
         else:
             general += 1
+            seat_row = _normalize_seat_row(_direct_value(seat, {"seatrownm"}))
+            if seat_row:
+                available_rows.add(seat_row)
+            else:
+                row_labels_complete = False
 
     mapped_total = general + accessible
     return SeatSnapshot(
@@ -1175,6 +1181,7 @@ class StateStore:
             "telegram_update_offset": 0,
             "frontier_date": "",
             "deferred": {},
+            "pending_deliveries": {},
             "last_error_fingerprint": "",
             "last_error_notified_at": "",
         }
@@ -1195,6 +1202,10 @@ class StateStore:
                 raise RuntimeError(f"좌석 수 상태 파일 형식이 올바르지 않습니다: {self.path}")
             if not isinstance(loaded.get("subscribers", {}), dict):
                 raise RuntimeError(f"구독자 상태 파일 형식이 올바르지 않습니다: {self.path}")
+            if not isinstance(loaded.get("deferred", {}), dict):
+                raise RuntimeError(f"보류 상태 파일 형식이 올바르지 않습니다: {self.path}")
+            if not isinstance(loaded.get("pending_deliveries", {}), dict):
+                raise RuntimeError(f"재전송 상태 파일 형식이 올바르지 않습니다: {self.path}")
             self.data.update(loaded)
             self.data["version"] = STATE_VERSION
             self.data.setdefault("seat_counts", {})
@@ -1203,6 +1214,7 @@ class StateStore:
             self.data.setdefault("telegram_update_offset", 0)
             self.data.setdefault("frontier_date", "")
             self.data.setdefault("deferred", {})
+            self.data.setdefault("pending_deliveries", {})
 
     def was_notified(self, key: str) -> bool:
         with self._lock:
@@ -1354,6 +1366,55 @@ class StateStore:
                 return False
             bucket[key] = {"total": remaining, "skips": skips - 1}
             return True
+
+    def queue_pending_delivery(self, chat_id: str, text: str, category: str) -> bool:
+        """Remember a failed Telegram delivery without duplicating the queue."""
+
+        key_source = f"{chat_id}\0{category}\0{text}"
+        key = hashlib.sha256(key_source.encode("utf-8")).hexdigest()
+        with self._lock:
+            bucket = self.data.setdefault("pending_deliveries", {})
+            if key in bucket:
+                return False
+            bucket[key] = {
+                "chat_id": str(chat_id),
+                "text": text,
+                "category": category,
+                "queued_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            }
+            return True
+
+    def pending_deliveries(self) -> tuple[tuple[str, dict[str, str]], ...]:
+        """Return a stable copy so Telegram calls happen outside the state lock."""
+
+        with self._lock:
+            records: list[tuple[str, dict[str, str]]] = []
+            for key, raw in self.data.setdefault("pending_deliveries", {}).items():
+                if not isinstance(raw, Mapping):
+                    continue
+                chat_id = raw.get("chat_id")
+                text = raw.get("text")
+                category = raw.get("category")
+                if all(
+                    isinstance(value, str) and value
+                    for value in (chat_id, text, category)
+                ):
+                    records.append(
+                        (
+                            str(key),
+                            {
+                                "chat_id": chat_id,
+                                "text": text,
+                                "category": category,
+                            },
+                        )
+                    )
+            return tuple(records)
+
+    def remove_pending_delivery(self, key: str) -> bool:
+        with self._lock:
+            bucket = self.data.setdefault("pending_deliveries", {})
+            return bucket.pop(str(key), None) is not None
 
     def subscriber_breakdown(self) -> dict[str, Any]:
         """Counts of who is subscribed and how they configured their alerts."""
@@ -1807,21 +1868,19 @@ class Watcher:
     def _plan_scan(self, today: dt.date) -> ScanPlan:
         """Choose the dates to request this cycle.
 
-        Full scans cover the whole window.  Cursor scans cover the open range
-        plus a short probe, which is contiguous because ``open_end`` is never
-        older than yesterday.
+        Dates just past the observed booking frontier come first because a hit
+        there is a new booking opening.  Already-open dates follow for seat
+        changes; a periodic full scan appends the rest of the window.
         """
 
         window = self.config.target_dates(today=today)
-        if not window or self.config.scan_mode == SCAN_MODE_FULL:
+        if not window:
             return ScanPlan(dates=tuple(window), full_scan=True)
 
         frontier = self.state.frontier_date
         # No frontier yet (first run, or a wiped volume) means there is nothing
         # to probe past, so the window has to be swept once to establish one.
         if frontier is None:
-            return ScanPlan(dates=tuple(window), full_scan=True)
-        if self._cycle_index % self.config.full_scan_every_cycles == 0:
             return ScanPlan(dates=tuple(window), full_scan=True)
 
         window_end = window[-1]
@@ -1831,8 +1890,20 @@ class Watcher:
         probe_end = min(
             open_end + dt.timedelta(days=self.config.cursor_probe_days), window_end
         )
+        probe_dates = [date for date in window if open_end < date <= probe_end]
+        open_dates = [date for date in window if date <= open_end]
+        remaining_dates = [date for date in window if date > probe_end]
+        full_scan = (
+            self.config.scan_mode == SCAN_MODE_FULL
+            or self._cycle_index % self.config.full_scan_every_cycles == 0
+        )
+        if full_scan:
+            return ScanPlan(
+                dates=tuple(probe_dates + remaining_dates + open_dates),
+                full_scan=True,
+            )
         return ScanPlan(
-            dates=tuple(date for date in window if date <= probe_end),
+            dates=tuple(probe_dates + open_dates),
             full_scan=False,
             open_end=open_end,
             window_end=window_end,
@@ -1845,7 +1916,7 @@ class Watcher:
             plan.open_end + dt.timedelta(days=self.config.cursor_expansion_days),
             plan.window_end,
         )
-        start = plan.dates[-1] + dt.timedelta(days=1)
+        start = max(plan.dates) + dt.timedelta(days=1)
         return [
             start + dt.timedelta(days=offset)
             for offset in range((expansion_end - start).days + 1)
@@ -1964,7 +2035,10 @@ class Watcher:
                 self.telegram.send_message(text, chat_id=chat_id)
             except TelegramError as exc:
                 failed += 1
-                self.logger.error("구독자 Telegram 전송 실패: %s", exc)
+                self.state.queue_pending_delivery(chat_id, text, category)
+                self.logger.error(
+                    "구독자 Telegram 전송 실패(다음 주기 재시도): %s", exc
+                )
             else:
                 delivered += 1
         if not subscriber_ids:
@@ -1977,6 +2051,29 @@ class Watcher:
                     "등록된 Telegram 구독자가 없어 알림을 전송하지 않습니다."
                 )
         return delivered, failed, len(subscriber_ids)
+
+    def _retry_pending_deliveries(self) -> None:
+        """Retry only recipients who missed an earlier broadcast."""
+
+        if self.dry_run:
+            return
+        changed = False
+        for key, record in self.state.pending_deliveries():
+            chat_id = record["chat_id"]
+            category = record["category"]
+            eligible = set(self.state.subscriber_ids_for(category))
+            if chat_id not in eligible:
+                changed = self.state.remove_pending_delivery(key) or changed
+                continue
+            try:
+                self.telegram.send_message(record["text"], chat_id=chat_id)
+            except TelegramError as exc:
+                self.logger.warning("Telegram 알림 재전송 실패: %s", exc)
+                continue
+            changed = self.state.remove_pending_delivery(key) or changed
+            self.logger.info("Telegram 미수신 알림 재전송 성공: chat_id=%s", chat_id)
+        if changed:
+            self.state.save()
 
     def _subscriber_stats_message(self) -> str:
         """Operator-facing snapshot of the subscriber list."""
@@ -2328,9 +2425,9 @@ class Watcher:
         """Fetch each date and alert on it before moving to the next.
 
         Alerting per date rather than after the whole sweep is what keeps the
-        delay between reading a seat count and sending it near zero.  Today is
-        requested first, so the showings closest to their start time — the ones
-        whose seats move fastest — are also the ones alerted soonest.
+        delay between reading a seat count and sending it near zero.  Probe
+        dates just beyond the booking frontier are requested first so a newly
+        opened session wins over ordinary seat-count changes.
         """
 
         for index, show_date in enumerate(dates):
@@ -2391,7 +2488,26 @@ class Watcher:
                 )
             tally.matching_sessions += len(sessions)
             if sessions:
-                self._alert_for_sessions(sessions, tally)
+                new_sessions = [
+                    session
+                    for session in sessions
+                    if not self.state.was_notified(
+                        session.notification_key(
+                            site_no=self.config.site_no,
+                            movie_no=self.config.movie_no,
+                        )
+                    )
+                ]
+                existing_sessions = [
+                    session for session in sessions if session not in new_sessions
+                ]
+                if new_sessions:
+                    self._alert_for_sessions(new_sessions, tally)
+                    # Persist open alerts before spending time on cancellation
+                    # tickets, both for priority and crash-safe de-duplication.
+                    self._flush_state(tally)
+                if existing_sessions:
+                    self._alert_for_sessions(existing_sessions, tally)
             self._flush_state(tally)
 
     def _alert_for_sessions(
@@ -2624,8 +2740,6 @@ class Watcher:
                     delivered, failed, total = self._broadcast_message(
                         text, category=ALERT_OPEN
                     )
-                    if total and not delivered:
-                        break
                     for session in chunk_sessions:
                         self.state.mark_notified(session_keys[session], session)
                         verdicts[session_keys[session]] = "발송·예매 오픈"
@@ -2725,7 +2839,7 @@ class Watcher:
                     else ALERT_SEATS
                 ),
             )
-            if delivered or total == 0:
+            if delivered or failed or total == 0:
                 self.state.set_seat_snapshot(key, current)
                 verdicts[key] = f"발송·좌석 변경 {previous.total}→{current.total}"
                 tally.dirty = True
@@ -2742,6 +2856,7 @@ class Watcher:
         self._record_verdicts(tally, sessions, verdicts, session_keys, snapshots)
 
     def run_cycle(self) -> CycleResult:
+        self._retry_pending_deliveries()
         today = self.config.local_today()
         plan = self._plan_scan(today)
         dates = list(plan.dates)
@@ -2758,28 +2873,31 @@ class Watcher:
             "조회 시작: %s 모드, %d일 (%s~%s)",
             "전체" if plan.full_scan else "커서",
             len(dates),
-            dates[0].isoformat() if dates else "-",
-            dates[-1].isoformat() if dates else "-",
+            min(dates).isoformat() if dates else "-",
+            max(dates).isoformat() if dates else "-",
         )
-        self._scan_and_alert(dates, errors, tally)
+        if not plan.full_scan and plan.open_end is not None:
+            probe_dates = [date for date in dates if date > plan.open_end]
+            open_dates = [date for date in dates if date <= plan.open_end]
+            self._scan_and_alert(probe_dates, errors, tally)
 
-        # The probe found a session past the frontier, so a new booking opening
-        # started.  Widen the scan now to find where the newly opened range
-        # ends, instead of creeping forward a few days per cycle.
-        if (
-            not plan.full_scan
-            and not tally.rate_limited
-            and plan.probe_hit(tally.latest_session_date)
-        ):
-            expansion = self._expansion_dates(plan)
-            if expansion:
-                self.logger.info(
-                    "예매 오픈 감지: %s까지 확장 조회합니다(%d일).",
-                    expansion[-1].isoformat(),
-                    len(expansion),
-                )
-                self._scan_and_alert(expansion, errors, tally)
-                dates.extend(expansion)
+            # Expand immediately after a probe hit, before spending any time on
+            # cancellation-ticket changes in the already-open range.
+            if not tally.rate_limited and plan.probe_hit(tally.latest_session_date):
+                expansion = self._expansion_dates(plan)
+                if expansion:
+                    self.logger.info(
+                        "예매 오픈 감지: %s까지 확장 조회합니다(%d일).",
+                        expansion[-1].isoformat(),
+                        len(expansion),
+                    )
+                    self._scan_and_alert(expansion, errors, tally)
+                    dates.extend(expansion)
+            # Calling this even after a 429 lets _scan_and_alert account for
+            # every known-open date skipped by the rate-limit stop.
+            self._scan_and_alert(open_dates, errors, tally)
+        else:
+            self._scan_and_alert(dates, errors, tally)
 
         if tally.latest_session_date:
             try:
@@ -2834,7 +2952,7 @@ class Watcher:
                 delivered, _failed, total = self._broadcast_message(
                     error_text, category=ALERT_SYSTEM
                 )
-                if delivered or total == 0:
+                if delivered or _failed or total == 0:
                     self.state.mark_error_notified(fingerprint)
                     tally.dirty = True
         elif self.state.clear_error():
