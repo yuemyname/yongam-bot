@@ -2017,12 +2017,10 @@ class Watcher:
             open_end + dt.timedelta(days=self.config.cursor_probe_days), window_end
         )
         probe_dates = [date for date in window if open_end < date <= probe_end]
-        # After probing just beyond the booking frontier, walk known-open dates
-        # backwards. This checks the newest bookable dates before older ones,
-        # while still reaching today on every cursor cycle.
-        open_dates = list(
-            reversed([date for date in window if date <= open_end])
-        )
+        # After probing just beyond the booking frontier, check known-open dates
+        # from today forwards. Cancellation tickets matter most for screenings
+        # that are closest to starting.
+        open_dates = [date for date in window if date <= open_end]
         remaining_dates = [date for date in window if date > probe_end]
         full_scan = (
             self.config.scan_mode == SCAN_MODE_FULL
