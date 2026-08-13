@@ -5,8 +5,9 @@ import logging
 import os
 from pathlib import Path
 import tempfile
+import threading
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 import urllib.parse
 
 from watcher import (
@@ -22,6 +23,7 @@ from watcher import (
     extract_seat_snapshot,
     extract_sessions,
     rate_limit_backoff_seconds,
+    run_command_loop,
 )
 
 
@@ -581,42 +583,62 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertIn("https://ko-fi.com/yuemyname", replies[0][1])
             self.assertIn("모든 알림 기능은 동일", replies[0][1])
 
-    def test_telegram_commands_are_polled_during_cgv_scan(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            config = dataclasses.replace(
-                make_config(Path(temporary)),
-                target_end=dt.date(2026, 8, 28),
-            )
-            logger = logging.getLogger(f"watcher-command-poll-{id(self)}")
-            logger.handlers = [logging.NullHandler()]
-            watcher = Watcher(config, logger=logger)
-            watcher.cgv.fetch_date = lambda _date: {"data": []}
-            poll_during_scan = Mock()
-            watcher._maybe_sync_subscribers = poll_during_scan
-
-            watcher.run_cycle()
-
-            self.assertEqual(poll_during_scan.call_count, 3)
-
-    def test_telegram_command_poll_interval_is_independent(self):
+    def test_telegram_commands_are_polled_while_cgv_scan_is_blocked(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = dataclasses.replace(
                 make_config(Path(temporary)),
                 subscriptions_enabled=True,
                 telegram_command_poll_seconds=2,
             )
-            logger = logging.getLogger(f"watcher-command-interval-{id(self)}")
+            logger = logging.getLogger(f"watcher-command-poll-{id(self)}")
             logger.handlers = [logging.NullHandler()]
             watcher = Watcher(config, logger=logger)
-            polls = []
-            watcher.telegram.get_updates = lambda **_kwargs: polls.append(True) or []
+            scan_started = threading.Event()
+            release_scan = threading.Event()
+            command_replied = threading.Event()
+            command_stop = threading.Event()
 
-            with patch("watcher.time.monotonic", side_effect=[100, 101, 102, 102]):
-                watcher.sync_subscribers()
-                watcher._maybe_sync_subscribers()
-                watcher._maybe_sync_subscribers()
+            def blocked_fetch(_date):
+                scan_started.set()
+                release_scan.wait(2)
+                return {"data": []}
 
-            self.assertEqual(len(polls), 2)
+            watcher.cgv.fetch_date = blocked_fetch
+            watcher.telegram.get_updates = lambda **_kwargs: [
+                {
+                    "update_id": 22,
+                    "message": {
+                        "text": "/start",
+                        "chat": {
+                            "id": 111222,
+                            "type": "private",
+                            "first_name": "구독자",
+                        },
+                    },
+                }
+            ]
+
+            def record_reply(_text, **_kwargs):
+                command_replied.set()
+                command_stop.set()
+
+            watcher.telegram.send_message = record_reply
+            scan_thread = threading.Thread(target=watcher.run_cycle)
+            command_thread = threading.Thread(
+                target=run_command_loop,
+                args=(watcher, command_stop),
+            )
+            scan_thread.start()
+            self.assertTrue(scan_started.wait(1))
+            command_thread.start()
+            try:
+                self.assertTrue(command_replied.wait(1))
+                self.assertTrue(watcher.state.is_subscribed("111222"))
+            finally:
+                command_stop.set()
+                release_scan.set()
+                command_thread.join(2)
+                scan_thread.join(2)
 
     def test_successful_send_is_persisted_and_not_repeated(self):
         with tempfile.TemporaryDirectory() as temporary:
