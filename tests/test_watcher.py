@@ -1438,6 +1438,62 @@ class WatcherIntegrationTests(unittest.TestCase):
             reloaded.load()
             self.assertEqual(reloaded.alert_mode("111222"), ALERT_MODE_OPEN_ONLY)
 
+    def test_only_a_join_or_leave_logs_the_subscriber_count(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = dataclasses.replace(
+                make_config(Path(temporary)), subscriptions_enabled=True
+            )
+            logger = logging.getLogger(f"watcher-subcount-log-{id(self)}")
+            records = []
+
+            class Capture(logging.Handler):
+                def emit(self, record):
+                    records.append(record.getMessage())
+
+            logger.handlers = [Capture()]
+            logger.setLevel(logging.INFO)
+            watcher = Watcher(config, logger=logger)
+            watcher.telegram.send_message = lambda text, **_kwargs: None
+
+            def batch(update_id, text):
+                return [
+                    {
+                        "update_id": update_id,
+                        "message": {
+                            "text": text,
+                            "chat": {"id": 4242, "type": "private"},
+                        },
+                    }
+                ]
+
+            def counted(label):
+                return [line for line in records if "구독자 변경" in line]
+
+            batches = [
+                batch(1, "/start"),
+                batch(2, "/status"),
+                batch(3, "/help"),
+                batch(4, "/mode_open"),
+                batch(5, "/start"),
+                batch(6, "안녕하세요"),
+                batch(7, "/stop"),
+            ]
+            watcher.telegram.get_updates = lambda **_kwargs: batches.pop(0)
+
+            watcher.sync_subscribers()
+            self.assertEqual(len(counted("join")), 1)
+
+            # Reads, a settings change, a repeat /start and plain chatter all
+            # advance the update offset but leave the roster alone.
+            for _ in range(5):
+                watcher.sync_subscribers()
+            self.assertEqual(len(counted("quiet")), 1)
+            self.assertEqual(watcher.state.telegram_update_offset, 7)
+
+            watcher.sync_subscribers()
+            self.assertEqual(len(counted("leave")), 2)
+            self.assertFalse(watcher.state.is_subscribed("4242"))
+
     def test_desc_command_explains_bot_and_usage(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = dataclasses.replace(

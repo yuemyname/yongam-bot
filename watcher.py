@@ -1965,7 +1965,11 @@ class Watcher:
             self.logger.warning("%s", exc)
             return
 
+        # Any incoming update advances the offset and so has to be saved, but
+        # only an actual join or leave is worth an INFO line — otherwise every
+        # /status or /help looks like the subscriber list moved.
         state_changed = False
+        subscribers_changed = False
         for update in sorted(
             updates,
             key=lambda item: _nonnegative_int(item.get("update_id")) or 0,
@@ -2005,6 +2009,7 @@ class Watcher:
                     chat_id, label=label, chat_type=chat_type
                 )
                 state_changed = state_changed or added
+                subscribers_changed = subscribers_changed or added
                 reply = (
                     "✅ CGV 용산 IMAX 알림 구독이 완료되었습니다."
                     if added
@@ -2018,6 +2023,7 @@ class Watcher:
             elif command in {"/stop", "/unsubscribe"}:
                 removed = self.state.remove_subscriber(chat_id)
                 state_changed = state_changed or removed
+                subscribers_changed = subscribers_changed or removed
                 reply = (
                     "🔕 알림 구독을 해지했습니다. 다시 받으려면 /start를 보내주세요."
                     if removed
@@ -2110,11 +2116,14 @@ class Watcher:
                 self.telegram.send_message(reply, chat_id=chat_id)
             except TelegramError as exc:
                 self.logger.warning("Telegram 구독 명령 답장 실패: %s", exc)
+            else:
+                self.logger.debug("Telegram 명령 처리: %s", command)
 
         if state_changed:
             self.state.save()
+        if subscribers_changed:
             self.logger.info(
-                "Telegram 구독 명령 처리 완료: 현재 구독자 %d명",
+                "Telegram 구독자 변경: 현재 %d명",
                 len(self.state.subscriber_ids()),
             )
 
