@@ -156,21 +156,14 @@ Railway에 배포된 봇은 Mac과 관계없이 계속 실행됩니다. Mac에�
 
 봇이 회차 하나를 알림으로 만들거나 버리는 순서, 그리고 그 알림이 구독자별로 어떻게 갈라지는지를 그림으로 정리했습니다.
 
-→ **[docs/alert-flow.html](docs/alert-flow.html)**
+→ **[docs/alert-flow.md](docs/alert-flow.md)**
 
 - 한 주기에 일어나는 조회·판정·발송 순서
 - 회차가 통과해야 하는 다섯 관문과 제외·보류 조건
 - `/mode`, `/seat` 설정별 수신 여부
 - 중복 발송을 막는 방식
 
-GitHub 웹에서는 HTML이 소스 코드로 보입니다. 저장소를 내려받아 브라우저로 열면 그림이 나옵니다.
-
-```bash
-git clone https://github.com/yuemyname/yongam-bot.git
-open yongam-bot/docs/alert-flow.html      # Windows: start, Linux: xdg-open
-```
-
-외부 서비스나 인터넷 연결 없이 파일 하나로 동작합니다.
+다이어그램은 GitHub에서 바로 보입니다. 내려받거나 별도 프로그램을 설치할 필요가 없습니다.
 
 ## 운영 및 설치
 
