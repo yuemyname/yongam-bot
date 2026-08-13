@@ -12,6 +12,10 @@
 start - 알림 구독
 stop - 알림 해지
 status - 구독 상태 확인
+mode - 알림 종류 확인·변경
+mode_all - 신규 오픈 + 잔여 좌석 받기
+mode_open - 신규 오픈만 받기
+mode_seats - 잔여 좌석만 받기
 desc - 봇 설명과 사용 방법
 coffee - 개발자에게 커피 후원
 help - 사용법 보기

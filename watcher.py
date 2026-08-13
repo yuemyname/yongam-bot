@@ -37,6 +37,61 @@ DEFAULT_BOOKING_URL = "https://cgv.co.kr/cnm/movieBook/movie"
 DEFAULT_SEAT_PAGE_URL = "https://cgv.co.kr/cnm/selectVisitorCnt"
 DEFAULT_SITE_NAME = "용산아이파크몰"
 UNCLASSIFIED_ALERT_MIN_SEATS = 7
+STATE_VERSION = 5
+
+# Alert categories a broadcast can belong to.  "system" messages (fetch error
+# notices) always reach every subscriber regardless of their preference.
+ALERT_OPEN = "open"
+ALERT_SEATS = "seats"
+ALERT_SYSTEM = "system"
+
+# Per-subscriber alert preference.  Subscribers stored before this feature have
+# no saved mode and fall back to DEFAULT_ALERT_MODE, preserving old behaviour.
+ALERT_MODE_ALL = "all"
+ALERT_MODE_OPEN_ONLY = "open"
+ALERT_MODE_SEATS_ONLY = "seats"
+DEFAULT_ALERT_MODE = ALERT_MODE_ALL
+ALERT_MODES: dict[str, frozenset[str]] = {
+    ALERT_MODE_ALL: frozenset({ALERT_OPEN, ALERT_SEATS}),
+    ALERT_MODE_OPEN_ONLY: frozenset({ALERT_OPEN}),
+    ALERT_MODE_SEATS_ONLY: frozenset({ALERT_SEATS}),
+}
+ALERT_MODE_LABELS = {
+    ALERT_MODE_ALL: "신규 오픈 + 잔여 좌석",
+    ALERT_MODE_OPEN_ONLY: "신규 오픈만",
+    ALERT_MODE_SEATS_ONLY: "잔여 좌석만",
+}
+# One-tap commands matter more than typing arguments on a phone keyboard, so
+# each mode gets its own command as well as a "/mode <value>" argument form.
+MODE_COMMAND_TARGETS = {
+    "/mode_all": ALERT_MODE_ALL,
+    "/mode_open": ALERT_MODE_OPEN_ONLY,
+    "/mode_seats": ALERT_MODE_SEATS_ONLY,
+}
+MODE_COMMANDS = {"/mode", "/alert", *MODE_COMMAND_TARGETS}
+ALERT_MODE_ALIASES = {
+    "all": ALERT_MODE_ALL,
+    "both": ALERT_MODE_ALL,
+    "전체": ALERT_MODE_ALL,
+    "모두": ALERT_MODE_ALL,
+    "open": ALERT_MODE_OPEN_ONLY,
+    "오픈": ALERT_MODE_OPEN_ONLY,
+    "예매": ALERT_MODE_OPEN_ONLY,
+    "seat": ALERT_MODE_SEATS_ONLY,
+    "seats": ALERT_MODE_SEATS_ONLY,
+    "좌석": ALERT_MODE_SEATS_ONLY,
+    "잔여": ALERT_MODE_SEATS_ONLY,
+}
+MODE_GUIDE = (
+    "알림 종류를 고를 수 있습니다.\n"
+    "/mode_all - 신규 오픈 + 잔여 좌석 (기본)\n"
+    "/mode_open - 신규 오픈만\n"
+    "/mode_seats - 잔여 좌석만"
+)
+
+# Keep one extra day so a subscriber in a different timezone never loses the
+# de-duplication record for a show that is still "today" for them.
+STATE_RETENTION_DAYS = 1
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -976,12 +1031,36 @@ class TelegramClient:
         return [item for item in updates if isinstance(item, Mapping)]
 
 
+def _state_key_date(key: str, record: Any) -> dt.date | None:
+    """Recover the show date for a stored record, or None when unknown."""
+
+    candidates: list[str] = []
+    if isinstance(record, Mapping):
+        stored = record.get("date")
+        if isinstance(stored, str):
+            candidates.append(stored)
+    parts = str(key).split(":")
+    if len(parts) >= 3:
+        candidates.append(parts[2])
+    for candidate in candidates:
+        try:
+            return dt.date.fromisoformat(candidate.strip())
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _expired_state_key(key: str, record: Any, cutoff: dt.date) -> bool:
+    show_date = _state_key_date(key, record)
+    return show_date is not None and show_date < cutoff
+
+
 class StateStore:
     def __init__(self, path: Path):
         self.path = path
         self._lock = threading.RLock()
         self.data: dict[str, Any] = {
-            "version": 4,
+            "version": STATE_VERSION,
             "notified": {},
             "seat_counts": {},
             "subscribers": {},
@@ -1008,7 +1087,7 @@ class StateStore:
             if not isinstance(loaded.get("subscribers", {}), dict):
                 raise RuntimeError(f"구독자 상태 파일 형식이 올바르지 않습니다: {self.path}")
             self.data.update(loaded)
-            self.data["version"] = 4
+            self.data["version"] = STATE_VERSION
             self.data.setdefault("seat_counts", {})
             self.data.setdefault("subscribers", {})
             self.data.setdefault("subscribers_initialized", False)
@@ -1029,6 +1108,30 @@ class StateStore:
                 "total_seats": session.total_seats,
             }
 
+    def prune_expired(self, today: dt.date) -> int:
+        """Drop notification and seat records for shows that already played.
+
+        Keys look like ``siteNo:movNo:YYYY-MM-DD:HH:MM`` so the show date is the
+        third colon-separated field.  Anything unparseable is kept: an unknown
+        key is far cheaper than a duplicate alert.
+        """
+
+        cutoff = today - dt.timedelta(days=STATE_RETENTION_DAYS)
+        removed = 0
+        with self._lock:
+            for bucket in ("notified", "seat_counts"):
+                records = self.data.get(bucket)
+                if not isinstance(records, dict):
+                    continue
+                for key in [
+                    key
+                    for key in records
+                    if _expired_state_key(key, records.get(key), cutoff)
+                ]:
+                    del records[key]
+                    removed += 1
+        return removed
+
     @property
     def subscribers_initialized(self) -> bool:
         with self._lock:
@@ -1048,6 +1151,46 @@ class StateStore:
         with self._lock:
             return str(chat_id) in self.data["subscribers"]
 
+    def alert_mode(self, chat_id: str) -> str:
+        """Return a subscriber's alert preference, defaulting to everything."""
+
+        with self._lock:
+            record = self.data["subscribers"].get(str(chat_id))
+            if not isinstance(record, Mapping):
+                return DEFAULT_ALERT_MODE
+            mode = record.get("alert_mode")
+            if isinstance(mode, str) and mode in ALERT_MODES:
+                return mode
+            return DEFAULT_ALERT_MODE
+
+    def set_alert_mode(self, chat_id: str, mode: str) -> bool:
+        """Store a new preference; returns False when it was already set."""
+
+        if mode not in ALERT_MODES:
+            raise ValueError(f"알 수 없는 알림 모드: {mode}")
+        with self._lock:
+            record = self.data["subscribers"].get(str(chat_id))
+            if not isinstance(record, Mapping):
+                return False
+            if record.get("alert_mode", DEFAULT_ALERT_MODE) == mode:
+                return False
+            updated = dict(record)
+            updated["alert_mode"] = mode
+            self.data["subscribers"][str(chat_id)] = updated
+            return True
+
+    def subscriber_ids_for(self, category: str) -> tuple[str, ...]:
+        """Subscribers who opted in to this alert category."""
+
+        if category == ALERT_SYSTEM:
+            return self.subscriber_ids()
+        with self._lock:
+            return tuple(
+                str(chat_id)
+                for chat_id in self.data["subscribers"]
+                if category in ALERT_MODES[self.alert_mode(chat_id)]
+            )
+
     def add_subscriber(
         self, chat_id: str, *, label: str = "", chat_type: str = ""
     ) -> bool:
@@ -1059,6 +1202,7 @@ class StateStore:
                 "subscribed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                 "label": label[:100],
                 "chat_type": chat_type[:30],
+                "alert_mode": DEFAULT_ALERT_MODE,
             }
             return True
 
@@ -1386,8 +1530,17 @@ class Watcher:
     def _mark_cgv_request_finished(self) -> None:
         self._last_cgv_request_finished_at = time.monotonic()
 
-    def _broadcast_message(self, text: str) -> tuple[int, int, int]:
-        subscriber_ids = self.state.subscriber_ids()
+    def _broadcast_message(
+        self, text: str, *, category: str = ALERT_SYSTEM
+    ) -> tuple[int, int, int]:
+        """Send to subscribers opted in to ``category``.
+
+        The returned total counts only those recipients, so callers that gate
+        state updates on delivery still advance when nobody wants this
+        category (total == 0) instead of retrying forever.
+        """
+
+        subscriber_ids = self.state.subscriber_ids_for(category)
         delivered = 0
         failed = 0
         for chat_id in subscriber_ids:
@@ -1399,8 +1552,55 @@ class Watcher:
             else:
                 delivered += 1
         if not subscriber_ids:
-            self.logger.warning("등록된 Telegram 구독자가 없어 알림을 전송하지 않습니다.")
+            if self.state.subscriber_ids():
+                self.logger.info(
+                    "'%s' 알림을 받는 구독자가 없어 전송을 생략합니다.", category
+                )
+            else:
+                self.logger.warning(
+                    "등록된 Telegram 구독자가 없어 알림을 전송하지 않습니다."
+                )
         return delivered, failed, len(subscriber_ids)
+
+    def _handle_mode_command(
+        self, chat_id: str, command: str, argument: str
+    ) -> tuple[str, bool]:
+        """Return the reply for an alert-mode command and whether state changed."""
+
+        requested = MODE_COMMAND_TARGETS.get(command)
+        if requested is None and argument:
+            requested = ALERT_MODE_ALIASES.get(argument)
+            if requested is None:
+                return (f"알 수 없는 알림 종류입니다.\n\n{MODE_GUIDE}", False)
+
+        current = self.state.alert_mode(chat_id)
+        if requested is None:
+            if not self.state.is_subscribed(chat_id):
+                return (
+                    "🔕 현재 구독 중이 아닙니다. /start로 구독한 뒤 알림 종류를 "
+                    f"고를 수 있습니다.\n\n{MODE_GUIDE}",
+                    False,
+                )
+            return (
+                f"🔔 현재 알림 종류: {ALERT_MODE_LABELS[current]}\n\n{MODE_GUIDE}",
+                False,
+            )
+
+        if not self.state.is_subscribed(chat_id):
+            return (
+                "먼저 /start로 구독해주세요. 구독 후에 알림 종류를 고를 수 있습니다.",
+                False,
+            )
+
+        changed = self.state.set_alert_mode(chat_id, requested)
+        label = ALERT_MODE_LABELS[requested]
+        # Every label ends in a consonant, so "으로" is always the right particle.
+        if not changed:
+            return (f"🔔 이미 '{label}'으로 설정되어 있습니다.", False)
+        return (
+            f"✅ 알림 종류를 '{label}'으로 변경했습니다.\n\n{MODE_GUIDE}",
+            True,
+        )
 
     def sync_subscribers(self) -> None:
         """Apply Telegram /start and /stop commands to the persistent list."""
@@ -1438,7 +1638,9 @@ class Watcher:
                 continue
 
             chat_id = str(chat["id"])
-            command = text.split(maxsplit=1)[0].lower().split("@", 1)[0]
+            fields = text.split()
+            command = fields[0].lower().split("@", 1)[0]
+            argument = fields[1].lower() if len(fields) > 1 else ""
             label = str(
                 chat.get("title")
                 or chat.get("username")
@@ -1460,7 +1662,8 @@ class Watcher:
                 )
                 reply += (
                     "\n\n예매 오픈과 좌석 수 변경을 알려드릴게요."
-                    "\n알림 해지: /stop\n구독 상태: /status"
+                    f"\n\n{MODE_GUIDE}"
+                    "\n\n알림 해지: /stop\n구독 상태: /status"
                 )
             elif command in {"/stop", "/unsubscribe"}:
                 removed = self.state.remove_subscriber(chat_id)
@@ -1471,17 +1674,30 @@ class Watcher:
                     else "현재 알림을 구독하고 있지 않습니다. 구독하려면 /start를 보내주세요."
                 )
             elif command == "/status":
-                reply = (
-                    "✅ 현재 CGV 용산 IMAX 알림을 구독 중입니다."
-                    if self.state.is_subscribed(chat_id)
-                    else "🔕 현재 구독 중이 아닙니다. 알림을 받으려면 /start를 보내주세요."
+                if self.state.is_subscribed(chat_id):
+                    mode_label = ALERT_MODE_LABELS[self.state.alert_mode(chat_id)]
+                    reply = (
+                        "✅ 현재 CGV 용산 IMAX 알림을 구독 중입니다.\n"
+                        f"알림 종류: {mode_label}\n\n"
+                        "알림 종류 변경: /mode"
+                    )
+                else:
+                    reply = (
+                        "🔕 현재 구독 중이 아닙니다. "
+                        "알림을 받으려면 /start를 보내주세요."
+                    )
+            elif command in MODE_COMMANDS:
+                reply, mode_changed = self._handle_mode_command(
+                    chat_id, command, argument
                 )
+                state_changed = state_changed or mode_changed
             elif command == "/help":
                 reply = (
                     "🎬 CGV 용산 IMAX 알림 봇\n\n"
                     "/start - 알림 구독\n"
                     "/stop - 알림 해지\n"
                     "/status - 구독 상태 확인\n"
+                    "/mode - 알림 종류 선택\n"
                     "/desc - 봇 설명과 사용 방법\n"
                     "/coffee - 개발자에게 커피 후원\n"
                     "/help - 사용법 보기"
@@ -1500,10 +1716,15 @@ class Watcher:
                     "• 장애인석만 남은 경우\n"
                     "• A열만 남은 경우\n"
                     "• 잔여 좌석이 0석인 경우\n\n"
+                    "🔧 알림 종류 선택\n"
+                    "• /mode_all — 신규 오픈 + 잔여 좌석 (기본)\n"
+                    "• /mode_open — 신규 오픈만\n"
+                    "• /mode_seats — 잔여 좌석만\n\n"
                     "📌 사용 방법\n"
                     "1. /start — 알림 구독\n"
                     "2. 알림이 오면 예매 바로가기 링크 열기\n"
                     "3. CGV 화면에서 IMAX 버튼 선택 후 예매\n\n"
+                    "/mode — 현재 알림 종류 확인·변경\n"
                     "/status — 구독 상태 확인\n"
                     "/stop — 알림 해지\n"
                     "/coffee — 개발자에게 커피 후원\n"
@@ -1533,6 +1754,13 @@ class Watcher:
 
     def run_cycle(self) -> CycleResult:
         dates = self.config.target_dates()
+        pruned_records = (
+            0 if self.dry_run else self.state.prune_expired(self.config.local_today())
+        )
+        if pruned_records:
+            self.logger.info(
+                "지난 상영일 상태 기록 %d개를 정리했습니다.", pruned_records
+            )
         payloads: dict[dt.date, Any] = {}
         errors: dict[dt.date, str] = {}
         schedule_skipped_dates = 0
@@ -1704,7 +1932,7 @@ class Watcher:
             and snapshots[session_keys[session]].alertable
         ]
 
-        state_changed = False
+        state_changed = bool(pruned_records)
         suppressed_sold_out = len(sold_out_new_sessions)
         deferred_seat_detail_keys = {
             session_keys[session] for session in deferred_new_sessions
@@ -1754,7 +1982,9 @@ class Watcher:
                     self.config,
                     unclassified_keys=unclassified_new_keys,
                 ):
-                    delivered, failed, total = self._broadcast_message(text)
+                    delivered, failed, total = self._broadcast_message(
+                        text, category=ALERT_OPEN
+                    )
                     if total and not delivered:
                         break
                     for session in chunk_sessions:
@@ -1845,7 +2075,8 @@ class Watcher:
                 )
                 continue
             delivered, failed, total = self._broadcast_message(
-                seat_change_message(session, previous, current, self.config)
+                seat_change_message(session, previous, current, self.config),
+                category=ALERT_SEATS,
             )
             if delivered or total == 0:
                 self.state.set_seat_snapshot(key, current)
@@ -1892,7 +2123,9 @@ class Watcher:
                     )
                     + "감시기는 계속 실행되며 자동 대기 후 다시 시도합니다."
                 )
-                delivered, _failed, total = self._broadcast_message(error_text)
+                delivered, _failed, total = self._broadcast_message(
+                    error_text, category=ALERT_SYSTEM
+                )
                 if delivered or total == 0:
                     self.state.mark_error_notified(fingerprint)
                     state_changed = True

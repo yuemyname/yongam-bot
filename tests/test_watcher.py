@@ -11,6 +11,13 @@ from unittest.mock import patch
 import urllib.parse
 
 from watcher import (
+    ALERT_MODE_ALL,
+    ALERT_MODE_OPEN_ONLY,
+    ALERT_MODE_SEATS_ONLY,
+    ALERT_OPEN,
+    ALERT_SEATS,
+    ALERT_SYSTEM,
+    STATE_VERSION,
     BookingSession,
     CgvClient,
     Config,
@@ -295,11 +302,105 @@ class StateStoreTests(unittest.TestCase):
 
             reloaded = StateStore(state_path)
             reloaded.load()
-            self.assertEqual(reloaded.data["version"], 4)
+            self.assertEqual(reloaded.data["version"], STATE_VERSION)
             self.assertEqual(reloaded.seat_snapshot("session").general, 3)
             self.assertEqual(
                 reloaded.seat_snapshot("session").available_rows, ("A", "B")
             )
+
+
+class StatePruningTests(unittest.TestCase):
+    @staticmethod
+    def _key(date_text: str, start_time: str = "14:30") -> str:
+        return f"0013:30001323:{date_text}:{start_time}"
+
+    def test_removes_past_shows_but_keeps_today_and_yesterday(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = StateStore(Path(temporary) / "notified.json")
+            today = dt.date(2026, 8, 13)
+            for offset in (-5, -2, -1, 0, 3):
+                key = self._key((today + dt.timedelta(days=offset)).isoformat())
+                store.data["notified"][key] = {"date": None}
+                store.set_seat_snapshot(key, SeatSnapshot(total=4))
+
+            removed = store.prune_expired(today)
+
+            # -5 and -2 fall before the one-day retention margin; both buckets.
+            self.assertEqual(removed, 4)
+            surviving = {
+                key.split(":")[2] for key in store.data["notified"]
+            }
+            self.assertEqual(
+                surviving,
+                {"2026-08-12", "2026-08-13", "2026-08-16"},
+            )
+            self.assertEqual(len(store.data["seat_counts"]), 3)
+
+    def test_keeps_records_whose_date_cannot_be_parsed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = StateStore(Path(temporary) / "notified.json")
+            store.data["notified"]["legacy-key-without-date"] = {}
+            store.data["notified"]["0013:30001323:not-a-date:14:30"] = {}
+
+            self.assertEqual(store.prune_expired(dt.date(2026, 8, 13)), 0)
+            self.assertEqual(len(store.data["notified"]), 2)
+
+    def test_prefers_the_stored_date_field_over_the_key(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = StateStore(Path(temporary) / "notified.json")
+            # Key says a future date, the record says the show already played.
+            store.data["notified"][self._key("2026-12-01")] = {"date": "2026-01-01"}
+
+            self.assertEqual(store.prune_expired(dt.date(2026, 8, 13)), 1)
+            self.assertEqual(store.data["notified"], {})
+
+
+class AlertModeStateTests(unittest.TestCase):
+    def test_defaults_to_all_and_persists_across_reload(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "notified.json"
+            store = StateStore(path)
+            store.add_subscriber("111", label="구독자", chat_type="private")
+
+            self.assertEqual(store.alert_mode("111"), ALERT_MODE_ALL)
+            self.assertTrue(store.set_alert_mode("111", ALERT_MODE_SEATS_ONLY))
+            self.assertFalse(store.set_alert_mode("111", ALERT_MODE_SEATS_ONLY))
+            store.save()
+
+            reloaded = StateStore(path)
+            reloaded.load()
+            self.assertEqual(reloaded.alert_mode("111"), ALERT_MODE_SEATS_ONLY)
+
+    def test_subscriber_stored_before_the_feature_falls_back_to_all(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = StateStore(Path(temporary) / "notified.json")
+            store.data["subscribers"]["999"] = {"subscribed_at": "2026-01-01T00:00:00"}
+
+            self.assertEqual(store.alert_mode("999"), ALERT_MODE_ALL)
+            self.assertIn("999", store.subscriber_ids_for(ALERT_OPEN))
+            self.assertIn("999", store.subscriber_ids_for(ALERT_SEATS))
+
+    def test_routes_each_category_to_the_opted_in_subscribers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = StateStore(Path(temporary) / "notified.json")
+            for chat_id, mode in (
+                ("1", ALERT_MODE_ALL),
+                ("2", ALERT_MODE_OPEN_ONLY),
+                ("3", ALERT_MODE_SEATS_ONLY),
+            ):
+                store.add_subscriber(chat_id)
+                store.set_alert_mode(chat_id, mode)
+
+            self.assertEqual(store.subscriber_ids_for(ALERT_OPEN), ("1", "2"))
+            self.assertEqual(store.subscriber_ids_for(ALERT_SEATS), ("1", "3"))
+            self.assertEqual(store.subscriber_ids_for(ALERT_SYSTEM), ("1", "2", "3"))
+
+    def test_rejects_an_unknown_mode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = StateStore(Path(temporary) / "notified.json")
+            store.add_subscriber("1")
+            with self.assertRaises(ValueError):
+                store.set_alert_mode("1", "nope")
 
 
 class ConfigTests(unittest.TestCase):
@@ -510,6 +611,203 @@ class WatcherIntegrationTests(unittest.TestCase):
             reloaded.load()
             self.assertFalse(reloaded.is_subscribed("111222"))
             self.assertTrue(reloaded.is_subscribed(config.telegram_chat_id))
+
+    @staticmethod
+    def _schedule_payload(remaining: int) -> dict:
+        return {
+            "data": [
+                {
+                    "scnsNm": "IMAX관",
+                    "scnYmd": "20260826",
+                    "scnsrtTm": "1430",
+                    "scnsNo": "13",
+                    "scnSseq": "4",
+                    "frSeatCnt": remaining,
+                    "stcnt": 200,
+                }
+            ]
+        }
+
+    def _watcher_with_three_alert_modes(self, temporary, name):
+        config = make_config(Path(temporary))
+        logger = logging.getLogger(f"watcher-{name}-{id(self)}")
+        logger.handlers = [logging.NullHandler()]
+        watcher = Watcher(config, logger=logger)
+        watcher.state.remove_subscriber(config.telegram_chat_id)
+        for chat_id, mode in (
+            ("1", ALERT_MODE_OPEN_ONLY),
+            ("2", ALERT_MODE_SEATS_ONLY),
+            ("3", ALERT_MODE_ALL),
+        ):
+            watcher.state.add_subscriber(chat_id)
+            watcher.state.set_alert_mode(chat_id, mode)
+        return watcher
+
+    def test_alert_mode_routes_open_and_seat_alerts_separately(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._watcher_with_three_alert_modes(temporary, "alert-routing")
+            remaining = {"count": 10}
+            watcher.cgv.fetch_date = lambda _date: self._schedule_payload(
+                remaining["count"]
+            )
+            watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
+                total=session.remaining_seats,
+                general=session.remaining_seats - 2,
+                accessible=2,
+                mapped_total=session.remaining_seats,
+                available_rows=("B",),
+            )
+            sent = []
+            watcher.telegram.send_message = lambda text, **kwargs: sent.append(
+                (kwargs.get("chat_id"), text)
+            )
+
+            first = watcher.run_cycle()
+            self.assertEqual(first.new_sessions, 1)
+            self.assertEqual({chat_id for chat_id, _ in sent}, {"1", "3"})
+            self.assertIn("예매 오픈 감지", sent[0][1])
+
+            sent.clear()
+            remaining["count"] = 9
+            second = watcher.run_cycle()
+            self.assertEqual(second.seat_changes, 1)
+            self.assertEqual({chat_id for chat_id, _ in sent}, {"2", "3"})
+            self.assertIn("잔여 좌석 변경", sent[0][1])
+
+    def test_open_alert_is_marked_notified_even_with_no_open_subscribers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._watcher_with_three_alert_modes(temporary, "no-open-subs")
+            watcher.state.remove_subscriber("1")
+            watcher.state.remove_subscriber("3")
+            watcher.cgv.fetch_date = lambda _date: self._schedule_payload(10)
+            watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
+                total=session.remaining_seats,
+                general=session.remaining_seats - 2,
+                accessible=2,
+                mapped_total=session.remaining_seats,
+                available_rows=("B",),
+            )
+            sent = []
+            watcher.telegram.send_message = lambda text, **kwargs: sent.append(
+                (kwargs.get("chat_id"), text)
+            )
+
+            # Only a seats-only subscriber remains, so the open alert has no
+            # recipients.  It must still be recorded, or it would re-fire every
+            # cycle forever once an "all" subscriber joins later.
+            first = watcher.run_cycle()
+            second = watcher.run_cycle()
+
+            self.assertEqual(first.new_sessions, 1)
+            self.assertEqual(second.new_sessions, 0)
+            self.assertEqual(sent, [])
+
+    def test_fetch_error_alert_reaches_every_alert_mode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._watcher_with_three_alert_modes(temporary, "error-fanout")
+
+            def fail(_date):
+                raise FetchError("CGV 연결 실패: 테스트")
+
+            watcher.cgv.fetch_date = fail
+            sent = []
+            watcher.telegram.send_message = lambda text, **kwargs: sent.append(
+                (kwargs.get("chat_id"), text)
+            )
+
+            watcher.run_cycle()
+
+            self.assertEqual({chat_id for chat_id, _ in sent}, {"1", "2", "3"})
+            self.assertIn("CGV 감시 조회 오류", sent[0][1])
+
+    def test_run_cycle_prunes_records_for_shows_that_already_played(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            logger = logging.getLogger(f"watcher-prune-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            stale = "0013:30001323:2026-01-01:14:30"
+            watcher.state.data["notified"][stale] = {"date": "2026-01-01"}
+            watcher.state.set_seat_snapshot(stale, SeatSnapshot(total=4))
+            watcher.cgv.fetch_date = lambda _date: {"data": []}
+            watcher.telegram.send_message = lambda text, **_kwargs: None
+
+            watcher.run_cycle()
+
+            self.assertNotIn(stale, watcher.state.data["notified"])
+            self.assertNotIn(stale, watcher.state.data["seat_counts"])
+            reloaded = StateStore(config.state_file)
+            reloaded.load()
+            self.assertNotIn(stale, reloaded.data["notified"])
+
+    def test_mode_commands_change_and_report_alert_preference(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = dataclasses.replace(
+                make_config(Path(temporary)), subscriptions_enabled=True
+            )
+            logger = logging.getLogger(f"watcher-mode-cmd-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            replies = []
+
+            def batch(update_id, text, chat_id=111222):
+                return [
+                    {
+                        "update_id": update_id,
+                        "message": {
+                            "text": text,
+                            "chat": {"id": chat_id, "type": "private"},
+                        },
+                    }
+                ]
+
+            batches = [
+                batch(1, "/mode_seats", chat_id=555),
+                batch(2, "/start"),
+                batch(3, "/mode_seats@YongsanBot"),
+                batch(4, "/status"),
+                batch(5, "/mode"),
+                batch(6, "/mode 오픈"),
+                batch(7, "/mode nonsense"),
+            ]
+            watcher.telegram.get_updates = lambda **_kwargs: batches.pop(0)
+            watcher.telegram.send_message = lambda text, **kwargs: replies.append(
+                (kwargs.get("chat_id"), text)
+            )
+
+            watcher.sync_subscribers()
+            self.assertIn("먼저 /start", replies[-1][1])
+            self.assertEqual(watcher.state.alert_mode("555"), ALERT_MODE_ALL)
+
+            watcher.sync_subscribers()
+            self.assertEqual(watcher.state.alert_mode("111222"), ALERT_MODE_ALL)
+
+            watcher.sync_subscribers()
+            self.assertEqual(
+                watcher.state.alert_mode("111222"), ALERT_MODE_SEATS_ONLY
+            )
+            self.assertIn("잔여 좌석만", replies[-1][1])
+
+            watcher.sync_subscribers()
+            self.assertIn("알림 종류: 잔여 좌석만", replies[-1][1])
+
+            watcher.sync_subscribers()
+            self.assertIn("현재 알림 종류: 잔여 좌석만", replies[-1][1])
+
+            watcher.sync_subscribers()
+            self.assertEqual(
+                watcher.state.alert_mode("111222"), ALERT_MODE_OPEN_ONLY
+            )
+
+            watcher.sync_subscribers()
+            self.assertIn("알 수 없는 알림 종류", replies[-1][1])
+            self.assertEqual(
+                watcher.state.alert_mode("111222"), ALERT_MODE_OPEN_ONLY
+            )
+
+            reloaded = StateStore(config.state_file)
+            reloaded.load()
+            self.assertEqual(reloaded.alert_mode("111222"), ALERT_MODE_OPEN_ONLY)
 
     def test_desc_command_explains_bot_and_usage(self):
         with tempfile.TemporaryDirectory() as temporary:
