@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import urllib.parse
 
 from watcher import (
@@ -580,6 +580,43 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertIn("커피 한 잔 후원", replies[0][1])
             self.assertIn("https://ko-fi.com/yuemyname", replies[0][1])
             self.assertIn("모든 알림 기능은 동일", replies[0][1])
+
+    def test_telegram_commands_are_polled_during_cgv_scan(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = dataclasses.replace(
+                make_config(Path(temporary)),
+                target_end=dt.date(2026, 8, 28),
+            )
+            logger = logging.getLogger(f"watcher-command-poll-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            watcher.cgv.fetch_date = lambda _date: {"data": []}
+            poll_during_scan = Mock()
+            watcher._maybe_sync_subscribers = poll_during_scan
+
+            watcher.run_cycle()
+
+            self.assertEqual(poll_during_scan.call_count, 3)
+
+    def test_telegram_command_poll_interval_is_independent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = dataclasses.replace(
+                make_config(Path(temporary)),
+                subscriptions_enabled=True,
+                telegram_command_poll_seconds=2,
+            )
+            logger = logging.getLogger(f"watcher-command-interval-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            polls = []
+            watcher.telegram.get_updates = lambda **_kwargs: polls.append(True) or []
+
+            with patch("watcher.time.monotonic", side_effect=[100, 101, 102, 102]):
+                watcher.sync_subscribers()
+                watcher._maybe_sync_subscribers()
+                watcher._maybe_sync_subscribers()
+
+            self.assertEqual(len(polls), 2)
 
     def test_successful_send_is_persisted_and_not_repeated(self):
         with tempfile.TemporaryDirectory() as temporary:
