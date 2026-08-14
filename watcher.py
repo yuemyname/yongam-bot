@@ -3175,11 +3175,15 @@ class Watcher:
         errors: dict[dt.date, str] = {}
 
         self.logger.info(
-            "조회 시작: %s 모드, %d일 (%s~%s)",
+            # The frontier is logged here rather than only when it advances:
+            # in steady state it never moves, so it was invisible exactly when
+            # someone wants to know how far booking currently reaches.
+            "조회 시작: %s 모드, %d일 (%s~%s), 예매 열린 마지막 날 %s",
             "전체" if plan.full_scan else "커서",
             len(dates),
             min(dates).isoformat() if dates else "-",
             max(dates).isoformat() if dates else "-",
+            frontier.isoformat() if (frontier := self.state.frontier_date) else "미관측",
         )
         if not plan.full_scan and plan.open_end is not None:
             probe_dates = [date for date in dates if date > plan.open_end]
