@@ -41,6 +41,8 @@ DEFAULT_SITE_NAME = "용산아이파크몰"
 UNCLASSIFIED_ALERT_MIN_SEATS = 7
 STATE_VERSION = 10
 TELEGRAM_BROADCAST_WORKERS = 4
+# Printed once per cycle so a long log can be read cycle by cycle.
+CYCLE_SEPARATOR = "─" * 60
 # Telegram descriptions that mean the chat is permanently unreachable.
 UNRECOVERABLE_CHAT_MARKERS = (
     "bot was blocked",
@@ -3174,6 +3176,9 @@ class Watcher:
                 tally.dirty = True
         errors: dict[dt.date, str] = {}
 
+        # Cycles run back to back, so without a separator the log reads as one
+        # unbroken stream and it is hard to tell where a cycle began.
+        self.logger.info(CYCLE_SEPARATOR)
         self.logger.info(
             # The frontier is logged here rather than only when it advances:
             # in steady state it never moves, so it was invisible exactly when
