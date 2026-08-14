@@ -39,8 +39,19 @@ DEFAULT_BOOKING_URL = "https://cgv.co.kr/cnm/movieBook/movie"
 DEFAULT_SEAT_PAGE_URL = "https://cgv.co.kr/cnm/selectVisitorCnt"
 DEFAULT_SITE_NAME = "용산아이파크몰"
 UNCLASSIFIED_ALERT_MIN_SEATS = 7
-STATE_VERSION = 9
+STATE_VERSION = 10
 TELEGRAM_BROADCAST_WORKERS = 4
+# Telegram descriptions that mean the chat is permanently unreachable.
+UNRECOVERABLE_CHAT_MARKERS = (
+    "bot was blocked",
+    "user is deactivated",
+    "bot was kicked",
+    "chat not found",
+    "peer_id_invalid",
+    "bot can't initiate conversation",
+)
+# A queued retry that never succeeds is dropped rather than kept forever.
+PENDING_DELIVERY_TTL_HOURS = 24
 
 # Scanning strategy.  "full" requests every date in the window each cycle.
 # "cursor" requests only the already-open range plus a short probe past the
@@ -153,6 +164,34 @@ class FetchError(RuntimeError):
 
 class TelegramError(RuntimeError):
     """A safe-to-display Telegram API error."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        description: str = "",
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.description = description
+
+    @property
+    def recipient_gone(self) -> bool:
+        """Whether this chat can never receive a message again.
+
+        Telegram answers 403 for a chat the bot was blocked by, kicked from,
+        or whose owner deleted their account, and 400 "chat not found" once the
+        chat itself is gone.  Retrying any of those is wasted forever, unlike a
+        timeout or a 5xx, so they are the cases worth telling apart.
+        """
+
+        text = self.description.lower()
+        if self.status_code == 403:
+            return True
+        if any(marker in text for marker in UNRECOVERABLE_CHAT_MARKERS):
+            return True
+        return False
 
 
 def _parse_bool(value: str, *, name: str) -> bool:
@@ -267,6 +306,7 @@ class Config:
     scan_mode: str
     booking_close_margin_minutes: int
     deferred_recheck_cycles: int
+    pending_delivery_max_attempts: int
     cursor_probe_days: int
     cursor_expansion_days: int
     full_scan_every_cycles: int
@@ -439,6 +479,12 @@ class Config:
                 name="DEFERRED_RECHECK_CYCLES",
                 minimum=1,
                 maximum=60,
+            ),
+            pending_delivery_max_attempts=_parse_int(
+                value("PENDING_DELIVERY_MAX_ATTEMPTS", "30"),
+                name="PENDING_DELIVERY_MAX_ATTEMPTS",
+                minimum=1,
+                maximum=500,
             ),
             cursor_probe_days=_parse_int(
                 value("CURSOR_PROBE_DAYS", "3"),
@@ -1115,7 +1161,11 @@ class TelegramClient:
             except Exception:
                 pass
             suffix = f" - {detail}" if detail else ""
-            raise TelegramError(f"Telegram 응답 오류: HTTP {exc.code}{suffix}") from exc
+            raise TelegramError(
+                f"Telegram 응답 오류: HTTP {exc.code}{suffix}",
+                status_code=exc.code,
+                description=detail,
+            ) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             reason = str(getattr(exc, "reason", None) or exc)
             reason = reason.replace(self.bot_token, "[숨김]")
@@ -1127,7 +1177,9 @@ class TelegramClient:
             raise TelegramError("Telegram 응답을 해석할 수 없습니다.") from exc
         if not parsed.get("ok"):
             description = str(parsed.get("description", "알 수 없는 오류"))[:180]
-            raise TelegramError(f"Telegram 전송 실패: {description}")
+            raise TelegramError(
+                f"Telegram 전송 실패: {description}", description=description
+            )
 
     def get_updates(self, *, offset: int) -> list[Mapping[str, Any]]:
         endpoint = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
@@ -1424,8 +1476,74 @@ class StateStore:
                 "text": text,
                 "category": category,
                 "queued_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "attempts": 0,
             }
             return True
+
+    def drop_pending_for_chat(self, chat_id: str) -> int:
+        """Discard every queued retry aimed at one chat."""
+
+        target = str(chat_id)
+        with self._lock:
+            bucket = self.data.setdefault("pending_deliveries", {})
+            keys = [
+                key
+                for key, record in bucket.items()
+                if isinstance(record, Mapping) and record.get("chat_id") == target
+            ]
+            for key in keys:
+                bucket.pop(key, None)
+            return len(keys)
+
+    def note_delivery_attempt(self, key: str, max_attempts: int) -> bool:
+        """Count a failed retry; returns True once the entry is given up on."""
+
+        with self._lock:
+            bucket = self.data.setdefault("pending_deliveries", {})
+            record = bucket.get(key)
+            if not isinstance(record, Mapping):
+                return False
+            attempts = int(record.get("attempts", 0)) + 1
+            if attempts >= max_attempts:
+                bucket.pop(key, None)
+                return True
+            updated = dict(record)
+            updated["attempts"] = attempts
+            bucket[key] = updated
+            return False
+
+    def prune_pending_deliveries(self, now: dt.datetime) -> int:
+        """Drop queued retries older than the TTL, whatever their attempt count.
+
+        Attempts only tick when a retry actually runs, so a stalled watcher
+        could otherwise hold a queue entry indefinitely.
+        """
+
+        cutoff = now - dt.timedelta(hours=PENDING_DELIVERY_TTL_HOURS)
+        removed = 0
+        with self._lock:
+            bucket = self.data.setdefault("pending_deliveries", {})
+            for key in list(bucket):
+                record = bucket.get(key)
+                queued_at = None
+                if isinstance(record, Mapping):
+                    try:
+                        queued_at = dt.datetime.fromisoformat(
+                            str(record.get("queued_at", ""))
+                        )
+                    except ValueError:
+                        queued_at = None
+                if queued_at is None:
+                    # Unreadable timestamp: drop it rather than keep it forever.
+                    bucket.pop(key, None)
+                    removed += 1
+                    continue
+                if queued_at.tzinfo is None:
+                    queued_at = queued_at.replace(tzinfo=dt.timezone.utc)
+                if queued_at < cutoff:
+                    bucket.pop(key, None)
+                    removed += 1
+        return removed
 
     def note_schedule_failure(self, show_date: dt.date) -> bool:
         """Persist a failed or skipped date so the next cycle prioritizes it."""
@@ -2139,10 +2257,15 @@ class Watcher:
         for chat_id, error in results:
             if error is not None:
                 failed += 1
-                self.state.queue_pending_delivery(chat_id, text, category)
-                self.logger.error(
-                    "구독자 Telegram 전송 실패(다음 주기 재시도): %s", error
-                )
+                if error.recipient_gone:
+                    # Blocked or deleted chats never recover, and they cannot
+                    # send /stop to remove themselves, so drop them here.
+                    self._drop_unreachable_subscriber(chat_id, error)
+                else:
+                    self.state.queue_pending_delivery(chat_id, text, category)
+                    self.logger.error(
+                        "구독자 Telegram 전송 실패(다음 주기 재시도): %s", error
+                    )
             else:
                 delivered += 1
         if not subscriber_ids:
@@ -2155,6 +2278,21 @@ class Watcher:
                     "등록된 Telegram 구독자가 없어 알림을 전송하지 않습니다."
                 )
         return delivered, failed, len(subscriber_ids)
+
+    def _drop_unreachable_subscriber(
+        self, chat_id: str, error: TelegramError
+    ) -> None:
+        """Unsubscribe a chat Telegram says can never be messaged again."""
+
+        removed = self.state.remove_subscriber(chat_id)
+        self.state.drop_pending_for_chat(chat_id)
+        if removed:
+            self.logger.warning(
+                "구독 해지: chat_id=%s 에 더 이상 보낼 수 없어 목록에서 제거했습니다. (%s)",
+                chat_id,
+                error,
+            )
+        self.state.save()
 
     def _retry_pending_deliveries(
         self,
@@ -2200,7 +2338,22 @@ class Watcher:
 
         for key, chat_id, error in results:
             if error is not None:
-                self.logger.warning("Telegram 알림 재전송 실패: %s", error)
+                if error.recipient_gone:
+                    self._drop_unreachable_subscriber(chat_id, error)
+                    changed = True
+                    continue
+                if self.state.note_delivery_attempt(
+                    key, self.config.pending_delivery_max_attempts
+                ):
+                    changed = True
+                    self.logger.warning(
+                        "Telegram 알림 재전송을 %d회 실패해 포기합니다: chat_id=%s",
+                        self.config.pending_delivery_max_attempts,
+                        chat_id,
+                    )
+                else:
+                    changed = True
+                    self.logger.warning("Telegram 알림 재전송 실패: %s", error)
                 continue
             changed = self.state.remove_pending_delivery(key) or changed
             self.logger.info("Telegram 미수신 알림 재전송 성공: chat_id=%s", chat_id)
@@ -3020,6 +3173,17 @@ class Watcher:
                 "지난 상영일 상태 기록 %d개를 정리했습니다.", pruned_records
             )
             tally.dirty = True
+        if not self.dry_run:
+            stale_retries = self.state.prune_pending_deliveries(
+                self.config.local_now()
+            )
+            if stale_retries:
+                self.logger.info(
+                    "재전송 대기 %d건이 %d시간을 넘겨 정리했습니다.",
+                    stale_retries,
+                    PENDING_DELIVERY_TTL_HOURS,
+                )
+                tally.dirty = True
         errors: dict[dt.date, str] = {}
 
         self.logger.info(

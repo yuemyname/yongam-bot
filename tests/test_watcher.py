@@ -29,6 +29,7 @@ from watcher import (
     FetchError,
     SeatSnapshot,
     StateStore,
+    PENDING_DELIVERY_TTL_HOURS,
     TelegramError,
     TimezoneFormatter,
     Watcher,
@@ -2038,6 +2039,137 @@ class WatcherIntegrationTests(unittest.TestCase):
             # It still owes the subscriber a booking-open alert, so the
             # backoff must not apply to it.
             self.assertEqual(per_cycle, [1, 1, 1, 1])
+
+    def _watcher_with_failing_subscriber(self, temporary, name, error, **overrides):
+        settings = {
+            "dynamic_date_window": True,
+            "target_window_days": 1,
+            **overrides,
+        }
+        config = dataclasses.replace(make_config(Path(temporary)), **settings)
+        logger = logging.getLogger(f"delivery-{name}-{id(self)}")
+        logger.handlers = [logging.NullHandler()]
+        watcher = Watcher(config, logger=logger)
+        watcher.state.add_subscriber("999", chat_type="private")
+        remaining = {"count": 100}
+
+        def send(text, chat_id=None, **_kwargs):
+            if str(chat_id) == "999":
+                raise error
+
+        watcher.telegram.send_message = send
+        watcher.cgv.fetch_date = lambda show_date: {
+            "data": [
+                {
+                    "scnsNm": "IMAX관",
+                    "scnYmd": show_date.strftime("%Y%m%d"),
+                    "scnsrtTm": "2200",
+                    "scnsNo": "13",
+                    "scnSseq": "4",
+                    "frSeatCnt": remaining["count"],
+                    "stcnt": 624,
+                }
+            ]
+        }
+        watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
+            total=session.remaining_seats,
+            usable=session.remaining_seats - 2,
+            mapped_total=session.remaining_seats,
+            available_rows=("B",),
+        )
+        return watcher, remaining
+
+    def test_a_blocked_chat_is_unsubscribed_rather_than_retried(self):
+        blocked = TelegramError(
+            "Telegram 응답 오류: HTTP 403",
+            status_code=403,
+            description="Forbidden: bot was blocked by the user",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher, remaining = self._watcher_with_failing_subscriber(
+                temporary, "blocked", blocked
+            )
+
+            for index in range(3):
+                remaining["count"] = 100 - index
+                watcher.run_cycle()
+
+            # A blocked chat cannot send /stop, so nothing else would ever
+            # remove it and every future broadcast would keep paying for it.
+            self.assertFalse(watcher.state.is_subscribed("999"))
+            self.assertEqual(watcher.state.data["pending_deliveries"], {})
+
+    def test_a_transient_failure_is_still_queued_for_retry(self):
+        transient = TelegramError(
+            "Telegram 응답 오류: HTTP 500",
+            status_code=500,
+            description="Internal Server Error",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher, remaining = self._watcher_with_failing_subscriber(
+                temporary, "transient", transient
+            )
+            remaining["count"] = 99
+            watcher.run_cycle()
+
+            self.assertTrue(watcher.state.is_subscribed("999"))
+            self.assertEqual(len(watcher.state.data["pending_deliveries"]), 1)
+
+    def test_a_retry_that_never_succeeds_is_given_up_on(self):
+        transient = TelegramError(
+            "Telegram 응답 오류: HTTP 500",
+            status_code=500,
+            description="Internal Server Error",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher, remaining = self._watcher_with_failing_subscriber(
+                temporary, "giveup", transient, pending_delivery_max_attempts=3
+            )
+            for index in range(3):
+                remaining["count"] = 100 - index
+                watcher.run_cycle()
+            peak = len(watcher.state.data["pending_deliveries"])
+
+            # No new alerts from here, so the queue has to drain instead of
+            # being retried forever.
+            for _ in range(5):
+                watcher.run_cycle()
+
+            self.assertGreater(peak, 0)
+            self.assertEqual(watcher.state.data["pending_deliveries"], {})
+
+    def test_queued_retries_expire_after_the_ttl(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = StateStore(Path(temporary) / "notified.json")
+            now = dt.datetime(2026, 8, 13, 9, 0, tzinfo=dt.timezone.utc)
+            store.queue_pending_delivery("1", "오래된 알림", ALERT_SEATS)
+            key = next(iter(store.data["pending_deliveries"]))
+            store.data["pending_deliveries"][key]["queued_at"] = (
+                now - dt.timedelta(hours=PENDING_DELIVERY_TTL_HOURS + 1)
+            ).isoformat()
+            store.queue_pending_delivery("1", "최근 알림", ALERT_SEATS)
+
+            removed = store.prune_pending_deliveries(now)
+
+            self.assertEqual(removed, 1)
+            self.assertEqual(len(store.data["pending_deliveries"]), 1)
+
+    def test_recipient_gone_recognises_permanent_telegram_errors(self):
+        gone = [
+            TelegramError("x", status_code=403, description="Forbidden: bot was blocked by the user"),
+            TelegramError("x", status_code=403, description="Forbidden: user is deactivated"),
+            TelegramError("x", description="Bad Request: chat not found"),
+            TelegramError("x", description="Forbidden: bot was kicked from the group chat"),
+        ]
+        transient = [
+            TelegramError("x", status_code=500, description="Internal Server Error"),
+            TelegramError("x", status_code=429, description="Too Many Requests"),
+            TelegramError("Telegram 연결 실패: timed out"),
+        ]
+        for error in gone:
+            self.assertTrue(error.recipient_gone, error.description)
+        for error in transient:
+            self.assertFalse(error.recipient_gone, error.description)
 
     def test_fetch_error_alert_reaches_every_alert_mode(self):
         with tempfile.TemporaryDirectory() as temporary:

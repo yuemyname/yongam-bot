@@ -86,12 +86,33 @@ Mac이 잠자기 상태이거나 덮개가 닫혀 있으면 감시가 중단될 
 | `STRICT_IMAX_MATCH` | `true` | IMAX 이름 또는 코드가 있는 회차만 감지 |
 | `BOOKING_CLOSE_MARGIN_MINUTES` | `0` | 상영 시작 몇 분 전부터 예매 마감으로 볼지 |
 | `DEFERRED_RECHECK_CYCLES` | `5` | 보류된 회차를 몇 주기마다 다시 조회할지 |
+| `PENDING_DELIVERY_MAX_ATTEMPTS` | `30` | 전송 실패 재시도를 몇 번까지 할지 |
 | `SCAN_MODE` | `cursor` | 신규 오픈 후보를 먼저 보는 조회 방식 (`full`로 전체 조회 가능) |
 | `CURSOR_PROBE_DAYS` | `3` | `cursor` 모드에서 프론티어 뒤로 더 볼 일수 |
 | `CURSOR_EXPANSION_DAYS` | `21` | 신규 오픈 감지 시 한 번에 확장 조회할 일수 |
 | `FULL_SCAN_EVERY_CYCLES` | `10` | `cursor` 모드에서도 전체를 조회하는 주기 |
 
 `DEFERRED_RECHECK_CYCLES`는 이미 예매 오픈 알림을 보낸 회차의 좌석 상세 판별이 실패했을 때만 적용됩니다. 아직 한 번도 알리지 않은 신규 회차는 오픈 알림을 놓치지 않도록 매 주기 다시 확인하고, 잔여 좌석 수가 바뀐 경우에도 설정된 대기 횟수와 관계없이 즉시 다시 확인합니다.
+
+## 전송 실패 처리
+
+Telegram 전송이 실패하면 원인에 따라 다르게 처리합니다.
+
+| 응답 | 처리 |
+|---|---|
+| `403 bot was blocked by the user` | **구독 목록에서 즉시 제거**, 대기 중인 재전송도 함께 삭제 |
+| `403 user is deactivated` / `bot was kicked` | 동일 |
+| `chat not found` | 동일 |
+| `429`, `5xx`, 연결 실패 등 | 그 사람에게만 다음 주기에 재전송 |
+
+봇을 차단한 사람은 `/stop`을 보낼 수 없어 스스로 해지할 수 없습니다. 이 경우를 구분하지 않으면 재전송 대기열이 계속 쌓이고 매 주기 헛된 요청이 늘어나므로, 영구 실패는 재시도 없이 구독을 정리합니다.
+
+일시적 실패는 `PENDING_DELIVERY_MAX_ATTEMPTS`회까지 재시도한 뒤 포기합니다. 감시기가 오래 멈춰 있어 시도 횟수가 늘지 않는 경우를 대비해, 대기열에 들어간 지 24시간이 지난 항목은 횟수와 관계없이 정리합니다.
+
+```text
+INFO 구독 해지: chat_id=... 에 더 이상 보낼 수 없어 목록에서 제거했습니다.
+INFO 재전송 대기 3건이 24시간을 넘겨 정리했습니다.
+```
 
 ## 조회 범위 — full과 cursor
 
