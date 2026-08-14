@@ -2706,15 +2706,15 @@ class Watcher:
         errors: dict[dt.date, str],
         tally: "_CycleTally",
     ) -> None:
-        """Sweep schedules first while alerting newly opened sessions immediately.
+        """Finish each date completely before moving to the next.
 
-        Probe dates just beyond the booking frontier are requested first. New
-        sessions are classified and announced as soon as their date is read;
-        existing sessions' cancellation-ticket details wait until every date
-        in this batch has been checked so they cannot delay open discovery.
+        Probe dates just beyond the booking frontier are still requested first,
+        so a new opening is discovered before anything else runs. After that,
+        each date is closed out where it is read — schedule, seat detail, alert,
+        save — because a cancellation ticket is worth little by the time the
+        rest of the window has been swept.
         """
 
-        existing_batches: list[list[BookingSession]] = []
         for index, show_date in enumerate(dates):
             if tally.rate_limited:
                 skipped_dates = dates[index:]
@@ -2811,19 +2811,7 @@ class Watcher:
                     # tickets, both for priority and crash-safe de-duplication.
                     self._flush_state(tally)
                 if existing_sessions:
-                    # Existing seat changes are secondary to discovering a new
-                    # showing on every remaining date. Process them only after
-                    # the schedule sweep has finished.
-                    existing_batches.append(existing_sessions)
-            self._flush_state(tally)
-
-        # A schedule-side 429 means CGV asked us to stop. Keep every saved seat
-        # snapshot unchanged so the next cycle sees the same changes and tries
-        # them again instead of spending more requests during the cooldown.
-        if tally.rate_limited:
-            return
-        for existing_sessions in existing_batches:
-            self._alert_for_sessions(existing_sessions, tally)
+                    self._alert_for_sessions(existing_sessions, tally)
             self._flush_state(tally)
 
     def _alert_for_sessions(

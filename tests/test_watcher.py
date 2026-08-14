@@ -1751,7 +1751,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertIn("예매 오픈 감지", sent[0])
             self.assertIn("잔여 좌석 변경", sent[1])
 
-    def test_all_dates_are_checked_before_existing_seat_details(self):
+    def test_seat_detail_runs_before_the_next_date_is_requested(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = dataclasses.replace(
                 make_config(Path(temporary)),
@@ -1821,10 +1821,44 @@ class WatcherIntegrationTests(unittest.TestCase):
 
             watcher.run_cycle()
 
+            # A cancellation ticket is worth little by the time the rest of
+            # the window has been swept, so each date closes out where it is
+            # read rather than queueing its seat detail for the end.
             self.assertLess(
-                events.index("schedule:2026-08-27"),
                 events.index("seats:2026-08-26"),
+                events.index("schedule:2026-08-27"),
             )
+
+    def test_probe_dates_are_still_requested_before_anything_else(self):
+        today = dt.date(2026, 8, 13)
+        with tempfile.TemporaryDirectory() as temporary:
+            config = dataclasses.replace(
+                make_config(Path(temporary)),
+                dynamic_date_window=True,
+                target_window_days=28,
+                scan_mode=SCAN_MODE_CURSOR,
+            )
+            logger = logging.getLogger(f"watcher-probe-first-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            with patch.object(Config, "local_now", return_value=_kst(today)):
+                watcher = Watcher(config, logger=logger)
+                watcher.state.advance_frontier(dt.date(2026, 8, 20))
+                watcher._cycle_index = 1
+                requested = []
+                watcher.cgv.fetch_date = lambda show_date: (
+                    requested.append(show_date), {"data": []}
+                )[1]
+                watcher.telegram.send_message = lambda text, **_kwargs: None
+
+                watcher.run_cycle()
+
+            # Seat detail moved inline, but discovering a new opening still
+            # comes first: the three probe dates lead the cycle.
+            self.assertEqual(
+                requested[:3],
+                [dt.date(2026, 8, 21), dt.date(2026, 8, 22), dt.date(2026, 8, 23)],
+            )
+            self.assertEqual(requested[3], today)
 
     def test_state_is_saved_as_each_date_finishes(self):
         with tempfile.TemporaryDirectory() as temporary:
