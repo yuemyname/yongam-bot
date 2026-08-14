@@ -2288,18 +2288,18 @@ class Watcher:
                 else:
                     self.state.queue_pending_delivery(chat_id, text, category)
                     self.logger.error(
-                        "구독자 Telegram 전송 실패(다음 주기 재시도): %s", error
+                        "전송 실패(다음 주기 재시도): %s", error
                     )
             else:
                 delivered += 1
         if not subscriber_ids:
             if self.state.subscriber_ids():
                 self.logger.info(
-                    "'%s' 알림을 받는 구독자가 없어 전송을 생략합니다.", category
+                    "전송 생략: '%s' 알림을 받는 구독자가 없습니다.", category
                 )
             else:
                 self.logger.warning(
-                    "등록된 Telegram 구독자가 없어 알림을 전송하지 않습니다."
+                    "전송 생략: 등록된 구독자가 없습니다."
                 )
         return delivered, failed, len(subscriber_ids)
 
@@ -2371,16 +2371,16 @@ class Watcher:
                 ):
                     changed = True
                     self.logger.warning(
-                        "Telegram 알림 재전송을 %d회 실패해 포기합니다: chat_id=%s",
+                        "재전송 %d회 실패해 포기: chat_id=%s",
                         self.config.pending_delivery_max_attempts,
                         chat_id,
                     )
                 else:
                     changed = True
-                    self.logger.warning("Telegram 알림 재전송 실패: %s", error)
+                    self.logger.warning("재전송 실패: %s", error)
                 continue
             changed = self.state.remove_pending_delivery(key) or changed
-            self.logger.info("Telegram 미수신 알림 재전송 성공: chat_id=%s", chat_id)
+            self.logger.info("재전송 성공: chat_id=%s", chat_id)
         if changed:
             self.state.save()
 
@@ -2810,7 +2810,7 @@ class Watcher:
                     {},
                 )
                 self.logger.info(
-                    "알림 제외: %s 상영이 시작돼 예매가 마감된 회차 %d개",
+                    "제외: %s 상영이 시작돼 예매가 마감된 회차 %d개",
                     show_date.isoformat(),
                     len(closed_sessions),
                 )
@@ -3029,19 +3029,19 @@ class Watcher:
         for session in suppressed_new_sessions:
             snapshot = snapshots[session_keys[session]]
             self.logger.info(
-                "알림 제외: %s %s",
+                "제외: %s %s",
                 _session_line(session),
                 snapshot.suppression_reason,
             )
 
         if sold_out_new_sessions:
             self.logger.info(
-                "알림 제외: 잔여 0석인 신규 회차 %d개",
+                "제외: 잔여 0석인 신규 회차 %d개",
                 len(sold_out_new_sessions),
             )
         if deferred_new_sessions:
             self.logger.info(
-                "알림 보류: A열 여부 판별 실패 후 잔여 6석 이하인 신규 회차 %d개",
+                "보류: A열 여부 판별 실패 후 잔여 6석 이하인 신규 회차 %d개",
                 len(deferred_new_sessions),
             )
 
@@ -3066,7 +3066,7 @@ class Watcher:
                         tally.dirty = True
                     tally.new_sessions += len(chunk_sessions)
                     self.logger.info(
-                        "Telegram 신규 회차 알림 %d개 전송: 성공 %d명, 실패 %d명",
+                        "전송: 신규 회차 알림 %d개, 성공 %d명, 실패 %d명",
                         len(chunk_sessions),
                         delivered,
                         failed,
@@ -3091,7 +3091,7 @@ class Watcher:
                 verdicts[key] = "제외·매진"
                 tally.suppressed_sold_out += 1
                 self.logger.info(
-                    "좌석 변경 알림 제외: %s 잔여 좌석이 0석입니다.",
+                    "제외: %s 잔여 좌석이 0석입니다.",
                     _session_line(session),
                 )
                 if not self.dry_run:
@@ -3103,7 +3103,7 @@ class Watcher:
                 verdicts[key] = "제외·A열만"
                 tally.suppressed_row_a_only += 1
                 self.logger.info(
-                    "좌석 변경 알림 제외: %s %s",
+                    "제외: %s %s",
                     _session_line(session),
                     current.suppression_reason,
                 )
@@ -3116,7 +3116,7 @@ class Watcher:
                 verdicts[key] = "보류·A열 여부 미확인"
                 tally.deferred_keys.add(key)
                 self.logger.info(
-                    "좌석 변경 알림 보류: %s A열 여부 판별 실패 후 잔여 6석 이하입니다.",
+                    "보류: %s A열 여부 판별 실패 후 잔여 6석 이하입니다.",
                     _session_line(session),
                 )
                 continue
@@ -3160,7 +3160,7 @@ class Watcher:
                 verdicts[key] = f"발송·좌석 변경 {previous.total}→{current.total}"
                 tally.dirty = True
                 self.logger.info(
-                    "Telegram 좌석 변경 알림 전송: %s (%d석 -> %d석), "
+                    "전송: 좌석 변경 %s (%d석 -> %d석), "
                     "성공 %d명, 실패 %d명",
                     _session_line(session),
                     previous.total,
