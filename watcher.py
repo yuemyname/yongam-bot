@@ -2119,18 +2119,40 @@ class Watcher:
             probe_end=probe_end,
         )
 
-    def _expansion_dates(self, plan: ScanPlan) -> list[dt.date]:
-        if plan.open_end is None or plan.window_end is None or not plan.dates:
+    def _walk_new_range(
+        self,
+        plan: ScanPlan,
+        probe_dates: Sequence[dt.date],
+        errors: dict[dt.date, str],
+        tally: "_CycleTally",
+    ) -> list[dt.date]:
+        """Follow a newly opened range forward until a date has no showings.
+
+        Booking opens as a contiguous block, so the first empty date past the
+        probe marks where it ends. Walking one day at a time costs a couple of
+        requests for a short opening instead of sweeping three weeks of empty
+        dates, and it returns to today's cancellation tickets that much sooner.
+
+        The empty date is still requested — that request is how the end is
+        recognised — so the walk always overshoots by exactly one day.
+        """
+
+        if plan.window_end is None or not probe_dates:
             return []
-        expansion_end = min(
-            plan.open_end + dt.timedelta(days=self.config.cursor_expansion_days),
-            plan.window_end,
-        )
-        start = (plan.probe_end or max(plan.dates)) + dt.timedelta(days=1)
-        return [
-            start + dt.timedelta(days=offset)
-            for offset in range((expansion_end - start).days + 1)
-        ]
+        walked: list[dt.date] = []
+        cursor = max(probe_dates) + dt.timedelta(days=1)
+        # Purely a backstop; the empty date normally ends the walk first.
+        limit = self.config.cursor_expansion_days
+        while cursor <= plan.window_end and len(walked) < limit:
+            if tally.rate_limited:
+                break
+            seen_before = tally.latest_session_date
+            self._scan_and_alert([cursor], errors, tally)
+            walked.append(cursor)
+            if tally.latest_session_date == seen_before:
+                break
+            cursor += dt.timedelta(days=1)
+        return walked
 
     def _fetch_schedules(
         self,
@@ -3198,20 +3220,14 @@ class Watcher:
             # Expand immediately after a probe hit, before spending any time on
             # cancellation-ticket changes in the already-open range.
             if not tally.rate_limited and plan.probe_hit(tally.latest_session_date):
-                already_requested = set(probe_dates)
-                expansion = [
-                    date
-                    for date in self._expansion_dates(plan)
-                    if date not in already_requested
-                ]
-                if expansion:
+                walked = self._walk_new_range(plan, probe_dates, errors, tally)
+                if walked:
                     self.logger.info(
-                        "예매 오픈 감지: %s까지 확장 조회합니다(%d일).",
-                        expansion[-1].isoformat(),
-                        len(expansion),
+                        "예매 오픈 감지: %s까지 이어서 조회했습니다(%d일).",
+                        walked[-1].isoformat(),
+                        len(walked),
                     )
-                    self._scan_and_alert(expansion, errors, tally)
-                    dates.extend(expansion)
+                    dates.extend(walked)
             # Calling this even after a 429 lets _scan_and_alert account for
             # every known-open date skipped by the rate-limit stop.
             self._scan_and_alert(open_dates, errors, tally)

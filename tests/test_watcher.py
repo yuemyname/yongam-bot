@@ -626,10 +626,6 @@ class ScanPlanTests(unittest.TestCase):
                     dt.date(2026, 9, 1),
                 ),
             )
-            # A far-away retry must not move the ordinary expansion start.
-            self.assertEqual(
-                watcher._expansion_dates(plan)[0], dt.date(2026, 8, 24)
-            )
 
     def test_probe_stays_anchored_to_today_when_the_frontier_has_passed(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -668,18 +664,6 @@ class ScanPlanTests(unittest.TestCase):
                     full_scan_cycles.append(index)
 
             self.assertEqual(full_scan_cycles, [0, 10, 20])
-
-    def test_expansion_covers_the_rest_of_the_configured_reach(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            watcher = self._watcher(temporary, cursor_expansion_days=21)
-            watcher.state.advance_frontier(dt.date(2026, 8, 20))
-            watcher._cycle_index = 1
-
-            expansion = watcher._expansion_dates(watcher._plan_scan(self.TODAY))
-
-            # Probe ended at 08-23; expansion continues to 08-20 + 21 days.
-            self.assertEqual(expansion[0], dt.date(2026, 8, 24))
-            self.assertEqual(expansion[-1], dt.date(2026, 9, 9))
 
     def test_frontier_only_moves_forward(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1859,6 +1843,110 @@ class WatcherIntegrationTests(unittest.TestCase):
                 [dt.date(2026, 8, 21), dt.date(2026, 8, 22), dt.date(2026, 8, 23)],
             )
             self.assertEqual(requested[3], today)
+
+    def _cursor_walk_watcher(self, temporary, name, open_through):
+        config = dataclasses.replace(
+            make_config(Path(temporary)),
+            dynamic_date_window=True,
+            target_window_days=28,
+            scan_mode=SCAN_MODE_CURSOR,
+        )
+        logger = logging.getLogger(f"walk-{name}-{id(self)}")
+        logger.handlers = [logging.NullHandler()]
+        watcher = Watcher(config, logger=logger)
+        watcher.telegram.send_message = lambda text, **_kwargs: None
+        watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
+            total=600, usable=598, mapped_total=600, available_rows=("B",)
+        )
+        live = {open_through["start"] + dt.timedelta(days=i) for i in range(12)}
+        open_through["live"] = live
+        requested = []
+
+        def fetch(show_date):
+            requested.append(show_date)
+            if show_date not in live:
+                return {"data": []}
+            return {
+                "data": [
+                    {
+                        "scnsNm": "IMAX관",
+                        "scnYmd": show_date.strftime("%Y%m%d"),
+                        "scnsrtTm": "2200",
+                        "scnsNo": "13",
+                        "scnSseq": "4",
+                        "frSeatCnt": 600,
+                        "stcnt": 624,
+                    }
+                ]
+            }
+
+        watcher.cgv.fetch_date = fetch
+        return watcher, requested
+
+    def test_a_new_opening_is_followed_only_to_its_last_date(self):
+        today = dt.date(2026, 8, 14)
+        frontier = dt.date(2026, 8, 25)
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(Config, "local_now", return_value=_kst(today)):
+                state = {"start": today}
+                watcher, requested = self._cursor_walk_watcher(
+                    temporary, "short", state
+                )
+                watcher.run_cycle()
+                requested.clear()
+
+                # Only four new dates open; the range ends at 8/29.
+                for offset in range(4):
+                    state["live"].add(dt.date(2026, 8, 26) + dt.timedelta(days=offset))
+                result = watcher.run_cycle()
+
+                ahead = [date for date in requested if date > frontier]
+                # 8/26..8/29 have showings, 8/30 is the empty date that ends
+                # the walk. Nothing beyond it is requested.
+                self.assertEqual(ahead[-1], dt.date(2026, 8, 30))
+                self.assertEqual(len(ahead), 5)
+                self.assertEqual(result.new_sessions, 4)
+                self.assertEqual(
+                    watcher.state.frontier_date, dt.date(2026, 8, 29)
+                )
+
+    def test_no_opening_costs_only_the_probe(self):
+        today = dt.date(2026, 8, 14)
+        frontier = dt.date(2026, 8, 25)
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(Config, "local_now", return_value=_kst(today)):
+                state = {"start": today}
+                watcher, requested = self._cursor_walk_watcher(
+                    temporary, "quiet", state
+                )
+                watcher.run_cycle()
+                requested.clear()
+
+                watcher.run_cycle()
+
+                ahead = [date for date in requested if date > frontier]
+                self.assertEqual(len(ahead), 3)
+                self.assertEqual(ahead[-1], dt.date(2026, 8, 28))
+
+    def test_the_walk_returns_to_today_after_the_new_range_ends(self):
+        today = dt.date(2026, 8, 14)
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(Config, "local_now", return_value=_kst(today)):
+                state = {"start": today}
+                watcher, requested = self._cursor_walk_watcher(
+                    temporary, "back", state
+                )
+                watcher.run_cycle()
+                requested.clear()
+                for offset in range(4):
+                    state["live"].add(dt.date(2026, 8, 26) + dt.timedelta(days=offset))
+
+                watcher.run_cycle()
+
+                # Today's cancellation tickets come straight after the walk,
+                # not after a fixed three-week sweep.
+                end_of_walk = requested.index(dt.date(2026, 8, 30))
+                self.assertEqual(requested[end_of_walk + 1], today)
 
     def test_state_is_saved_as_each_date_finishes(self):
         with tempfile.TemporaryDirectory() as temporary:
