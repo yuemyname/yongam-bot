@@ -1549,10 +1549,12 @@ class WatcherIntegrationTests(unittest.TestCase):
                 batch(1, "/seats sweet", chat_id=555),
                 batch(2, "/start"),
                 batch(3, "/seats"),
-                batch(4, "/seats@YongsanBot sweet"),
+                batch(4, "/seat_sweet@YongsanBot"),
                 batch(5, "/status"),
                 batch(6, "/seats all"),
-                batch(7, "/seats nonsense"),
+                batch(7, "/seats sweet"),
+                batch(8, "/seats all"),
+                batch(9, "/seats nonsense"),
             ]
             watcher.telegram.get_updates = lambda **_kwargs: batches.pop(0)
             watcher.telegram.send_message = lambda text, **kwargs: replies.append(
@@ -1578,6 +1580,16 @@ class WatcherIntegrationTests(unittest.TestCase):
 
             watcher.sync_subscribers()
             self.assertIn("선호 좌석: 명당 좌석만", replies[-1][1])
+
+            watcher.sync_subscribers()
+            self.assertEqual(
+                watcher.state.seat_selection("111222"), SEAT_SELECTION_ALL
+            )
+
+            watcher.sync_subscribers()
+            self.assertEqual(
+                watcher.state.seat_selection("111222"), SEAT_SELECTION_SWEET
+            )
 
             watcher.sync_subscribers()
             self.assertEqual(
@@ -2833,11 +2845,17 @@ class WatcherIntegrationTests(unittest.TestCase):
 
             self.assertIn("따로 설정하지 않아도 됩니다", welcome)
             self.assertIn("기본 설정은 모든 A열 제외 좌석", welcome)
-            self.assertIn("명당 좌석만 받기: /seats sweet", welcome)
+            self.assertIn("명당 좌석만 받기: /seat_sweet", welcome)
             self.assertIn("전체 좌석으로 돌아가기: /seats all", welcome)
             self.assertIn("신규 예매 오픈은 좌석 설정과 관계없이 항상", welcome)
             # Listing every setting made a finished subscription look unfinished.
-            for command in ("/mode_all", "/mode_open", "/mode_seats", "/seat_"):
+            for command in (
+                "/mode_all",
+                "/mode_open",
+                "/mode_seats",
+                "/seat_all",
+                "/seat_verified",
+            ):
                 self.assertNotIn(command, welcome)
             self.assertLess(len(welcome.splitlines()), 12)
 
@@ -2875,14 +2893,14 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertIn("오디세이 예매 오픈", description)
             self.assertIn("오늘부터 28일", description)
             self.assertIn("A열만 남은 경우", description)
-            self.assertIn("/seats sweet", description)
+            self.assertIn("/seat_sweet", description)
             self.assertIn("Extremer: F16~29, G16~29", description)
             self.assertIn("Experienced: H13~32, I13~32", description)
             self.assertIn("SweetSpot: J11~34, K11~34, L11~34", description)
             self.assertIn("/seats all", description)
             self.assertIn("신규 예매 오픈 알림은 sweet/all과 관계없이 항상", description)
             self.assertIn("/start — 알림 구독", description)
-            self.assertIn("명당만 원하면 /seats sweet", description)
+            self.assertIn("명당만 원하면 /seat_sweet", description)
             self.assertIn("예매 바로가기 링크 열기", description)
             self.assertIn("/stop — 알림 해지", description)
 
