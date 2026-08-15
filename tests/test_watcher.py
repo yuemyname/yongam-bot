@@ -337,7 +337,7 @@ class SeatSnapshotTests(unittest.TestCase):
 
         self.assertEqual(
             _available_seat_line(snapshot),
-            "A열 제외 잔여 좌석: B열 1~3, 5 / C열 10~11",
+            "A열 제외 잔여 좌석: B1~3, 5 / C10~11",
         )
 
     def test_keeps_row_information_when_seat_number_is_missing(self):
@@ -2815,7 +2815,7 @@ class WatcherIntegrationTests(unittest.TestCase):
                 sent_messages[0],
             )
             self.assertIn(
-                "A열 제외 잔여 좌석: B열 1~100",
+                "A열 제외 잔여 좌석: B1~100",
                 sent_messages[0],
             )
             self.assertLess(
@@ -2878,7 +2878,7 @@ class WatcherIntegrationTests(unittest.TestCase):
                 "잔여좌석/총좌석: 9/200석 (이전 10/200석)", sent_messages[1]
             )
             self.assertIn(
-                "A열 제외 잔여 좌석: B열 1~7",
+                "A열 제외 잔여 좌석: B1~7",
                 sent_messages[1],
             )
             self.assertIn("📅 상영일: 2026-08-26 (수)", sent_messages[1])

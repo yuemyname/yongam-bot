@@ -1982,7 +1982,7 @@ def _available_seat_line(
     for row, number in snapshot.available_seats:
         seats_by_row.setdefault(row, []).append(number)
     details = " / ".join(
-        f"{row}열 {_compact_seat_numbers(seats_by_row.get(row, ()))}"
+        f"{row}{_compact_seat_numbers(seats_by_row.get(row, ()))}"
         for row in non_a_rows
     )
     line = f"A열 제외 잔여 좌석: {details}"
