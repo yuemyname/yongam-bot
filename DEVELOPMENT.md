@@ -19,7 +19,8 @@ mode_seats - 잔여 좌석만 받기
 seat - 좌석 알림 범위 확인·변경
 seat_all - A열 여부 미확인 알림도 받기
 seat_verified - A열 제외 좌석이 확인된 알림만 받기
-seats - 모든 좌석 또는 명당 좌석 선택
+seat_sweet - 명당 좌석 변경만 받기
+seat_default - 모든 A열 제외 좌석 받기
 desc - 봇 설명과 사용 방법
 coffee - 개발자에게 커피 후원
 help - 사용법 보기

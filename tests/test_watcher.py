@@ -4,6 +4,7 @@ import http.client
 import json
 import logging
 import os
+import re
 from pathlib import Path
 import tempfile
 import threading
@@ -3580,3 +3581,42 @@ class CgvClientTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DocumentedCommandTests(unittest.TestCase):
+    """Every command a subscriber can see must actually do something."""
+
+    REPO = Path(__file__).resolve().parent.parent
+
+    def _handled_commands(self) -> set[str]:
+        source = (self.REPO / "watcher.py").read_text(encoding="utf-8")
+        return set(re.findall(r'"(/[a-z_]+)"', source))
+
+    def test_botfather_list_only_registers_commands_that_exist(self):
+        development = (self.REPO / "DEVELOPMENT.md").read_text(encoding="utf-8")
+        block = development.split("`/setcommands`")[1].split("```")[1]
+        listed = {
+            f"/{line.split(' - ')[0].strip()}"
+            for line in block.splitlines()
+            if " - " in line
+        }
+
+        self.assertTrue(listed, "BotFather 목록을 찾지 못했습니다")
+        # A command in the menu that the bot ignores answers with the generic
+        # "unknown command" reply, which reads as the bot being broken.
+        self.assertEqual(listed - self._handled_commands(), set())
+
+    def test_readme_table_only_lists_commands_that_exist(self):
+        readme = (self.REPO / "README.md").read_text(encoding="utf-8")
+        listed = set(re.findall(r"^\| `(/[a-z_]+)` \|", readme, re.MULTILINE))
+
+        self.assertTrue(listed, "README 명령어 표를 찾지 못했습니다")
+        self.assertEqual(listed - self._handled_commands(), set())
+
+    def test_the_operator_command_stays_out_of_public_lists(self):
+        development = (self.REPO / "DEVELOPMENT.md").read_text(encoding="utf-8")
+        readme = (self.REPO / "README.md").read_text(encoding="utf-8")
+        block = development.split("`/setcommands`")[1].split("```")[1]
+
+        self.assertNotIn("stats", block)
+        self.assertNotIn("| `/stats` |", readme)
