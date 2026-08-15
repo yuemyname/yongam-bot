@@ -167,7 +167,10 @@ SEAT_SELECTION_ALIASES = {
     "sweet": SEAT_SELECTION_SWEET,
     "명당": SEAT_SELECTION_SWEET,
 }
-SEAT_SELECTION_COMMANDS = {"/seats"}
+SEAT_SELECTION_COMMAND_TARGETS = {
+    "/seat_sweet": SEAT_SELECTION_SWEET,
+}
+SEAT_SELECTION_COMMANDS = {"/seats", *SEAT_SELECTION_COMMAND_TARGETS}
 SWEET_SEAT_RANGES: dict[str, tuple[int, int]] = {
     "F": (16, 29),
     "G": (16, 29),
@@ -179,7 +182,7 @@ SWEET_SEAT_RANGES: dict[str, tuple[int, int]] = {
 }
 SEAT_SELECTION_GUIDE = (
     "받고 싶은 잔여 좌석을 고를 수 있습니다.\n"
-    "/seats sweet - 명당 좌석만 받기\n"
+    "/seat_sweet - 명당 좌석만 받기\n"
     "  F16~29 · G16~29 · H13~32 · I13~32 · J11~34 · K11~34 · L11~34\n"
     "/seats all - 모든 A열 제외 좌석 받기 (기본)\n\n"
     "신규 예매 오픈 알림은 이 설정과 관계없이 항상 전송됩니다."
@@ -2774,7 +2777,7 @@ class Watcher:
     def _handle_seat_selection_command(
         self, chat_id: str, argument: str
     ) -> tuple[str, bool]:
-        """Return the reply for /seats and whether its preference changed."""
+        """Return the seat-selection reply and whether its preference changed."""
 
         requested = SEAT_SELECTION_ALIASES.get(argument) if argument else None
         if argument and requested is None:
@@ -2872,7 +2875,7 @@ class Watcher:
                 reply += (
                     "\n\n기본 설정은 모든 A열 제외 좌석이며, "
                     "따로 설정하지 않아도 됩니다."
-                    "\n🎯 명당 좌석만 받기: /seats sweet"
+                    "\n🎯 명당 좌석만 받기: /seat_sweet"
                     "\n↩️ 전체 좌석으로 돌아가기: /seats all"
                     "\n※ 신규 예매 오픈은 좌석 설정과 관계없이 항상 알려드립니다."
                     "\n\n자세한 설명 /desc · 상태 확인 /status · 해지 /stop"
@@ -2906,7 +2909,8 @@ class Watcher:
                     reply += (
                         "\n\n알림 종류 변경: /mode"
                         "\n좌석 알림 범위 변경: /seat"
-                        "\n선호 좌석 변경: /seats"
+                        "\n명당 좌석으로 변경: /seat_sweet"
+                        "\n전체 좌석으로 변경: /seats all"
                     )
                 else:
                     reply = (
@@ -2924,8 +2928,11 @@ class Watcher:
                 )
                 state_changed = state_changed or seat_info_changed
             elif command in SEAT_SELECTION_COMMANDS:
+                seat_selection_argument = SEAT_SELECTION_COMMAND_TARGETS.get(
+                    command, argument
+                )
                 reply, seat_selection_changed = self._handle_seat_selection_command(
-                    chat_id, argument
+                    chat_id, seat_selection_argument
                 )
                 state_changed = state_changed or seat_selection_changed
             elif command in ADMIN_STATS_COMMANDS and chat_id == str(
@@ -2942,11 +2949,11 @@ class Watcher:
                     "/status - 구독 상태 확인\n"
                     "/mode - 알림 종류 선택\n"
                     "/seat - 잔여 좌석 알림 범위 선택\n"
-                    "/seats - 모든 좌석 또는 명당 좌석 선택\n"
+                    "/seat_sweet - 명당 좌석만 받기\n"
                     "/desc - 봇 설명과 사용 방법\n"
                     "/coffee - 개발자에게 커피 후원\n"
                     "/help - 사용법 보기\n\n"
-                    "/mode, /seat, /seats 는 선택 사항입니다.\n"
+                    "/mode, /seat, /seat_sweet 는 선택 사항입니다.\n"
                     "그대로 두시면 모든 알림을 받습니다."
                 )
             elif command in {"/desc", "/description"}:
@@ -2972,7 +2979,7 @@ class Watcher:
                     "• /seat_verified — A열 제외 좌석이 확인된 알림만 받기\n\n"
                     "🎯 명당 좌석 알림 선택 (선택 사항)\n"
                     "기본값은 모든 A열 제외 좌석입니다.\n"
-                    "• /seats sweet — 아래 세 구역만 좌석 변경 알림\n"
+                    "• /seat_sweet — 아래 세 구역만 좌석 변경 알림\n"
                     "  Extremer: F16~29, G16~29\n"
                     "  Experienced: H13~32, I13~32\n"
                     "  SweetSpot: J11~34, K11~34, L11~34\n"
@@ -2981,12 +2988,13 @@ class Watcher:
                     "※ 신규 예매 오픈 알림은 sweet/all과 관계없이 항상 전송\n\n"
                     "📌 사용 방법\n"
                     "1. /start — 알림 구독\n"
-                    "2. 명당만 원하면 /seats sweet (선택 사항)\n"
+                    "2. 명당만 원하면 /seat_sweet (선택 사항)\n"
                     "3. 알림이 오면 예매 바로가기 링크 열기\n"
                     "4. CGV 화면에서 IMAX 버튼 선택 후 예매\n\n"
                     "/mode — 현재 알림 종류 확인·변경\n"
                     "/seat — 잔여 좌석 알림 범위 확인·변경\n"
-                    "/seats — 선호 좌석 확인·변경\n"
+                    "/seat_sweet — 명당 좌석만 받기\n"
+                    "/seats — 현재 좌석 설정 확인·전체 좌석으로 변경\n"
                     "/status — 구독 상태 확인\n"
                     "/stop — 알림 해지\n"
                     "/coffee — 개발자에게 커피 후원\n"
