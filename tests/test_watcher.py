@@ -876,6 +876,26 @@ class MinimumSeatsTests(unittest.TestCase):
                 ("any",),
             )
 
+    def test_a_setting_saved_under_the_old_name_is_kept(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._watcher(temporary)
+            watcher.state.add_subscriber("pair")
+            # What a subscriber's record looks like from before the field was
+            # renamed. Losing it would silently widen their alerts.
+            record = dict(watcher.state.data["subscribers"]["pair"])
+            record.pop("min_seats", None)
+            record["min_cancel"] = 2
+            watcher.state.data["subscribers"]["pair"] = record
+
+            self.assertEqual(watcher.state.min_seats("pair"), 2)
+            self.assertFalse(watcher.state.set_min_seats("pair", 2))
+
+            self.assertTrue(watcher.state.set_min_seats("pair", 1))
+            self.assertNotIn(
+                "min_cancel", watcher.state.data["subscribers"]["pair"]
+            )
+            self.assertEqual(watcher.state.min_seats("pair"), 1)
+
     def test_two_seat_minimum_filters_by_how_many_are_on_sale(self):
         with tempfile.TemporaryDirectory() as temporary:
             watcher = self._watcher(temporary)
@@ -3507,7 +3527,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertIn("⚙️ 기본 설정", description)
             self.assertIn("/mode — 현재 설정과 선택 방법 확인", description)
             self.assertIn(
-                "/mode_all — 신규 오픈과 잔여 좌석 모두 받기", description
+                "/mode_all — 신규 오픈과 예매 가능 좌석 모두 받기", description
             )
             self.assertIn("/mode_open — 신규 예매 오픈만", description)
             self.assertIn("/mode_seats — 예매 가능 좌석만", description)
@@ -4253,6 +4273,53 @@ class DocumentedCommandTests(unittest.TestCase):
 
         self.assertTrue(listed, "README 명령어 표를 찾지 못했습니다")
         self.assertEqual(listed - self._handled_commands(), set())
+
+    def _botfather_commands(self) -> list[str]:
+        development = (self.REPO / "DEVELOPMENT.md").read_text(encoding="utf-8")
+        block = development.split("`/setcommands`")[1].split("```")[1]
+        return [
+            f"/{line.split(' - ')[0].strip()}"
+            for line in block.splitlines()
+            if " - " in line
+        ]
+
+    def test_readme_lists_the_registered_commands_in_the_same_order(self):
+        readme = (self.REPO / "README.md").read_text(encoding="utf-8")
+        table = readme.split("| 명령어 | 기능 |")[1].split("\n\n")[0]
+        listed = re.findall(r"^\| `(/[a-z0-9_]+)` \|", table, re.MULTILINE)
+
+        # Subscribers see the BotFather menu and the README table side by
+        # side; a different order or a missing entry reads as a broken bot.
+        self.assertEqual(listed, self._botfather_commands())
+
+    def test_help_matches_the_registered_commands(self):
+        source = (self.REPO / "watcher.py").read_text(encoding="utf-8")
+        block = source.split('"🎬 CGV 용산 IMAX 알림 봇\\n\\n"')[1].split(
+            "elif command"
+        )[0]
+        listed = re.findall(r'"(/[a-z0-9_]+) -', block)
+
+        self.assertEqual(listed, self._botfather_commands())
+
+    def test_documented_settings_exist_in_the_code(self):
+        source = (self.REPO / "watcher.py").read_text(encoding="utf-8")
+        known = set(re.findall(r'value\("([A-Z_0-9]+)"', source))
+
+        for name, pattern in (
+            ("DEVELOPMENT.md", r"`([A-Z_][A-Z_0-9]{4,})`"),
+            (".env.example", r"^#?\s*([A-Z_][A-Z_0-9]{4,})="),
+        ):
+            documented = set(
+                re.findall(
+                    pattern,
+                    (self.REPO / name).read_text(encoding="utf-8"),
+                    re.MULTILINE,
+                )
+            )
+            self.assertTrue(documented, f"{name}에서 설정값을 찾지 못했습니다")
+            self.assertEqual(
+                documented - known, set(), f"{name}에 없는 설정이 적혀 있습니다"
+            )
 
     def test_the_operator_command_stays_out_of_public_lists(self):
         development = (self.REPO / "DEVELOPMENT.md").read_text(encoding="utf-8")

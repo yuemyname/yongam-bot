@@ -1548,20 +1548,28 @@ class StateStore:
             self.data["subscribers"][str(chat_id)] = updated
             return True
 
+    @staticmethod
+    def _stored_min_seats(record: Mapping[str, Any]) -> int:
+        # "min_cancel" is what this was called while it measured how many
+        # seats freed up at once.  Subscribers who set it then keep their
+        # choice under the name that describes what it now measures.
+        for field in ("min_seats", "min_cancel"):
+            minimum = record.get(field)
+            if isinstance(minimum, int) and minimum in MIN_SEATS_CHOICES:
+                return minimum
+        return MIN_SEATS_DEFAULT
+
     def min_seats(self, chat_id: str) -> int:
-        """Seats that must free up at once before this subscriber is alerted."""
+        """Seats that must be on sale before this subscriber is alerted."""
 
         with self._lock:
             record = self.data["subscribers"].get(str(chat_id))
             if not isinstance(record, Mapping):
                 return MIN_SEATS_DEFAULT
-            minimum = record.get("min_cancel")
-            if isinstance(minimum, int) and minimum in MIN_SEATS_CHOICES:
-                return minimum
-            return MIN_SEATS_DEFAULT
+            return self._stored_min_seats(record)
 
     def set_min_seats(self, chat_id: str, minimum: int) -> bool:
-        """Store a minimum cancellation size; returns False when unchanged."""
+        """Store a minimum seat count; returns False when unchanged."""
 
         if minimum not in MIN_SEATS_CHOICES:
             raise ValueError(f"알 수 없는 예매 가능 최소 좌석: {minimum}")
@@ -1569,10 +1577,11 @@ class StateStore:
             record = self.data["subscribers"].get(str(chat_id))
             if not isinstance(record, Mapping):
                 return False
-            if record.get("min_cancel", MIN_SEATS_DEFAULT) == minimum:
+            if self._stored_min_seats(record) == minimum:
                 return False
             updated = dict(record)
-            updated["min_cancel"] = minimum
+            updated.pop("min_cancel", None)
+            updated["min_seats"] = minimum
             self.data["subscribers"][str(chat_id)] = updated
             return True
 
@@ -1877,7 +1886,7 @@ class StateStore:
                 "chat_type": chat_type[:30],
                 "alert_mode": DEFAULT_ALERT_MODE,
                 "seat_selection": DEFAULT_SEAT_SELECTION,
-                "min_cancel": MIN_SEATS_DEFAULT,
+                "min_seats": MIN_SEATS_DEFAULT,
             }
             return True
 
@@ -3077,22 +3086,24 @@ class Watcher:
                 reply = (
                     "🎬 용아맥 오디세이 알림 봇\n\n"
                     "CGV 용산아이파크몰 IMAX의 오디세이 예매 오픈과 "
-                    "잔여 좌석 변화를 확인해 알려주는 비공식 봇입니다.\n"
+                    "예매 가능한 좌석을 확인해 알려주는 비공식 봇입니다.\n"
                     "한국시간 기준 오늘부터 28일간의 상영 회차를 감시합니다.\n\n"
                     "🔔 알려드리는 내용\n"
                     "• 새 IMAX 상영 회차 예매 오픈\n"
                     "• 예매 가능한 A열 제외 좌석 (취소표 포함)\n"
                     "• 상영일·시작시간·잔여좌석/총좌석·좌석 행/번호·예매 링크\n\n"
-                    "🚫 알림 제외\n"
+                    "🚫 좌석 알림 제외\n"
                     "• A열만 남은 경우\n"
-                    "• 잔여 좌석이 0석인 경우\n\n"
+                    "• 잔여 좌석이 0석인 경우\n"
+                    "• 상영이 이미 시작된 경우\n"
+                    "※ 신규 회차 오픈 알림은 매진이어도 전송\n\n"
                     "⚙️ 기본 설정\n"
                     "• 신규 예매 오픈 + 예매 가능 좌석 알림\n"
                     "• 모든 A열 제외 좌석 알림\n"
                     "• 별도 설정 없이 바로 사용 가능\n\n"
                     "🔧 알림 종류 선택\n"
                     "• /mode — 현재 설정과 선택 방법 확인\n"
-                    "• /mode_all — 신규 오픈과 잔여 좌석 모두 받기 (기본)\n"
+                    "• /mode_all — 신규 오픈과 예매 가능 좌석 모두 받기 (기본)\n"
                     "• /mode_open — 신규 예매 오픈만\n"
                     "• /mode_seats — 예매 가능 좌석만\n\n"
                     "💺 잔여 좌석 대상 (선택 사항)\n"
@@ -3804,7 +3815,7 @@ class Watcher:
 
         self.logger.info(
             "조회 완료: 성공 %d일, 오류 %d일, IMAX 회차 %d개, 신규 %d개, "
-            "좌석변경 %d개, A열만 남아 제외 %d개, "
+            "예매 가능 좌석 %d개, A열만 남아 제외 %d개, "
             "0석 제외 %d개, 예매 마감 제외 %d개, 좌석판별 대기 %d개, "
             "미판별 7석 이상 알림 %d개, "
             "HTTP 429 %d개, 일정 생략 %d일, 좌석상세 생략 %d개, "
