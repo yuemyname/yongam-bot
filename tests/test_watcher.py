@@ -24,6 +24,7 @@ from watcher import (
     ALERT_SYSTEM,
     SCAN_MODE_CURSOR,
     SCAN_MODE_FULL,
+    MIN_CANCEL_DEFAULT,
     SEAT_SELECTION_ALL,
     SEAT_SELECTION_SWEET,
     STATE_VERSION,
@@ -38,6 +39,7 @@ from watcher import (
     TimezoneFormatter,
     Watcher,
     _available_seat_line,
+    _freed_seat_count,
     _sweet_seat_snapshot,
     booking_url_for_session,
     _seat_snapshot_changed,
@@ -803,6 +805,260 @@ class ScanPlanTests(unittest.TestCase):
             self.assertFalse(watcher.state.advance_frontier(dt.date(2026, 8, 20)))
             self.assertTrue(watcher.state.advance_frontier(dt.date(2026, 8, 21)))
             self.assertEqual(watcher.state.frontier_date, dt.date(2026, 8, 21))
+
+
+class MinimumCancellationTests(unittest.TestCase):
+    """The /count setting: how many seats must free up at once."""
+
+    TODAY = dt.date(2026, 8, 26)
+
+    @staticmethod
+    def _snapshot(usable, *, rows=("A", "H"), seats=None):
+        available = (
+            seats
+            if seats is not None
+            else tuple(("H", str(i)) for i in range(1, usable + 1))
+        )
+        return SeatSnapshot(
+            total=usable + 1,  # one A-row seat always sits unsold
+            usable=usable,
+            mapped_total=usable + 1,
+            available_rows=rows,
+            available_seats=available,
+        )
+
+    def test_freed_count_only_counts_growth(self):
+        self.assertEqual(
+            _freed_seat_count(self._snapshot(5), self._snapshot(7)), 2
+        )
+        self.assertEqual(
+            _freed_seat_count(self._snapshot(7), self._snapshot(5)), 0
+        )
+        self.assertEqual(_freed_seat_count(None, self._snapshot(3)), 3)
+
+    def test_freed_count_falls_back_to_the_total_when_rows_are_unreadable(self):
+        # Same fallback the alert text itself uses: no rows, no non-A count.
+        previous = SeatSnapshot(total=8)
+        current = SeatSnapshot(total=11)
+
+        self.assertEqual(_freed_seat_count(previous, current), 3)
+
+    def _watcher(self, temporary, **overrides):
+        config = dataclasses.replace(
+            make_config(Path(temporary)),
+            target_start=self.TODAY,
+            target_end=self.TODAY,
+            **overrides,
+        )
+        logger = logging.getLogger(f"min-cancel-{id(self)}")
+        logger.handlers = [logging.NullHandler()]
+        watcher = Watcher(config, logger=logger)
+        watcher.state.remove_subscriber(config.telegram_chat_id)
+        return watcher
+
+    def test_default_is_no_threshold_at_all(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._watcher(temporary)
+            watcher.state.add_subscriber("any")
+
+            self.assertEqual(watcher.state.min_cancel("any"), MIN_CANCEL_DEFAULT)
+            # A seat *selling* frees nothing, yet the default audience still
+            # gets the change — the setting must not silently narrow them.
+            self.assertEqual(
+                watcher.state.subscriber_ids_for(ALERT_SEATS, freed_seats=0),
+                ("any",),
+            )
+
+    def test_two_seat_minimum_filters_by_how_many_freed_at_once(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._watcher(temporary)
+            watcher.state.add_subscriber("any")
+            watcher.state.add_subscriber("pair")
+            self.assertTrue(watcher.state.set_min_cancel("pair", 2))
+
+            for freed, expected in ((0, ("any",)), (1, ("any",)),
+                                    (2, ("any", "pair")), (5, ("any", "pair"))):
+                self.assertEqual(
+                    watcher.state.subscriber_ids_for(
+                        ALERT_SEATS, freed_seats=freed
+                    ),
+                    expected,
+                    f"{freed}매 취소",
+                )
+
+    def test_booking_open_alerts_ignore_the_minimum(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._watcher(temporary)
+            watcher.state.add_subscriber("pair")
+            watcher.state.set_min_cancel("pair", 2)
+
+            # Detecting a newly opened showing is the bot's whole point, so no
+            # seat-count setting may withhold it.
+            self.assertEqual(
+                watcher.state.subscriber_ids_for(ALERT_OPEN), ("pair",)
+            )
+            self.assertEqual(
+                watcher.state.subscriber_ids_for(ALERT_SYSTEM), ("pair",)
+            )
+
+    def _run_seat_changes(self, watcher, steps):
+        usable = {"n": steps[0]}
+        watcher.cgv.fetch_date = lambda _date: {
+            "data": [
+                {
+                    "scnsNm": "IMAX관",
+                    "scnYmd": self.TODAY.strftime("%Y%m%d"),
+                    "scnsrtTm": "2330",
+                    "scnsNo": "13",
+                    "scnSseq": "4",
+                    "frSeatCnt": usable["n"] + 1,
+                    "stcnt": 200,
+                }
+            ]
+        }
+        watcher.cgv.fetch_seat_snapshot = lambda _session: self._snapshot(
+            usable["n"]
+        )
+        sent = []
+        watcher.telegram.send_message = lambda text, **kwargs: sent.append(
+            (kwargs.get("chat_id"), text)
+        )
+
+        watcher.run_cycle()  # first sighting: booking-open alert
+        received = []
+        for count in steps[1:]:
+            usable["n"] = count
+            before = len(sent)
+            watcher.run_cycle()
+            received.append(sorted(chat for chat, _text in sent[before:]))
+        return received
+
+    def test_one_seat_cancellation_skips_the_pair_subscriber(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(
+                Config, "local_now", return_value=_kst(self.TODAY)
+            ):
+                watcher = self._watcher(temporary)
+                watcher.state.add_subscriber("any")
+                watcher.state.add_subscriber("pair")
+                watcher.state.set_min_cancel("pair", 2)
+
+                # 5석 -> 6석(1매 취소) -> 8석(2매 취소) -> 7석(1매 판매)
+                received = self._run_seat_changes(watcher, [5, 6, 8, 7])
+
+            self.assertEqual(
+                received, [["any"], ["any", "pair"], ["any"]]
+            )
+
+    def test_the_change_is_recorded_even_when_the_minimum_filters_everyone(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(
+                Config, "local_now", return_value=_kst(self.TODAY)
+            ):
+                watcher = self._watcher(temporary)
+                watcher.state.add_subscriber("pair")
+                watcher.state.set_min_cancel("pair", 2)
+
+                # Without the snapshot advancing, the same single-seat change
+                # would be re-evaluated every cycle forever.
+                received = self._run_seat_changes(watcher, [5, 6, 6])
+
+            self.assertEqual(received, [[], []])
+            key = f"0013:30001323:{self.TODAY.isoformat()}:23:30"
+            self.assertEqual(watcher.state.seat_snapshot(key).usable, 6)
+
+    def test_sweet_subscribers_are_measured_inside_the_sweet_area(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._watcher(temporary)
+            watcher.state.add_subscriber("pair-sweet")
+            watcher.state.set_seat_selection("pair-sweet", SEAT_SELECTION_SWEET)
+            watcher.state.set_min_cancel("pair-sweet", 2)
+
+            # Two seats freed, but only one of them inside the sweet ranges.
+            previous = self._snapshot(1, seats=(("H", "20"),))
+            current = self._snapshot(
+                3, seats=(("H", "20"), ("H", "21"), ("H", "1"))
+            )
+            freed_sweet = _freed_seat_count(
+                _sweet_seat_snapshot(previous), _sweet_seat_snapshot(current)
+            )
+
+            self.assertEqual(_freed_seat_count(previous, current), 2)
+            self.assertEqual(freed_sweet, 1)
+            self.assertEqual(
+                watcher.state.subscriber_ids_for(
+                    ALERT_SEATS_SWEET, freed_seats=freed_sweet
+                ),
+                (),
+            )
+
+    def test_count_commands_change_report_and_persist_the_minimum(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = dataclasses.replace(
+                make_config(Path(temporary)), subscriptions_enabled=True
+            )
+            logger = logging.getLogger(f"count-cmd-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            replies = []
+
+            def batch(update_id, text, chat_id=111222):
+                return [
+                    {
+                        "update_id": update_id,
+                        "message": {
+                            "text": text,
+                            "chat": {"id": chat_id, "type": "private"},
+                        },
+                    }
+                ]
+
+            batches = [
+                batch(1, "/count_2", chat_id=555),
+                batch(2, "/start"),
+                batch(3, "/count_2@YongsanBot"),
+                batch(4, "/status"),
+                batch(5, "/count_2"),
+                batch(6, "/count"),
+                batch(7, "/count 9"),
+                batch(8, "/count_1"),
+            ]
+            watcher.telegram.get_updates = lambda **_kwargs: batches.pop(0)
+            watcher.telegram.send_message = lambda text, **kwargs: replies.append(
+                (kwargs.get("chat_id"), text)
+            )
+
+            watcher.sync_subscribers()
+            self.assertIn("구독 중이 아닙니다", replies[-1][1])
+
+            watcher.sync_subscribers()
+            self.assertEqual(watcher.state.min_cancel("111222"), MIN_CANCEL_DEFAULT)
+
+            watcher.sync_subscribers()
+            self.assertEqual(watcher.state.min_cancel("111222"), 2)
+            self.assertIn("2매 이상 취소만", replies[-1][1])
+
+            watcher.sync_subscribers()
+            self.assertIn("최소 취소 매수: 2매 이상 취소만", replies[-1][1])
+
+            watcher.sync_subscribers()
+            self.assertIn("이미 이렇게 설정", replies[-1][1])
+
+            watcher.sync_subscribers()
+            self.assertIn("현재 최소 취소 매수", replies[-1][1])
+
+            watcher.sync_subscribers()
+            self.assertIn("알 수 없는 매수", replies[-1][1])
+            self.assertEqual(watcher.state.min_cancel("111222"), 2)
+
+            watcher.sync_subscribers()
+            self.assertEqual(watcher.state.min_cancel("111222"), MIN_CANCEL_DEFAULT)
+
+            reloaded = StateStore(config.state_file)
+            reloaded.load()
+            self.assertEqual(
+                reloaded.min_cancel("111222"), MIN_CANCEL_DEFAULT
+            )
 
 
 class ForcedSeatRecheckTests(unittest.TestCase):
@@ -3589,7 +3845,7 @@ class DocumentedCommandTests(unittest.TestCase):
 
     def _handled_commands(self) -> set[str]:
         source = (self.REPO / "watcher.py").read_text(encoding="utf-8")
-        return set(re.findall(r'"(/[a-z_]+)"', source))
+        return set(re.findall(r'"(/[a-z0-9_]+)"', source))
 
     def test_botfather_list_only_registers_commands_that_exist(self):
         development = (self.REPO / "DEVELOPMENT.md").read_text(encoding="utf-8")
@@ -3607,7 +3863,7 @@ class DocumentedCommandTests(unittest.TestCase):
 
     def test_readme_table_only_lists_commands_that_exist(self):
         readme = (self.REPO / "README.md").read_text(encoding="utf-8")
-        listed = set(re.findall(r"^\| `(/[a-z_]+)` \|", readme, re.MULTILINE))
+        listed = set(re.findall(r"^\| `(/[a-z0-9_]+)` \|", readme, re.MULTILINE))
 
         self.assertTrue(listed, "README 명령어 표를 찾지 못했습니다")
         self.assertEqual(listed - self._handled_commands(), set())

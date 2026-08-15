@@ -19,6 +19,9 @@ mode_seats - 잔여 좌석만 받기
 seat - 잔여 좌석 대상 확인·변경
 seat_all - 모든 A열 제외 좌석 받기
 seat_sweet - 명당 좌석만 받기
+count - 최소 취소 매수 확인·변경
+count_1 - 1매 취소부터 모두 받기
+count_2 - 2매 이상 취소만 받기
 desc - 봇 설명과 사용 방법
 coffee - 개발자에게 커피 후원
 help - 사용법 보기
