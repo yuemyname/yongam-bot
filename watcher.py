@@ -67,6 +67,10 @@ DEFAULT_SCAN_MODE = SCAN_MODE_CURSOR
 # notices) always reach every subscriber regardless of their preference.
 ALERT_OPEN = "open"
 ALERT_SEATS = "seats"
+# A classified seat-change alert rendered only with the subscriber's preferred
+# central-seat preset.  Keeping a separate category also makes queued Telegram
+# retries respect a later /seats setting change.
+ALERT_SEATS_SWEET = "seats_sweet"
 # A seat-change alert CGV's detail response could not classify.  It reaches the
 # seat-alert subscribers who did not ask for verified seat information only.
 ALERT_SEATS_UNCLASSIFIED = "seats_unclassified"
@@ -144,6 +148,41 @@ SEAT_INFO_GUIDE = (
     "CGV 좌석 상세 조회가 실패하면 A열 여부를 확인할 수 없어 "
     "'A열 여부 미확인' 표시로 알림이 갑니다. "
     "/seat_verified를 고르면 이런 알림은 받지 않습니다."
+)
+
+# Preferred seats for cancellation-ticket alerts.  Booking-open alerts remain
+# unfiltered because detecting a newly opened showing is the bot's top priority.
+SEAT_SELECTION_ALL = "all"
+SEAT_SELECTION_SWEET = "sweet"
+DEFAULT_SEAT_SELECTION = SEAT_SELECTION_ALL
+SEAT_SELECTIONS = (SEAT_SELECTION_ALL, SEAT_SELECTION_SWEET)
+SEAT_SELECTION_LABELS = {
+    SEAT_SELECTION_ALL: "모든 A열 제외 좌석",
+    SEAT_SELECTION_SWEET: "명당 좌석만",
+}
+SEAT_SELECTION_ALIASES = {
+    "all": SEAT_SELECTION_ALL,
+    "전체": SEAT_SELECTION_ALL,
+    "모두": SEAT_SELECTION_ALL,
+    "sweet": SEAT_SELECTION_SWEET,
+    "명당": SEAT_SELECTION_SWEET,
+}
+SEAT_SELECTION_COMMANDS = {"/seats"}
+SWEET_SEAT_RANGES: dict[str, tuple[int, int]] = {
+    "F": (16, 29),
+    "G": (16, 29),
+    "H": (13, 32),
+    "I": (13, 32),
+    "J": (11, 34),
+    "K": (11, 34),
+    "L": (11, 34),
+}
+SEAT_SELECTION_GUIDE = (
+    "받고 싶은 잔여 좌석을 고를 수 있습니다.\n"
+    "/seats sweet - 명당 좌석만 받기\n"
+    "  F16~29 · G16~29 · H13~32 · I13~32 · J11~34 · K11~34 · L11~34\n"
+    "/seats all - 모든 A열 제외 좌석 받기 (기본)\n\n"
+    "신규 예매 오픈 알림은 이 설정과 관계없이 항상 전송됩니다."
 )
 
 # Keep one extra day so a subscriber in a different timezone never loses the
@@ -1461,6 +1500,34 @@ class StateStore:
             self.data["subscribers"][str(chat_id)] = updated
             return True
 
+    def seat_selection(self, chat_id: str) -> str:
+        """Return the subscriber's preferred-seat preset."""
+
+        with self._lock:
+            record = self.data["subscribers"].get(str(chat_id))
+            if not isinstance(record, Mapping):
+                return DEFAULT_SEAT_SELECTION
+            selection = record.get("seat_selection")
+            if isinstance(selection, str) and selection in SEAT_SELECTIONS:
+                return selection
+            return DEFAULT_SEAT_SELECTION
+
+    def set_seat_selection(self, chat_id: str, selection: str) -> bool:
+        """Store a preferred-seat preset; returns False when unchanged."""
+
+        if selection not in SEAT_SELECTIONS:
+            raise ValueError(f"알 수 없는 좌석 선택: {selection}")
+        with self._lock:
+            record = self.data["subscribers"].get(str(chat_id))
+            if not isinstance(record, Mapping):
+                return False
+            if record.get("seat_selection", DEFAULT_SEAT_SELECTION) == selection:
+                return False
+            updated = dict(record)
+            updated["seat_selection"] = selection
+            self.data["subscribers"][str(chat_id)] = updated
+            return True
+
     def note_deferred(self, key: str, total: int, skips: int) -> bool:
         """Remember that a showing could not be classified at this seat count.
 
@@ -1654,9 +1721,11 @@ class StateStore:
         with self._lock:
             modes = {mode: 0 for mode in ALERT_MODES}
             chat_types: dict[str, int] = {}
+            seat_selections = {selection: 0 for selection in SEAT_SELECTIONS}
             verified = 0
             for chat_id, record in self.data["subscribers"].items():
                 modes[self.alert_mode(chat_id)] += 1
+                seat_selections[self.seat_selection(chat_id)] += 1
                 if self.verified_seats_only(chat_id):
                     verified += 1
                 kind = ""
@@ -1666,6 +1735,7 @@ class StateStore:
             return {
                 "total": len(self.data["subscribers"]),
                 "modes": modes,
+                "seat_selections": seat_selections,
                 "verified_seats_only": verified,
                 "chat_types": chat_types,
             }
@@ -1681,6 +1751,19 @@ class StateStore:
                 for chat_id in self.subscriber_ids_for(ALERT_SEATS)
                 if not self.verified_seats_only(chat_id)
             )
+        if category in {ALERT_SEATS, ALERT_SEATS_SWEET}:
+            selection = (
+                SEAT_SELECTION_SWEET
+                if category == ALERT_SEATS_SWEET
+                else SEAT_SELECTION_ALL
+            )
+            with self._lock:
+                return tuple(
+                    str(chat_id)
+                    for chat_id in self.data["subscribers"]
+                    if ALERT_SEATS in ALERT_MODES[self.alert_mode(chat_id)]
+                    and self.seat_selection(chat_id) == selection
+                )
         with self._lock:
             return tuple(
                 str(chat_id)
@@ -1701,6 +1784,7 @@ class StateStore:
                 "chat_type": chat_type[:30],
                 "alert_mode": DEFAULT_ALERT_MODE,
                 "verified_seats_only": False,
+                "seat_selection": DEFAULT_SEAT_SELECTION,
             }
             return True
 
@@ -1961,8 +2045,52 @@ def _compact_seat_numbers(numbers: Iterable[str]) -> str:
     return ", ".join(parts)
 
 
+def _sweet_seat_snapshot(snapshot: SeatSnapshot) -> SeatSnapshot | None:
+    """Return only seats inside the combined Sweet/Experienced/Extremer area."""
+
+    if not snapshot.seat_map_complete or snapshot.available_seats is None:
+        return None
+    selected = tuple(
+        (row, number)
+        for row, number in snapshot.available_seats
+        if number.isdigit()
+        and row in SWEET_SEAT_RANGES
+        and SWEET_SEAT_RANGES[row][0] <= int(number) <= SWEET_SEAT_RANGES[row][1]
+    )
+    selected_rows = tuple(
+        sorted({row for row, _number in selected}, key=_natural_sort_key)
+    )
+    return SeatSnapshot(
+        total=snapshot.total,
+        usable=len(selected),
+        mapped_total=snapshot.total,
+        available_rows=selected_rows,
+        available_seats=selected,
+    )
+
+
+def _sweet_seats_became_available(
+    previous: SeatSnapshot, current: SeatSnapshot
+) -> tuple[SeatSnapshot | None, SeatSnapshot] | None:
+    """Snapshots to alert on when a currently available sweet seat changed."""
+
+    current_sweet = _sweet_seat_snapshot(current)
+    if current_sweet is None or not current_sweet.available_seats:
+        return None
+    previous_sweet = _sweet_seat_snapshot(previous)
+    if (
+        previous_sweet is not None
+        and previous_sweet.available_seats == current_sweet.available_seats
+    ):
+        return None
+    return previous_sweet, current_sweet
+
+
 def _available_seat_line(
-    snapshot: SeatSnapshot | None, *, max_chars: int = 900
+    snapshot: SeatSnapshot | None,
+    *,
+    label: str = "A열 제외 잔여 좌석",
+    max_chars: int = 900,
 ) -> str | None:
     if snapshot is None or not snapshot.seat_map_complete:
         return None
@@ -1976,7 +2104,7 @@ def _available_seat_line(
         return None
     if snapshot.available_seats is None:
         rows = ", ".join(f"{row}열" for row in non_a_rows)
-        return f"A열 제외 잔여 좌석: {rows} (좌석 번호 미확인)"
+        return f"{label}: {rows} (좌석 번호 미확인)"
 
     seats_by_row: dict[str, list[str]] = {}
     for row, number in snapshot.available_seats:
@@ -1985,14 +2113,14 @@ def _available_seat_line(
         f"{row}{_compact_seat_numbers(seats_by_row.get(row, ()))}"
         for row in non_a_rows
     )
-    line = f"A열 제외 잔여 좌석: {details}"
+    line = f"{label}: {details}"
     if len(line) <= max_chars:
         return line
 
     counts = " / ".join(
         f"{row}열 {len(seats_by_row.get(row, ()))}석" for row in non_a_rows
     )
-    return f"A열 제외 잔여 좌석: {counts} (좌석 번호가 많아 행별 수량으로 요약)"
+    return f"{label}: {counts} (좌석 번호가 많아 행별 수량으로 요약)"
 
 
 def seat_change_message(
@@ -2000,7 +2128,11 @@ def seat_change_message(
     previous: SeatSnapshot,
     current: SeatSnapshot,
     config: Config,
+    *,
+    availability: tuple[SeatSnapshot | None, SeatSnapshot] | None = None,
+    scope_label: str = "A열 제외",
 ) -> str:
+    previous_available, current_available = availability or (previous, current)
     lines = [
         "💺 CGV 잔여 좌석 변경",
         _alert_date_banner(session.date),
@@ -2014,9 +2146,18 @@ def seat_change_message(
             f"(이전 {_seat_ratio(session, remaining=previous.total)})"
         ),
     ]
-    if previous.usable is not None and current.usable is not None:
-        lines.append(f"A열 제외 예매 가능: {previous.usable}석 → {current.usable}석")
-    if seat_line := _available_seat_line(current):
+    if (
+        previous_available is not None
+        and previous_available.usable is not None
+        and current_available.usable is not None
+    ):
+        lines.append(
+            f"{scope_label} 예매 가능: "
+            f"{previous_available.usable}석 → {current_available.usable}석"
+        )
+    if seat_line := _available_seat_line(
+        current_available, label=f"{scope_label} 잔여 좌석"
+    ):
         lines.append(seat_line)
     if current.uses_unclassified_fallback:
         lines.append("⚠️ A열 여부 미확인 · 전체 잔여 수 기준 알림")
@@ -2543,6 +2684,13 @@ class Watcher:
         lines.append("잔여 좌석 알림 범위")
         lines.append(f"• {SEAT_INFO_LABELS[False]} — {total - verified}명")
         lines.append(f"• {SEAT_INFO_LABELS[True]} — {verified}명")
+        lines.append("")
+        lines.append("선호 좌석")
+        for selection in (SEAT_SELECTION_ALL, SEAT_SELECTION_SWEET):
+            lines.append(
+                f"• {SEAT_SELECTION_LABELS[selection]} — "
+                f"{stats['seat_selections'][selection]}명"
+            )
         return "\n".join(lines)
 
     def _handle_mode_command(
@@ -2622,6 +2770,39 @@ class Watcher:
         if not changed:
             return (f"💺 이미 이렇게 설정되어 있습니다.\n→ {label}{note}", False)
         return (f"✅ 잔여 좌석 알림 범위를 변경했습니다.\n→ {label}{note}", True)
+
+    def _handle_seat_selection_command(
+        self, chat_id: str, argument: str
+    ) -> tuple[str, bool]:
+        """Return the reply for /seats and whether its preference changed."""
+
+        requested = SEAT_SELECTION_ALIASES.get(argument) if argument else None
+        if argument and requested is None:
+            return (f"알 수 없는 좌석 선택입니다.\n\n{SEAT_SELECTION_GUIDE}", False)
+        if not self.state.is_subscribed(chat_id):
+            return (
+                "🔕 현재 구독 중이 아닙니다. /start로 구독한 뒤 설정할 수 있습니다."
+                f"\n\n{SEAT_SELECTION_GUIDE}",
+                False,
+            )
+
+        note = ""
+        if ALERT_SEATS not in ALERT_MODES[self.state.alert_mode(chat_id)]:
+            note = "\n\n참고: 현재 잔여 좌석 알림을 받지 않는 설정입니다. /mode 확인"
+
+        current = self.state.seat_selection(chat_id)
+        if requested is None:
+            return (
+                f"🎯 현재 좌석 선택\n→ {SEAT_SELECTION_LABELS[current]}"
+                f"{note}\n\n{SEAT_SELECTION_GUIDE}",
+                False,
+            )
+
+        changed = self.state.set_seat_selection(chat_id, requested)
+        label = SEAT_SELECTION_LABELS[requested]
+        if not changed:
+            return (f"🎯 이미 이렇게 설정되어 있습니다.\n→ {label}{note}", False)
+        return (f"✅ 좌석 선택을 변경했습니다.\n→ {label}{note}", True)
 
     def sync_subscribers(self) -> None:
         """Apply Telegram /start and /stop commands to the persistent list."""
@@ -2716,7 +2897,15 @@ class Watcher:
                             self.state.verified_seats_only(chat_id)
                         ]
                         reply += f"\n좌석 알림 범위: {seat_label}"
-                    reply += "\n\n알림 종류 변경: /mode\n좌석 알림 범위 변경: /seat"
+                        selection_label = SEAT_SELECTION_LABELS[
+                            self.state.seat_selection(chat_id)
+                        ]
+                        reply += f"\n선호 좌석: {selection_label}"
+                    reply += (
+                        "\n\n알림 종류 변경: /mode"
+                        "\n좌석 알림 범위 변경: /seat"
+                        "\n선호 좌석 변경: /seats"
+                    )
                 else:
                     reply = (
                         "🔕 현재 구독 중이 아닙니다. "
@@ -2732,6 +2921,11 @@ class Watcher:
                     chat_id, command, argument
                 )
                 state_changed = state_changed or seat_info_changed
+            elif command in SEAT_SELECTION_COMMANDS:
+                reply, seat_selection_changed = self._handle_seat_selection_command(
+                    chat_id, argument
+                )
+                state_changed = state_changed or seat_selection_changed
             elif command in ADMIN_STATS_COMMANDS and chat_id == str(
                 self.config.telegram_chat_id
             ):
@@ -2746,10 +2940,11 @@ class Watcher:
                     "/status - 구독 상태 확인\n"
                     "/mode - 알림 종류 선택\n"
                     "/seat - 잔여 좌석 알림 범위 선택\n"
+                    "/seats - 모든 좌석 또는 명당 좌석 선택\n"
                     "/desc - 봇 설명과 사용 방법\n"
                     "/coffee - 개발자에게 커피 후원\n"
                     "/help - 사용법 보기\n\n"
-                    "/mode 와 /seat 은 선택 사항입니다.\n"
+                    "/mode, /seat, /seats 는 선택 사항입니다.\n"
                     "그대로 두시면 모든 알림을 받습니다."
                 )
             elif command in {"/desc", "/description"}:
@@ -2773,12 +2968,18 @@ class Watcher:
                     "💺 잔여 좌석 알림 범위 (선택 사항)\n"
                     "• /seat_all — A열 여부 미확인 알림도 받기 (기본)\n"
                     "• /seat_verified — A열 제외 좌석이 확인된 알림만 받기\n\n"
+                    "🎯 선호 좌석 선택 (선택 사항)\n"
+                    "• /seats sweet — F16~29·G16~29·H13~32·I13~32·"
+                    "J11~34·K11~34·L11~34만 받기\n"
+                    "• /seats all — 모든 A열 제외 좌석 받기 (기본)\n"
+                    "• 신규 예매 오픈 알림은 선택과 관계없이 항상 받기\n\n"
                     "📌 사용 방법\n"
                     "1. /start — 알림 구독\n"
                     "2. 알림이 오면 예매 바로가기 링크 열기\n"
                     "3. CGV 화면에서 IMAX 버튼 선택 후 예매\n\n"
                     "/mode — 현재 알림 종류 확인·변경\n"
                     "/seat — 잔여 좌석 알림 범위 확인·변경\n"
+                    "/seats — 선호 좌석 확인·변경\n"
                     "/status — 구독 상태 확인\n"
                     "/stop — 알림 해지\n"
                     "/coffee — 개발자에게 커피 후원\n"
@@ -3268,14 +3469,38 @@ class Watcher:
                     current.total,
                 )
                 continue
-            delivered, failed, total = self._broadcast_message(
-                seat_change_message(session, previous, current, self.config),
-                category=(
-                    ALERT_SEATS_UNCLASSIFIED
-                    if current.uses_unclassified_fallback
-                    else ALERT_SEATS
-                ),
+            all_category = (
+                ALERT_SEATS_UNCLASSIFIED
+                if current.uses_unclassified_fallback
+                else ALERT_SEATS
             )
+            if self.state.subscriber_ids_for(all_category):
+                delivered, failed, total = self._broadcast_message(
+                    seat_change_message(session, previous, current, self.config),
+                    category=all_category,
+                )
+            else:
+                delivered = failed = total = 0
+            sweet_delivery = _sweet_seats_became_available(previous, current)
+            if (
+                not current.uses_unclassified_fallback
+                and sweet_delivery is not None
+                and self.state.subscriber_ids_for(ALERT_SEATS_SWEET)
+            ):
+                sweet_delivered, sweet_failed, sweet_total = self._broadcast_message(
+                    seat_change_message(
+                        session,
+                        previous,
+                        current,
+                        self.config,
+                        availability=sweet_delivery,
+                        scope_label="명당",
+                    ),
+                    category=ALERT_SEATS_SWEET,
+                )
+                delivered += sweet_delivered
+                failed += sweet_failed
+                total += sweet_total
             if delivered or failed or total == 0:
                 self.state.set_seat_snapshot(key, current)
                 verdicts[key] = f"발송·좌석 변경 {previous.total}→{current.total}"
