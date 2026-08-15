@@ -39,7 +39,7 @@ DEFAULT_BOOKING_URL = "https://cgv.co.kr/cnm/movieBook/movie"
 DEFAULT_SEAT_PAGE_URL = "https://cgv.co.kr/cnm/selectVisitorCnt"
 DEFAULT_SITE_NAME = "용산아이파크몰"
 UNCLASSIFIED_ALERT_MIN_SEATS = 7
-STATE_VERSION = 12
+STATE_VERSION = 13
 TELEGRAM_BROADCAST_WORKERS = 4
 # Printed once per cycle so a long log can be read cycle by cycle.
 CYCLE_SEPARATOR = "─" * 60
@@ -160,32 +160,31 @@ SEAT_SELECTION_GUIDE = (
     "신규 예매 오픈 알림은 이 설정과 관계없이 항상 전송됩니다."
 )
 
-# How many seats must free up at once before a seat-change alert is worth
-# sending.  Someone booking a pair has no use for a single-seat cancellation.
-MIN_CANCEL_DEFAULT = 1
-MIN_CANCEL_CHOICES = (1, 2)
-MIN_CANCEL_LABELS = {
-    1: "1매부터 모두",
-    2: "2매 이상 취소만",
+# How many seats must be on sale before the alert is worth sending.  Someone
+# booking a pair has no use for a showing with one seat left.
+MIN_SEATS_DEFAULT = 1
+MIN_SEATS_CHOICES = (1, 2)
+MIN_SEATS_LABELS = {
+    1: "1석부터 모두",
+    2: "2석 이상 남았을 때만",
 }
-MIN_CANCEL_COMMAND_TARGETS = {
+MIN_SEATS_COMMAND_TARGETS = {
     "/count_1": 1,
     "/count_2": 2,
 }
-MIN_CANCEL_COMMANDS = {"/count", *MIN_CANCEL_COMMAND_TARGETS}
-MIN_CANCEL_ALIASES = {
+MIN_SEATS_COMMANDS = {"/count", *MIN_SEATS_COMMAND_TARGETS}
+MIN_SEATS_ALIASES = {
     "1": 1,
     "2": 2,
-    "1매": 1,
-    "2매": 2,
+    "1석": 1,
+    "2석": 2,
     "all": 1,
     "전체": 1,
 }
-MIN_CANCEL_GUIDE = (
-    "한 번에 몇 매 이상 풀렸을 때 알림을 받을지 고를 수 있습니다.\n"
-    "/count_1 - 1매부터 모두 받기 (기본)\n"
-    "/count_2 - 2매 이상 취소만 받기\n\n"
-    "1매씩 따로 취소되면 2매가 남아도 알림이 가지 않습니다.\n"
+MIN_SEATS_GUIDE = (
+    "예매 가능한 좌석이 몇 석 이상일 때 알림을 받을지 고를 수 있습니다.\n"
+    "/count_1 - 1석부터 모두 받기 (기본)\n"
+    "/count_2 - 2석 이상 남았을 때만 받기\n\n"
     "신규 예매 오픈 알림은 이 설정과 관계없이 항상 전송됩니다."
 )
 
@@ -363,6 +362,7 @@ class Config:
     seat_recheck_always_days: int
     seat_recheck_rotate_days: int
     seat_recheck_rotate_cycles: int
+    seat_alert_repeat_minutes: int
     pending_delivery_max_attempts: int
     cursor_probe_days: int
     cursor_expansion_days: int
@@ -554,6 +554,12 @@ class Config:
                 name="SEAT_RECHECK_ROTATE_CYCLES",
                 minimum=1,
                 maximum=60,
+            ),
+            seat_alert_repeat_minutes=_parse_int(
+                value("SEAT_ALERT_REPEAT_MINUTES", "0"),
+                name="SEAT_ALERT_REPEAT_MINUTES",
+                minimum=0,
+                maximum=1440,
             ),
             pending_delivery_max_attempts=_parse_int(
                 value("PENDING_DELIVERY_MAX_ATTEMPTS", "30"),
@@ -1382,6 +1388,7 @@ class StateStore:
             "frontier_date": "",
             "failed_schedule_dates": {},
             "deferred": {},
+            "seat_alerts": {},
             "pending_deliveries": {},
             "last_error_fingerprint": "",
             "last_error_notified_at": "",
@@ -1418,6 +1425,7 @@ class StateStore:
             self.data.setdefault("frontier_date", "")
             self.data.setdefault("failed_schedule_dates", {})
             self.data.setdefault("deferred", {})
+            self.data.setdefault("seat_alerts", {})
             self.data.setdefault("pending_deliveries", {})
 
     def was_notified(self, key: str) -> bool:
@@ -1451,6 +1459,7 @@ class StateStore:
                 "seat_counts",
                 "deferred",
                 "failed_schedule_dates",
+                "seat_alerts",
             ):
                 records = self.data.get(bucket)
                 if not isinstance(records, dict):
@@ -1539,33 +1548,60 @@ class StateStore:
             self.data["subscribers"][str(chat_id)] = updated
             return True
 
-    def min_cancel(self, chat_id: str) -> int:
+    def min_seats(self, chat_id: str) -> int:
         """Seats that must free up at once before this subscriber is alerted."""
 
         with self._lock:
             record = self.data["subscribers"].get(str(chat_id))
             if not isinstance(record, Mapping):
-                return MIN_CANCEL_DEFAULT
+                return MIN_SEATS_DEFAULT
             minimum = record.get("min_cancel")
-            if isinstance(minimum, int) and minimum in MIN_CANCEL_CHOICES:
+            if isinstance(minimum, int) and minimum in MIN_SEATS_CHOICES:
                 return minimum
-            return MIN_CANCEL_DEFAULT
+            return MIN_SEATS_DEFAULT
 
-    def set_min_cancel(self, chat_id: str, minimum: int) -> bool:
+    def set_min_seats(self, chat_id: str, minimum: int) -> bool:
         """Store a minimum cancellation size; returns False when unchanged."""
 
-        if minimum not in MIN_CANCEL_CHOICES:
-            raise ValueError(f"알 수 없는 최소 취소 매수: {minimum}")
+        if minimum not in MIN_SEATS_CHOICES:
+            raise ValueError(f"알 수 없는 예매 가능 최소 좌석: {minimum}")
         with self._lock:
             record = self.data["subscribers"].get(str(chat_id))
             if not isinstance(record, Mapping):
                 return False
-            if record.get("min_cancel", MIN_CANCEL_DEFAULT) == minimum:
+            if record.get("min_cancel", MIN_SEATS_DEFAULT) == minimum:
                 return False
             updated = dict(record)
             updated["min_cancel"] = minimum
             self.data["subscribers"][str(chat_id)] = updated
             return True
+
+    def seat_alert_is_due(
+        self, key: str, now: dt.datetime, repeat_minutes: int
+    ) -> bool:
+        """Whether this showing may be re-announced while seats stay on sale.
+
+        With the interval at zero every cycle sends, which is the point of a
+        stock alert.  Raising it is the one lever that shortens the queue if
+        an opening floods, and it only throttles repeats — the caller sends a
+        genuine change regardless.
+        """
+
+        if repeat_minutes <= 0:
+            return True
+        with self._lock:
+            raw = self.data.setdefault("seat_alerts", {}).get(str(key))
+        if not isinstance(raw, str):
+            return True
+        try:
+            last = dt.datetime.fromisoformat(raw)
+        except ValueError:
+            return True
+        return now - last >= dt.timedelta(minutes=repeat_minutes)
+
+    def note_seat_alert(self, key: str, now: dt.datetime) -> None:
+        with self._lock:
+            self.data.setdefault("seat_alerts", {})[str(key)] = now.isoformat()
 
     def note_deferred(self, key: str, total: int, skips: int) -> bool:
         """Remember that a showing could not be classified at this seat count.
@@ -1761,11 +1797,11 @@ class StateStore:
             modes = {mode: 0 for mode in ALERT_MODES}
             chat_types: dict[str, int] = {}
             seat_selections = {selection: 0 for selection in SEAT_SELECTIONS}
-            min_cancels = {minimum: 0 for minimum in MIN_CANCEL_CHOICES}
+            min_seats_counts = {minimum: 0 for minimum in MIN_SEATS_CHOICES}
             for chat_id, record in self.data["subscribers"].items():
                 modes[self.alert_mode(chat_id)] += 1
                 seat_selections[self.seat_selection(chat_id)] += 1
-                min_cancels[self.min_cancel(chat_id)] += 1
+                min_seats_counts[self.min_seats(chat_id)] += 1
                 kind = ""
                 if isinstance(record, Mapping):
                     kind = str(record.get("chat_type") or "")
@@ -1774,37 +1810,39 @@ class StateStore:
                 "total": len(self.data["subscribers"]),
                 "modes": modes,
                 "seat_selections": seat_selections,
-                "min_cancels": min_cancels,
+                "min_seats": min_seats_counts,
                 "chat_types": chat_types,
             }
 
     def subscriber_ids_for(
-        self, category: str, *, freed_seats: int | None = None
+        self, category: str, *, seats_available: int | None = None
     ) -> tuple[str, ...]:
         """Subscribers who opted in to this alert category.
 
-        ``freed_seats`` is how many bookable seats appeared in this
-        observation.  Passing it applies each subscriber's minimum
-        cancellation size; leaving it None means the alert is not about a
-        cancellation at all, so nobody is filtered out.
+        ``seats_available`` is how many seats this alert says are on sale,
+        counted inside whatever scope the category names.  Passing it applies
+        each subscriber's minimum; leaving it None means the alert is not
+        about seat availability, so nobody is filtered out.
         """
 
         def wants_this_many(chat_id: str) -> bool:
-            minimum = self.min_cancel(chat_id)
+            minimum = self.min_seats(chat_id)
             # The default is not a threshold of one — it is no threshold at
-            # all, so seats *selling* still reach everyone who never set a
-            # minimum, exactly as before this setting existed.
-            if freed_seats is None or minimum == MIN_CANCEL_DEFAULT:
+            # all, so an alert reaches everyone who never set a minimum even
+            # when the seat count could not be read.
+            if seats_available is None or minimum == MIN_SEATS_DEFAULT:
                 return True
-            return minimum <= freed_seats
+            return minimum <= seats_available
 
         if category == ALERT_SYSTEM:
             return self.subscriber_ids()
         if category == ALERT_SEATS_UNCLASSIFIED:
             # Sweetness cannot be judged without a readable row, so an
-            # unclassified change only ever concerns whole-auditorium
+            # unclassified alert only ever concerns whole-auditorium
             # subscribers.
-            return self.subscriber_ids_for(ALERT_SEATS, freed_seats=freed_seats)
+            return self.subscriber_ids_for(
+                ALERT_SEATS, seats_available=seats_available
+            )
         if category in {ALERT_SEATS, ALERT_SEATS_SWEET}:
             selection = (
                 SEAT_SELECTION_SWEET
@@ -1839,7 +1877,7 @@ class StateStore:
                 "chat_type": chat_type[:30],
                 "alert_mode": DEFAULT_ALERT_MODE,
                 "seat_selection": DEFAULT_SEAT_SELECTION,
-                "min_cancel": MIN_CANCEL_DEFAULT,
+                "min_cancel": MIN_SEATS_DEFAULT,
             }
             return True
 
@@ -2122,43 +2160,28 @@ def _sweet_seat_snapshot(snapshot: SeatSnapshot) -> SeatSnapshot | None:
     )
 
 
-def _freed_seat_count(
-    previous: SeatSnapshot | None, current: SeatSnapshot
-) -> int:
-    """Bookable seats that appeared since the previous observation.
+def _available_seat_count(snapshot: SeatSnapshot) -> int:
+    """Seats outside row A that a subscriber could book right now.
 
-    Only growth counts, and only growth that was actually seen: a seat
-    selling is not a cancellation, and an unreadable seat map means no
-    trustworthy non-A count, which reads as zero rather than as the schedule
-    total.  Falling back to the total would count A-row seats the subscriber
-    asked to exclude — two seats freeing up, one of them in row A, would
-    satisfy a two-seat minimum it does not really meet.
+    Only confirmed seats count.  The schedule total includes row A, which
+    this audience excluded, so it can never stand in: eight seats left with
+    an unreadable map might be eight row-A seats.
     """
 
-    if current.usable is None:
-        return 0
-    if previous is None:
-        return current.usable
-    if previous.usable is None:
-        return 0
-    return max(0, current.usable - previous.usable)
+    return snapshot.usable if snapshot.usable is not None else 0
 
 
-def _sweet_seats_became_available(
-    previous: SeatSnapshot, current: SeatSnapshot
+def _sweet_seats_available(
+    previous: SeatSnapshot | None, current: SeatSnapshot
 ) -> tuple[SeatSnapshot | None, SeatSnapshot] | None:
-    """Snapshots to alert on when a currently available sweet seat changed."""
+    """Snapshots to alert on while a sweet seat is on sale, or None."""
 
     current_sweet = _sweet_seat_snapshot(current)
     if current_sweet is None or not current_sweet.available_seats:
         return None
-    previous_sweet = _sweet_seat_snapshot(previous)
-    if (
-        previous_sweet is not None
-        and previous_sweet.available_seats == current_sweet.available_seats
-    ):
-        return None
-    return previous_sweet, current_sweet
+    return (
+        _sweet_seat_snapshot(previous) if previous is not None else None
+    ), current_sweet
 
 
 def _available_seat_line(
@@ -2200,7 +2223,7 @@ def _available_seat_line(
 
 def seat_change_message(
     session: BookingSession,
-    previous: SeatSnapshot,
+    previous: SeatSnapshot | None,
     current: SeatSnapshot,
     config: Config,
     *,
@@ -2208,28 +2231,32 @@ def seat_change_message(
     scope_label: str = "A열 제외",
 ) -> str:
     previous_available, current_available = availability or (previous, current)
+    ratio = _seat_ratio(session, remaining=current.total)
+    # The alert repeats while seats stay on sale, so the previous count is
+    # only worth printing when it actually differs.
+    if previous is not None and previous.total != current.total:
+        ratio += f" (이전 {_seat_ratio(session, remaining=previous.total)})"
     lines = [
-        "💺 CGV 잔여 좌석 변경",
+        "💺 CGV 예매 가능 좌석",
         _alert_date_banner(session.date),
         f"영화: {config.movie_label} ({config.movie_no})",
         f"극장: 용산아이파크몰 ({config.site_no})",
         "",
         f"상영 시작시간: {session.start_time}",
-        (
-            "잔여좌석/총좌석: "
-            f"{_seat_ratio(session, remaining=current.total)} "
-            f"(이전 {_seat_ratio(session, remaining=previous.total)})"
-        ),
+        f"잔여좌석/총좌석: {ratio}",
     ]
     if (
         previous_available is not None
         and previous_available.usable is not None
         and current_available.usable is not None
+        and previous_available.usable != current_available.usable
     ):
         lines.append(
             f"{scope_label} 예매 가능: "
             f"{previous_available.usable}석 → {current_available.usable}석"
         )
+    elif current_available.usable is not None:
+        lines.append(f"{scope_label} 예매 가능: {current_available.usable}석")
     if seat_line := _available_seat_line(
         current_available, label=f"{scope_label} 잔여 좌석"
     ):
@@ -2590,7 +2617,7 @@ class Watcher:
         text: str,
         *,
         category: str = ALERT_SYSTEM,
-        freed_seats: int | None = None,
+        seats_available: int | None = None,
     ) -> tuple[int, int, int]:
         """Send to subscribers opted in to ``category``.
 
@@ -2600,7 +2627,7 @@ class Watcher:
         """
 
         subscriber_ids = self.state.subscriber_ids_for(
-            category, freed_seats=freed_seats
+            category, seats_available=seats_available
         )
         delivered = 0
         failed = 0
@@ -2769,11 +2796,11 @@ class Watcher:
             )
 
         lines.append("")
-        lines.append("최소 취소 매수")
-        for minimum in MIN_CANCEL_CHOICES:
+        lines.append("예매 가능 최소 좌석")
+        for minimum in MIN_SEATS_CHOICES:
             lines.append(
-                f"• {MIN_CANCEL_LABELS[minimum]} — "
-                f"{stats['min_cancels'][minimum]}명"
+                f"• {MIN_SEATS_LABELS[minimum]} — "
+                f"{stats['min_seats'][minimum]}명"
             )
         return "\n".join(lines)
 
@@ -2851,20 +2878,20 @@ class Watcher:
             return (f"🎯 이미 이렇게 설정되어 있습니다.\n→ {label}{note}", False)
         return (f"✅ 좌석 선택을 변경했습니다.\n→ {label}{note}", True)
 
-    def _handle_min_cancel_command(
+    def _handle_min_seats_command(
         self, chat_id: str, command: str, argument: str
     ) -> tuple[str, bool]:
         """Return the minimum-cancellation reply and whether it changed."""
 
-        requested = MIN_CANCEL_COMMAND_TARGETS.get(command)
+        requested = MIN_SEATS_COMMAND_TARGETS.get(command)
         if requested is None and argument:
-            requested = MIN_CANCEL_ALIASES.get(argument)
+            requested = MIN_SEATS_ALIASES.get(argument)
             if requested is None:
-                return (f"알 수 없는 매수입니다.\n\n{MIN_CANCEL_GUIDE}", False)
+                return (f"알 수 없는 좌석 수입니다.\n\n{MIN_SEATS_GUIDE}", False)
         if not self.state.is_subscribed(chat_id):
             return (
                 "🔕 현재 구독 중이 아닙니다. /start로 구독한 뒤 설정할 수 있습니다."
-                f"\n\n{MIN_CANCEL_GUIDE}",
+                f"\n\n{MIN_SEATS_GUIDE}",
                 False,
             )
 
@@ -2873,17 +2900,17 @@ class Watcher:
             note = "\n\n참고: 현재 잔여 좌석 알림을 받지 않는 설정입니다. /mode 확인"
 
         if requested is None:
-            current = MIN_CANCEL_LABELS[self.state.min_cancel(chat_id)]
+            current = MIN_SEATS_LABELS[self.state.min_seats(chat_id)]
             return (
-                f"🎫 현재 최소 취소 매수\n→ {current}{note}\n\n{MIN_CANCEL_GUIDE}",
+                f"🎫 현재 예매 가능 최소 좌석\n→ {current}{note}\n\n{MIN_SEATS_GUIDE}",
                 False,
             )
 
-        changed = self.state.set_min_cancel(chat_id, requested)
-        label = MIN_CANCEL_LABELS[requested]
+        changed = self.state.set_min_seats(chat_id, requested)
+        label = MIN_SEATS_LABELS[requested]
         if not changed:
             return (f"🎫 이미 이렇게 설정되어 있습니다.\n→ {label}{note}", False)
-        return (f"✅ 최소 취소 매수를 변경했습니다.\n→ {label}{note}", True)
+        return (f"✅ 예매 가능 최소 좌석을 변경했습니다.\n→ {label}{note}", True)
 
     def sync_subscribers(self) -> None:
         """Apply Telegram /start and /stop commands to the persistent list."""
@@ -2952,14 +2979,14 @@ class Watcher:
                 # can see in the BotFather menu.
                 reply += (
                     "\n\n🔔 기본 설정"
-                    "\n• 신규 예매 오픈 + 잔여 좌석 변경 알림"
+                    "\n• 신규 예매 오픈 + 예매 가능 좌석 알림"
                     "\n• 잔여 좌석은 모든 A열 제외 좌석"
-                    "\n• 1매 취소부터 모두 알림"
+                    "\n• 1석부터 모두 알림"
                     "\n\n필요할 때만 설정을 바꾸세요."
                     "\n• 알림 종류 선택: /mode"
                     "\n• 잔여 좌석 대상 선택: /seat"
                     "\n• 명당 좌석만 받기: /seat_sweet"
-                    "\n• 2매 이상 취소만 받기: /count_2"
+                    "\n• 2석 이상 남았을 때만 받기: /count_2"
                     "\n\n※ 신규 예매 오픈은 좌석 설정과 관계없이 항상 알려드립니다."
                     "\n현재 설정 /status · 자세한 설명 /desc · 해지 /stop"
                 )
@@ -2986,13 +3013,13 @@ class Watcher:
                         ]
                         reply += f"\n잔여 좌석 대상: {selection_label}"
                         reply += (
-                            "\n최소 취소 매수: "
-                            f"{MIN_CANCEL_LABELS[self.state.min_cancel(chat_id)]}"
+                            "\n예매 가능 최소 좌석: "
+                            f"{MIN_SEATS_LABELS[self.state.min_seats(chat_id)]}"
                         )
                     reply += (
                         "\n\n알림 종류 변경: /mode"
                         "\n잔여 좌석 대상 변경: /seat"
-                        "\n최소 취소 매수 변경: /count"
+                        "\n예매 가능 최소 좌석 변경: /count"
                     )
                 else:
                     reply = (
@@ -3009,11 +3036,11 @@ class Watcher:
                     chat_id, command, argument
                 )
                 state_changed = state_changed or seat_selection_changed
-            elif command in MIN_CANCEL_COMMANDS:
-                reply, min_cancel_changed = self._handle_min_cancel_command(
+            elif command in MIN_SEATS_COMMANDS:
+                reply, min_seats_changed = self._handle_min_seats_command(
                     chat_id, command, argument
                 )
-                state_changed = state_changed or min_cancel_changed
+                state_changed = state_changed or min_seats_changed
             elif command == ADMIN_STATS_COMMAND and chat_id == str(
                 self.config.telegram_chat_id
             ):
@@ -3029,13 +3056,13 @@ class Watcher:
                     "/mode - 알림 종류 선택\n"
                     "/mode_all - 신규 오픈과 잔여 좌석 모두 받기\n"
                     "/mode_open - 신규 예매 오픈만 받기\n"
-                    "/mode_seats - 잔여 좌석 변경만 받기\n"
+                    "/mode_seats - 예매 가능 좌석만 받기\n"
                     "/seat - 잔여 좌석 대상 선택\n"
                     "/seat_all - 모든 A열 제외 좌석 받기 (기본)\n"
                     "/seat_sweet - 명당 좌석만 받기\n"
-                    "/count - 최소 취소 매수 선택\n"
-                    "/count_1 - 1매부터 모두 받기 (기본)\n"
-                    "/count_2 - 2매 이상 취소만 받기\n"
+                    "/count - 예매 가능 최소 좌석 선택\n"
+                    "/count_1 - 1석부터 모두 받기 (기본)\n"
+                    "/count_2 - 2석 이상 남았을 때만 받기\n"
                     "/desc - 봇 설명과 사용 방법\n"
                     "/coffee - 개발자에게 커피 후원\n"
                     "/help - 전체 명령어 보기\n\n"
@@ -3050,35 +3077,34 @@ class Watcher:
                     "한국시간 기준 오늘부터 28일간의 상영 회차를 감시합니다.\n\n"
                     "🔔 알려드리는 내용\n"
                     "• 새 IMAX 상영 회차 예매 오픈\n"
-                    "• 잔여 좌석 또는 A열 제외 예매 가능 좌석 변경\n"
+                    "• 예매 가능한 A열 제외 좌석 (취소표 포함)\n"
                     "• 상영일·시작시간·잔여좌석/총좌석·좌석 행/번호·예매 링크\n\n"
                     "🚫 알림 제외\n"
                     "• A열만 남은 경우\n"
                     "• 잔여 좌석이 0석인 경우\n\n"
                     "⚙️ 기본 설정\n"
-                    "• 신규 예매 오픈 + 잔여 좌석 변경 알림\n"
+                    "• 신규 예매 오픈 + 예매 가능 좌석 알림\n"
                     "• 모든 A열 제외 좌석 알림\n"
                     "• 별도 설정 없이 바로 사용 가능\n\n"
                     "🔧 알림 종류 선택\n"
                     "• /mode — 현재 설정과 선택 방법 확인\n"
                     "• /mode_all — 신규 오픈과 잔여 좌석 모두 받기 (기본)\n"
                     "• /mode_open — 신규 예매 오픈만\n"
-                    "• /mode_seats — 잔여 좌석 변경만\n\n"
+                    "• /mode_seats — 예매 가능 좌석만\n\n"
                     "💺 잔여 좌석 대상 (선택 사항)\n"
                     "기본값은 모든 A열 제외 좌석입니다.\n"
                     "• /seat_all — 모든 A열 제외 좌석 알림 (기본)\n"
-                    "• /seat_sweet — 아래 세 구역만 좌석 변경 알림\n"
+                    "• /seat_sweet — 아래 세 구역만 알림\n"
                     "  Extremer: F16~29, G16~29\n"
                     "  Experienced: H13~32, I13~32\n"
                     "  SweetSpot: J11~34, K11~34, L11~34\n"
                     "• /seat — 현재 좌석 대상 확인\n"
                     "※ 신규 예매 오픈 알림은 좌석 설정과 관계없이 항상 전송\n\n"
-                    "🎫 최소 취소 매수 (선택 사항)\n"
-                    "기본값은 1매부터 모두 받기입니다.\n"
-                    "• /count_1 — 1매부터 모두 받기 (기본)\n"
-                    "• /count_2 — 2매 이상 한꺼번에 풀렸을 때만\n"
-                    "• /count — 현재 설정 확인\n"
-                    "※ 1매씩 따로 취소되면 2매가 남아도 알림이 가지 않습니다\n\n"
+                    "🎫 예매 가능 최소 좌석 (선택 사항)\n"
+                    "기본값은 1석부터 모두 받기입니다.\n"
+                    "• /count_1 — 1석부터 모두 받기 (기본)\n"
+                    "• /count_2 — 2석 이상 남아 있을 때만\n"
+                    "• /count — 현재 설정 확인\n\n"
                     "📌 사용 방법\n"
                     "1. /start — 알림 구독\n"
                     "2. 명당만 원하면 /seat_sweet (선택 사항)\n"
@@ -3509,31 +3535,33 @@ class Watcher:
             if current is None:
                 continue
             previous = previous_snapshots.get(key)
-            if previous is None:
-                verdicts.setdefault(key, "첫 관측·기록만")
+
+            # A session not notified before this cycle was just handled by the
+            # booking-open alert above.  It gets no second message, and none
+            # of the exclusion rules below may overwrite that verdict.
+            if key not in previously_notified:
+                verdicts.setdefault(key, "오픈 알림으로 갈음")
                 if not self.dry_run:
                     self.state.set_seat_snapshot(key, current)
                     tally.dirty = True
                 continue
-            if not _seat_snapshot_changed(previous, current):
-                if not previous.seat_map_complete and current.seat_map_complete:
-                    # The cycle after a booking-open alert, which was sent off
-                    # the schedule total alone.  Nothing changed for anyone,
-                    # but this is the non-A baseline every later comparison
-                    # measures against, so it has to be stored.
-                    verdicts.setdefault(key, "기록만·좌석표 확인")
-                    if not self.dry_run:
-                        self.state.set_seat_snapshot(key, current)
-                        tally.dirty = True
-                continue
+
+            # Most showings sit sold out cycle after cycle now that the alert
+            # no longer waits for a change.  Log the moment a showing enters
+            # an excluded state, not every minute it stays there; the DEBUG
+            # verdict line still carries the full per-cycle census.
+            changed = previous is None or _seat_snapshot_changed(
+                previous, current
+            )
 
             if current.total == 0:
                 verdicts[key] = "제외·매진"
                 tally.suppressed_sold_out += 1
-                self.logger.info(
-                    "제외: %s 잔여 좌석이 0석입니다.",
-                    _session_line(session),
-                )
+                if changed:
+                    self.logger.info(
+                        "제외: %s 잔여 좌석이 0석입니다.",
+                        _session_line(session),
+                    )
                 if not self.dry_run:
                     self.state.set_seat_snapshot(key, current)
                     tally.dirty = True
@@ -3542,11 +3570,12 @@ class Watcher:
             if current.should_suppress:
                 verdicts[key] = "제외·A열만"
                 tally.suppressed_row_a_only += 1
-                self.logger.info(
-                    "제외: %s %s",
-                    _session_line(session),
-                    current.suppression_reason,
-                )
+                if changed:
+                    self.logger.info(
+                        "제외: %s %s",
+                        _session_line(session),
+                        current.suppression_reason,
+                    )
                 if not self.dry_run:
                     self.state.set_seat_snapshot(key, current)
                     tally.dirty = True
@@ -3555,17 +3584,21 @@ class Watcher:
             if not current.alertable:
                 verdicts[key] = "보류·A열 여부 미확인"
                 tally.deferred_keys.add(key)
-                self.logger.info(
-                    "보류: %s A열 여부 판별 실패 후 잔여 6석 이하입니다.",
-                    _session_line(session),
-                )
+                if changed:
+                    self.logger.info(
+                        "보류: %s A열 여부 판별 실패 후 잔여 6석 이하입니다.",
+                        _session_line(session),
+                    )
                 continue
 
-            # A session not notified before this cycle receives the booking-open
-            # alert above.  Do not send a second seat-change message for the same
-            # observation.
-            if key not in previously_notified:
-                verdicts.setdefault(key, "오픈 알림으로 갈음")
+            # Seats on sale are worth announcing whether or not the count
+            # moved since the last look: the subscriber wants to know a seat
+            # is bookable now, not that it changed.  A genuine change always
+            # goes out; only repeats of an unchanged showing can be throttled.
+            if not changed and not self.state.seat_alert_is_due(
+                key, self.config.local_now(), self.config.seat_alert_repeat_minutes
+            ):
+                verdicts.setdefault(key, "대기·재알림 간격")
                 if not self.dry_run:
                     self.state.set_seat_snapshot(key, current)
                     tally.dirty = True
@@ -3581,9 +3614,8 @@ class Watcher:
             tally.seat_changes += 1
             if self.dry_run:
                 self.logger.info(
-                    "드라이런 좌석 변경: %s (%d석 -> %d석)",
+                    "드라이런 예매 가능 좌석: %s (%d석)",
                     _session_line(session),
-                    previous.total,
                     current.total,
                 )
                 continue
@@ -3593,26 +3625,28 @@ class Watcher:
                 else ALERT_SEATS
             )
             # Each audience is measured against the seats it actually asked
-            # about, so a pair freeing up outside the sweet area does not
-            # satisfy a sweet subscriber's two-seat minimum.
-            freed_all = _freed_seat_count(previous, current)
-            if self.state.subscriber_ids_for(all_category, freed_seats=freed_all):
+            # about, so two seats on sale outside the sweet area do not meet a
+            # sweet subscriber's two-seat minimum.
+            open_all = _available_seat_count(current)
+            if self.state.subscriber_ids_for(
+                all_category, seats_available=open_all
+            ):
                 delivered, failed, total = self._broadcast_message(
                     seat_change_message(session, previous, current, self.config),
                     category=all_category,
-                    freed_seats=freed_all,
+                    seats_available=open_all,
                 )
             else:
                 delivered = failed = total = 0
-            sweet_delivery = _sweet_seats_became_available(previous, current)
-            freed_sweet = (
-                _freed_seat_count(*sweet_delivery) if sweet_delivery else 0
+            sweet_delivery = _sweet_seats_available(previous, current)
+            open_sweet = (
+                _available_seat_count(sweet_delivery[1]) if sweet_delivery else 0
             )
             if (
                 not current.uses_unclassified_fallback
                 and sweet_delivery is not None
                 and self.state.subscriber_ids_for(
-                    ALERT_SEATS_SWEET, freed_seats=freed_sweet
+                    ALERT_SEATS_SWEET, seats_available=open_sweet
                 )
             ):
                 sweet_delivered, sweet_failed, sweet_total = self._broadcast_message(
@@ -3625,20 +3659,19 @@ class Watcher:
                         scope_label="명당",
                     ),
                     category=ALERT_SEATS_SWEET,
-                    freed_seats=freed_sweet,
+                    seats_available=open_sweet,
                 )
                 delivered += sweet_delivered
                 failed += sweet_failed
                 total += sweet_total
             if delivered or failed or total == 0:
                 self.state.set_seat_snapshot(key, current)
-                verdicts[key] = f"발송·좌석 변경 {previous.total}→{current.total}"
+                self.state.note_seat_alert(key, self.config.local_now())
+                verdicts[key] = f"발송·예매 가능 {current.total}석"
                 tally.dirty = True
                 self.logger.info(
-                    "전송: 좌석 변경 %s (%d석 -> %d석), "
-                    "성공 %d명, 실패 %d명",
+                    "전송: 예매 가능 좌석 %s (%d석), 성공 %d명, 실패 %d명",
                     _session_line(session),
-                    previous.total,
                     current.total,
                     delivered,
                     failed,

@@ -19,9 +19,9 @@ mode_seats - 잔여 좌석만 받기
 seat - 잔여 좌석 대상 확인·변경
 seat_all - 모든 A열 제외 좌석 받기
 seat_sweet - 명당 좌석만 받기
-count - 최소 취소 매수 확인·변경
-count_1 - 1매 취소부터 모두 받기
-count_2 - 2매 이상 취소만 받기
+count - 예매 가능 최소 좌석 확인·변경
+count_1 - 1석부터 모두 받기
+count_2 - 2석 이상 남았을 때만 받기
 desc - 봇 설명과 사용 방법
 coffee - 개발자에게 커피 후원
 help - 사용법 보기
@@ -93,6 +93,7 @@ Mac이 잠자기 상태이거나 덮개가 닫혀 있으면 감시가 중단될 
 | `STRICT_IMAX_MATCH` | `true` | IMAX 이름 또는 코드가 있는 회차만 감지 |
 | `BOOKING_CLOSE_MARGIN_MINUTES` | `0` | 상영 시작 몇 분 전부터 예매 마감으로 볼지 |
 | `DEFERRED_RECHECK_CYCLES` | `5` | 보류된 회차를 몇 주기마다 다시 조회할지 |
+| `SEAT_ALERT_REPEAT_MINUTES` | `0` | 좌석 수가 그대로인 회차를 몇 분마다 다시 알릴지 (0 = 매 주기) |
 | `SEAT_RECHECK_ALWAYS_DAYS` | `2` | 잔여 수가 그대로여도 좌석표를 매 주기 다시 읽을 일수 |
 | `SEAT_RECHECK_ROTATE_DAYS` | `7` | 그 뒤로 순환하며 다시 읽을 일수 |
 | `SEAT_RECHECK_ROTATE_CYCLES` | `5` | 순환 구간을 몇 주기에 걸쳐 한 바퀴 돌지 |
