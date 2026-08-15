@@ -2794,7 +2794,24 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertNotIn("구독 현황", replies[-1][1])
 
             send(int(config.telegram_chat_id), "/help", 3)
-            self.assertNotIn("stats", replies[-1][1])
+            help_reply = replies[-1][1]
+            self.assertNotIn("stats", help_reply)
+            for command in (
+                "/start -",
+                "/stop -",
+                "/status -",
+                "/mode -",
+                "/mode_all -",
+                "/mode_open -",
+                "/mode_seats -",
+                "/seat -",
+                "/seat_sweet -",
+                "/seat_default -",
+                "/desc -",
+                "/coffee -",
+                "/help -",
+            ):
+                self.assertIn(command, help_reply)
 
     def test_stats_counts_subscribers_stored_before_the_settings_existed(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2834,8 +2851,12 @@ class WatcherIntegrationTests(unittest.TestCase):
             watcher.sync_subscribers()
             welcome = replies[-1]
 
-            self.assertIn("따로 설정하지 않아도 됩니다", welcome)
-            self.assertIn("기본 설정은 모든 A열 제외 좌석", welcome)
+            self.assertIn("🔔 기본 설정", welcome)
+            self.assertIn("신규 예매 오픈 + 잔여 좌석 변경 알림", welcome)
+            self.assertIn("모든 A열 제외 좌석 알림", welcome)
+            self.assertIn("좌석 판별 실패 알림도 포함", welcome)
+            self.assertIn("알림 종류 선택: /mode", welcome)
+            self.assertIn("좌석 판별 범위 선택: /seat", welcome)
             self.assertIn("명당 좌석만 받기: /seat_sweet", welcome)
             self.assertIn("전체 좌석으로 돌아가기: /seat_default", welcome)
             self.assertIn("신규 예매 오픈은 좌석 설정과 관계없이 항상", welcome)
@@ -2849,7 +2870,7 @@ class WatcherIntegrationTests(unittest.TestCase):
                 "/seat_verified",
             ):
                 self.assertNotIn(command, welcome)
-            self.assertLess(len(welcome.splitlines()), 12)
+            self.assertLess(len(welcome.splitlines()), 18)
 
     def test_desc_command_explains_bot_and_usage(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2885,17 +2906,32 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertIn("오디세이 예매 오픈", description)
             self.assertIn("오늘부터 28일", description)
             self.assertIn("A열만 남은 경우", description)
+            self.assertIn("⚙️ 기본 설정", description)
+            self.assertIn("/mode — 현재 설정과 선택 방법 확인", description)
+            self.assertIn(
+                "/mode_all — 신규 오픈과 잔여 좌석 모두 받기", description
+            )
+            self.assertIn("/mode_open — 신규 예매 오픈만", description)
+            self.assertIn("/mode_seats — 잔여 좌석 변경만", description)
+            self.assertIn("/seat — 좌석 판별 범위 선택", description)
             self.assertIn("/seat_sweet", description)
             self.assertIn("Extremer: F16~29, G16~29", description)
             self.assertIn("Experienced: H13~32, I13~32", description)
             self.assertIn("SweetSpot: J11~34, K11~34, L11~34", description)
             self.assertIn("/seat_default", description)
             self.assertNotIn("/seats", description)
-            self.assertIn("신규 예매 오픈 알림은 sweet/all과 관계없이 항상", description)
+            self.assertNotIn("/seat_all", description)
+            self.assertNotIn("/seat_verified", description)
+            self.assertIn("신규 예매 오픈 알림은 좌석 설정과 관계없이 항상", description)
             self.assertIn("/start — 알림 구독", description)
             self.assertIn("명당만 원하면 /seat_sweet", description)
             self.assertIn("예매 바로가기 링크 열기", description)
             self.assertIn("/stop — 알림 해지", description)
+            self.assertIn("/status — 현재 구독 및 설정 확인", description)
+            self.assertIn("/desc — 봇 설명과 사용 방법", description)
+            self.assertIn("/coffee — 개발자에게 커피 후원", description)
+            self.assertIn("/help — 전체 명령어 보기", description)
+            self.assertLess(len(description), 4096)
 
     def test_coffee_command_shows_kofi_donation_link(self):
         with tempfile.TemporaryDirectory() as temporary:
