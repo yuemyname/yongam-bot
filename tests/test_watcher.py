@@ -1079,6 +1079,156 @@ class MinimumCancellationTests(unittest.TestCase):
             )
 
 
+class BookingOpenWithoutSeatDetailTests(unittest.TestCase):
+    """Booking-open alerts ship on the schedule response alone."""
+
+    TODAY = dt.date(2026, 8, 26)
+    KEY = "0013:30001323:2026-08-26:14:30"
+    # Two sweet seats (J11~34), two ordinary ones, one in row A.
+    SEATS = [("A", "5"), ("B", "10"), ("C", "11"), ("J", "20"), ("J", "21")]
+
+    def _watcher(self, temporary):
+        config = dataclasses.replace(
+            make_config(Path(temporary)),
+            target_start=self.TODAY,
+            target_end=self.TODAY,
+        )
+        logger = logging.getLogger(f"open-fast-{id(self)}")
+        logger.handlers = [logging.NullHandler()]
+        watcher = Watcher(config, logger=logger)
+        watcher.state.remove_subscriber(config.telegram_chat_id)
+        for who in ("기본", "명당", "2매이상"):
+            watcher.state.add_subscriber(who)
+        watcher.state.set_seat_selection("명당", SEAT_SELECTION_SWEET)
+        watcher.state.set_min_cancel("2매이상", 2)
+        return watcher
+
+    def _wire(self, watcher, sold):
+        """Sell seats off the front of SEATS; return the request/alert logs."""
+
+        def free_seats():
+            return tuple(self.SEATS[sold["n"]:])
+
+        watcher.cgv.fetch_date = lambda _date: {
+            "data": [
+                {
+                    "scnsNm": "IMAX관",
+                    "scnYmd": self.TODAY.strftime("%Y%m%d"),
+                    "scnsrtTm": "1430",
+                    "scnsNo": "13",
+                    "scnSseq": "4",
+                    "frSeatCnt": len(free_seats()),
+                    "stcnt": 624,
+                }
+            ]
+        }
+        seat_requests = []
+
+        def fetch_seat(session):
+            seat_requests.append(session.start_time)
+            seats = free_seats()
+            non_a = tuple(seat for seat in seats if seat[0] != "A")
+            return SeatSnapshot(
+                total=len(seats),
+                usable=len(non_a),
+                mapped_total=len(seats),
+                available_rows=tuple(sorted({row for row, _ in seats})),
+                available_seats=non_a,
+            )
+
+        watcher.cgv.fetch_seat_snapshot = fetch_seat
+        sent = []
+        watcher.telegram.send_message = lambda text, **kwargs: sent.append(
+            (kwargs.get("chat_id"), text)
+        )
+        return seat_requests, sent
+
+    def test_the_opening_cycle_makes_no_seat_request(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(
+                Config, "local_now", return_value=_kst(self.TODAY)
+            ):
+                watcher = self._watcher(temporary)
+                seat_requests, sent = self._wire(watcher, {"n": 0})
+                result = watcher.run_cycle()
+
+            self.assertEqual(seat_requests, [])
+            self.assertEqual(result.new_sessions, 1)
+            self.assertEqual(
+                sorted(chat for chat, _text in sent),
+                ["2매이상", "기본", "명당"],
+            )
+            # /seat_sweet and /count_2 never withhold a booking-open alert.
+            self.assertTrue(
+                all("예매 오픈 감지" in text for _chat, text in sent)
+            )
+
+    def test_the_next_cycle_records_the_baseline_without_alerting(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(
+                Config, "local_now", return_value=_kst(self.TODAY)
+            ):
+                watcher = self._watcher(temporary)
+                seat_requests, sent = self._wire(watcher, {"n": 0})
+                watcher.run_cycle()
+                sent.clear()
+                watcher.run_cycle()
+
+                self.assertEqual(seat_requests, ["14:30"])
+                self.assertEqual(sent, [])
+                stored = watcher.state.seat_snapshot(self.KEY)
+
+            self.assertTrue(stored.seat_map_complete)
+            self.assertEqual(stored.usable, 4)
+
+    def test_seat_alerts_are_normal_from_the_baseline_onward(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sold = {"n": 0}
+            with patch.object(
+                Config, "local_now", return_value=_kst(self.TODAY)
+            ):
+                watcher = self._watcher(temporary)
+                seat_requests, sent = self._wire(watcher, sold)
+                watcher.run_cycle()  # 예매 오픈
+                watcher.run_cycle()  # 좌석표 기준선
+
+                def cycle(sold_count):
+                    sold["n"] = sold_count
+                    sent.clear()
+                    watcher.run_cycle()
+                    return sorted(chat for chat, _text in sent)
+
+                # A5, B10, C11 sell: five seats down to two.
+                sale = cycle(3)
+                # B10 and C11 come back: two ordinary seats freed at once.
+                pair = cycle(1)
+                pair_message = next(text for _chat, text in sent)
+                # A5 comes back: the non-A count does not move.
+                row_a = cycle(0)
+
+            self.assertEqual(sale, ["기본"])
+            # Two seats freed, but neither inside the sweet ranges.
+            self.assertEqual(pair, ["2매이상", "기본"])
+            self.assertEqual(row_a, ["기본"])
+            self.assertIn("잔여좌석/총좌석: 4/624석 (이전 2/624석)", pair_message)
+            self.assertIn("A열 제외 예매 가능: 2석 → 4석", pair_message)
+            self.assertIn("A열 제외 잔여 좌석: B10 / C11 / J20~21", pair_message)
+
+    def test_a_sold_out_new_showing_is_still_excluded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(
+                Config, "local_now", return_value=_kst(self.TODAY)
+            ):
+                watcher = self._watcher(temporary)
+                seat_requests, sent = self._wire(watcher, {"n": len(self.SEATS)})
+                result = watcher.run_cycle()
+
+            self.assertEqual(seat_requests, [])
+            self.assertEqual(sent, [])
+            self.assertEqual(result.new_sessions, 0)
+            self.assertEqual(result.suppressed_sold_out, 1)
+
+
 class ForcedSeatRecheckTests(unittest.TestCase):
     """Seat maps re-read even when the schedule total did not move."""
 
@@ -1208,7 +1358,8 @@ class ForcedSeatRecheckTests(unittest.TestCase):
         alerts = []
         watcher.telegram.send_message = lambda text, **_kwargs: alerts.append(text)
 
-        watcher.run_cycle()
+        watcher.run_cycle()  # booking-open alert, no seat request
+        watcher.run_cycle()  # baseline seat map
         alerts.clear()
         seat_requests.clear()
         # The total stays at 9: an A-row seat sells while an H-row seat frees.
@@ -1403,7 +1554,9 @@ class WatcherIntegrationTests(unittest.TestCase):
             config = make_config(Path(temporary))
             logger = logging.getLogger(f"watcher-seat-rate-limit-{id(self)}")
             logger.handlers = [logging.NullHandler()]
-            watcher = Watcher(config, logger=logger, dry_run=True)
+            watcher = Watcher(config, logger=logger)
+            watcher.telegram.send_message = lambda *_args, **_kwargs: None
+            remaining = {"count": 2}
             watcher.cgv.fetch_date = lambda _date: {
                 "data": [
                     {
@@ -1412,7 +1565,7 @@ class WatcherIntegrationTests(unittest.TestCase):
                         "scnsrtTm": start_time,
                         "scnsNo": "13",
                         "scnSseq": sequence,
-                        "frSeatCnt": 2,
+                        "frSeatCnt": remaining["count"],
                         "stcnt": 200,
                     }
                     for start_time, sequence in (
@@ -1428,6 +1581,18 @@ class WatcherIntegrationTests(unittest.TestCase):
                 attempted_sessions.append(session.start_time)
                 raise FetchError("CGV 응답 오류: HTTP 429")
 
+            # Booking-open alerts make no seat requests, so the announcement
+            # and the baseline read have to happen before the rate limit is
+            # what the cycle runs into.
+            watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
+                total=session.remaining_seats,
+                usable=session.remaining_seats,
+                mapped_total=session.remaining_seats,
+                available_rows=("B",),
+            )
+            watcher.run_cycle()
+            watcher.run_cycle()
+            remaining["count"] = 3
             watcher.cgv.fetch_seat_snapshot = fail_first_seat_request
             result = watcher.run_cycle()
 
@@ -1586,6 +1751,13 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(first.new_sessions, 1)
             self.assertEqual({chat_id for chat_id, _text in sent}, {"all", "sweet"})
             self.assertTrue(all("예매 오픈 감지" in text for _chat_id, text in sent))
+
+            # The open alert went out without reading seats, so the next cycle
+            # records the baseline the sweet filter compares against. Nothing
+            # changed, so nobody hears about it.
+            sent.clear()
+            watcher.run_cycle()
+            self.assertEqual(sent, [])
 
             sent.clear()
             seats.add(("B", "2"))
@@ -2630,7 +2802,9 @@ class WatcherIntegrationTests(unittest.TestCase):
         self.assertIn("회차 판정 3건", line)
         self.assertIn("07:00 400/624 제외·예매 마감", line)
         self.assertIn("19:00 412/624 발송·예매 오픈", line)
-        self.assertIn("22:00 5/624 보류·A열 여부 미확인", line)
+        # Five seats left used to be held back pending the row-A check; a
+        # booking-open alert no longer waits for one.
+        self.assertIn("22:00 5/624 발송·예매 오픈", line)
 
     def test_normal_runs_do_not_carry_the_per_showing_summary(self):
         now = _kst(dt.date(2026, 8, 13))
@@ -2719,22 +2893,26 @@ class WatcherIntegrationTests(unittest.TestCase):
             # Something moved, so the next look happens immediately.
             self.assertEqual(len(calls) - before, 1)
 
-    def test_a_showing_never_announced_keeps_retrying_every_cycle(self):
+    def test_an_unannounced_showing_is_sent_before_its_seats_are_read(self):
         with tempfile.TemporaryDirectory() as temporary:
             watcher, remaining, calls = self._unreadable_seat_map_watcher(
                 temporary, "unannounced", deferred_recheck_cycles=5
             )
             remaining["count"] = 5
+            sent = []
+            watcher.telegram.send_message = lambda text, **_kwargs: sent.append(
+                text
+            )
 
-            per_cycle = []
-            for _ in range(4):
-                before = len(calls)
-                watcher.run_cycle()
-                per_cycle.append(len(calls) - before)
+            first = watcher.run_cycle()
 
-            # It still owes the subscriber a booking-open alert, so the
-            # backoff must not apply to it.
-            self.assertEqual(per_cycle, [1, 1, 1, 1])
+            # Six seats or fewer used to be held back until the seat map could
+            # rule out row A. The booking-open alert now goes out on the
+            # schedule response alone, so no seat request happens at all.
+            self.assertEqual(calls, [])
+            self.assertEqual(first.new_sessions, 1)
+            self.assertEqual(len(sent), 1)
+            self.assertIn("예매 오픈 감지", sent[0])
 
     def _watcher_with_failing_subscriber(self, temporary, name, error, **overrides):
         settings = {
@@ -3342,10 +3520,9 @@ class WatcherIntegrationTests(unittest.TestCase):
                 "상영 시작시간 14:30 — 100/624석",
                 sent_messages[0],
             )
-            self.assertIn(
-                "A열 제외 잔여 좌석: B1~100",
-                sent_messages[0],
-            )
+            # No seat map is read for a booking-open alert, so it carries the
+            # start time and the count and nothing about seat locations.
+            self.assertNotIn("잔여 좌석:", sent_messages[0])
             self.assertLess(
                 sent_messages[0].index("📅 상영일"),
                 sent_messages[0].index("영화: 오디세이"),
@@ -3459,7 +3636,15 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(second.seat_changes, 0)
             self.assertEqual(second.suppressed_row_a_only, 1)
 
-    def test_suppresses_new_session_when_only_row_a_remains(self):
+    def test_a_new_showing_is_sent_before_row_a_can_be_ruled_out(self):
+        """Row A is not checked on a booking-open alert, by design.
+
+        The check costs one request per showing, and a showing that has just
+        opened has its whole auditorium free, so there is nothing to exclude.
+        Only a restart, which makes every showing look new again, can reach a
+        row-A-only showing here.
+        """
+
         with tempfile.TemporaryDirectory() as temporary:
             config = make_config(Path(temporary))
             logger = logging.getLogger(f"watcher-row-a-{id(self)}")
@@ -3479,22 +3664,33 @@ class WatcherIntegrationTests(unittest.TestCase):
                     }
                 ]
             }
-            watcher.cgv.fetch_seat_snapshot = lambda _session: SeatSnapshot(
-                total=2,
-                usable=0,
-                mapped_total=2,
-                available_rows=("A",),
-            )
+            seat_calls = []
+
+            def seat(_session):
+                seat_calls.append(_session.start_time)
+                return SeatSnapshot(
+                    total=2, usable=0, mapped_total=2, available_rows=("A",)
+                )
+
+            watcher.cgv.fetch_seat_snapshot = seat
             sent_messages = []
             watcher.telegram.send_message = (
                 lambda text, **_kwargs: sent_messages.append(text)
             )
 
-            result = watcher.run_cycle()
+            first = watcher.run_cycle()
 
-            self.assertEqual(sent_messages, [])
-            self.assertEqual(result.new_sessions, 0)
-            self.assertEqual(result.suppressed_row_a_only, 1)
+            self.assertEqual(seat_calls, [])
+            self.assertEqual(first.new_sessions, 1)
+            self.assertEqual(len(sent_messages), 1)
+
+            # The very next cycle reads the map, and from then on the row-A
+            # rule applies again: no further alert for this showing.
+            second = watcher.run_cycle()
+
+            self.assertEqual(seat_calls, ["14:30"])
+            self.assertEqual(second.new_sessions, 0)
+            self.assertEqual(len(sent_messages), 1)
 
     def test_defers_new_alert_after_seat_detail_error_then_retries(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3536,21 +3732,34 @@ class WatcherIntegrationTests(unittest.TestCase):
             first = watcher.run_cycle()
             session = BookingSession(date="2026-08-26", start_time="14:30")
             key = session.notification_key(site_no="0013", movie_no="30001323")
-            self.assertEqual(first.new_sessions, 0)
-            self.assertEqual(first.deferred_seat_details, 1)
-            self.assertEqual(first.seat_detail_errors, 1)
-            self.assertFalse(watcher.state.was_notified(key))
-            self.assertEqual(sent_messages, [])
+            # A seat request that cannot succeed no longer delays the alert,
+            # because the alert never waited for one.
+            self.assertEqual(first.new_sessions, 1)
+            self.assertEqual(first.seat_detail_errors, 0)
+            self.assertTrue(watcher.state.was_notified(key))
+            self.assertEqual(len(sent_messages), 1)
 
-            detail_available["value"] = True
+            # The baseline read is what now hits the failure, and it is the
+            # one that gets put on the backoff.
             second = watcher.run_cycle()
 
-            self.assertEqual(second.new_sessions, 1)
-            self.assertEqual(second.deferred_seat_details, 0)
+            self.assertEqual(second.new_sessions, 0)
+            self.assertEqual(second.seat_detail_errors, 1)
+            self.assertIn(key, watcher.state.data["deferred"])
             self.assertEqual(len(sent_messages), 1)
-            self.assertTrue(watcher.state.was_notified(key))
 
-    def test_alerts_new_session_with_seven_seats_after_detail_error(self):
+            # Backoff in effect: the next cycles coast instead of re-asking.
+            detail_available["value"] = True
+            seat_calls_before = second.seat_detail_errors
+            third = watcher.run_cycle()
+
+            self.assertEqual(third.seat_detail_errors, 0)
+            self.assertEqual(third.deferred_rechecks_skipped, 1)
+            self.assertIsNone(watcher.state.seat_snapshot(key).usable)
+            self.assertEqual(len(sent_messages), 1)
+            self.assertEqual(seat_calls_before, 1)
+
+    def test_a_new_session_alerts_without_asking_for_seat_detail(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = make_config(Path(temporary))
             logger = logging.getLogger(f"watcher-fallback-new-{id(self)}")
@@ -3585,11 +3794,14 @@ class WatcherIntegrationTests(unittest.TestCase):
 
             self.assertEqual(result.new_sessions, 1)
             self.assertEqual(result.deferred_seat_details, 0)
-            self.assertEqual(result.seat_detail_errors, 1)
-            self.assertEqual(result.unclassified_fallback_alerts, 1)
+            # The failing seat request is never made, so it cannot be counted.
+            self.assertEqual(result.seat_detail_errors, 0)
             self.assertEqual(len(sent_messages), 1)
             self.assertIn("7/200석", sent_messages[0])
-            self.assertIn("A열 여부 미확인", sent_messages[0])
+            # No seat map was read, so the alert claims nothing about row A —
+            # neither a seat list nor the "unverified" warning that goes with
+            # falling back to the schedule total.
+            self.assertNotIn("A열", sent_messages[0])
             self.assertTrue(watcher.state.was_notified(key))
 
     def test_alerts_seat_change_with_seven_seats_after_detail_error(self):

@@ -3322,6 +3322,18 @@ class Watcher:
                 snapshots[key] = SeatSnapshot(total=0)
                 continue
 
+            if key not in previously_notified:
+                # A showing nobody has been told about goes out on the
+                # schedule response alone.  Reading its seat map costs one
+                # request per showing — twelve seconds on a five-show day
+                # between spotting the opening and sending it — and buys
+                # nothing: a showing that just opened has its whole auditorium
+                # free, so there is no row-A-only case to exclude and no seat
+                # list worth printing.  The map gets read on a later cycle,
+                # once the count starts moving.
+                snapshots[key] = SeatSnapshot(total=remaining)
+                continue
+
             show_date = _parse_show_date(session.date)
             forced_recheck = show_date is not None and self._forces_seat_recheck(
                 show_date, today
@@ -3331,14 +3343,14 @@ class Watcher:
                 forced_recheck
                 or previous is None
                 or previous.total != remaining
-                or (
-                    key not in previously_notified
-                    and not previous.seat_map_complete
-                )
+                # The booking-open alert went out without reading the map, so
+                # the first cycle after it buys the non-A baseline that seat
+                # comparisons need.  Until it exists there is nothing to tell
+                # a /seat_sweet or /count_2 subscriber apart by.
+                or not previous.seat_map_complete
             )
-            # Only showings already announced may coast.  One we have never
-            # alerted on still owes the subscriber a booking-open message, so
-            # it keeps asking every cycle until the seat map can be read.
+            # A map CGV will not render must not be re-requested every minute,
+            # which is what the deferral backoff below is for.
             if (
                 needs_detail
                 and key in previously_notified
@@ -3412,11 +3424,15 @@ class Watcher:
                 snapshot = snapshots.get(key)
                 if snapshot is None:
                     continue
+                # "We asked and still have no usable map."  A snapshot that
+                # alerts off the schedule total alone counts too: it can carry
+                # the alert, but not the non-A baseline, so re-reading it is
+                # still worth throttling rather than repeating every cycle.
                 unresolved = (
                     key in previously_notified
                     and snapshot.total > 0
                     and not snapshot.should_suppress
-                    and not snapshot.alertable
+                    and not snapshot.seat_map_complete
                 )
                 changed = (
                     self.state.note_deferred(
@@ -3434,74 +3450,30 @@ class Watcher:
             for session in sessions
             if session_keys[session] not in previously_notified
         ]
+        # With the seat map out of the picture, sold out is the only thing
+        # left that can disqualify a newly opened showing.
         sold_out_new_sessions = [
             session
             for session in detected_new_sessions
             if snapshots.get(session_keys[session]) is not None
             and snapshots[session_keys[session]].total == 0
         ]
-        suppressed_new_sessions = [
-            session
-            for session in detected_new_sessions
-            if snapshots.get(session_keys[session]) is not None
-            and snapshots[session_keys[session]].total > 0
-            and snapshots[session_keys[session]].should_suppress
-        ]
-        deferred_new_sessions = [
-            session
-            for session in detected_new_sessions
-            if session not in sold_out_new_sessions
-            and session not in suppressed_new_sessions
-            and (
-                snapshots.get(session_keys[session]) is None
-                or not snapshots[session_keys[session]].alertable
-            )
-        ]
         new_sessions = [
             session
             for session in detected_new_sessions
             if snapshots.get(session_keys[session]) is not None
-            and snapshots[session_keys[session]].alertable
+            and snapshots[session_keys[session]].total > 0
         ]
 
         for session in sold_out_new_sessions:
             verdicts[session_keys[session]] = "제외·매진"
-        for session in suppressed_new_sessions:
-            verdicts[session_keys[session]] = "제외·A열만"
-        for session in deferred_new_sessions:
-            verdicts[session_keys[session]] = "보류·A열 여부 미확인"
 
         tally.suppressed_sold_out += len(sold_out_new_sessions)
-        tally.deferred_keys.update(
-            session_keys[session] for session in deferred_new_sessions
-        )
-        unclassified_new_keys = {
-            session_keys[session]
-            for session in new_sessions
-            if snapshots[session_keys[session]].uses_unclassified_fallback
-        }
-        tally.unclassified_fallback_alerts += len(unclassified_new_keys)
-        tally.suppressed_row_a_only += sum(
-            snapshots[session_keys[session]].row_a_only
-            for session in suppressed_new_sessions
-        )
-        for session in suppressed_new_sessions:
-            snapshot = snapshots[session_keys[session]]
-            self.logger.info(
-                "제외: %s %s",
-                _session_line(session),
-                snapshot.suppression_reason,
-            )
 
         if sold_out_new_sessions:
             self.logger.info(
                 "제외: 잔여 0석인 신규 회차 %d개",
                 len(sold_out_new_sessions),
-            )
-        if deferred_new_sessions:
-            self.logger.info(
-                "보류: A열 여부 판별 실패 후 잔여 6석 이하인 신규 회차 %d개",
-                len(deferred_new_sessions),
             )
 
         if new_sessions:
@@ -3514,7 +3486,6 @@ class Watcher:
                 for text, chunk_sessions in message_chunks(
                     new_sessions,
                     self.config,
-                    unclassified_keys=unclassified_new_keys,
                     seat_snapshots=snapshots,
                 ):
                     delivered, failed, total = self._broadcast_message(
@@ -3545,6 +3516,15 @@ class Watcher:
                     tally.dirty = True
                 continue
             if not _seat_snapshot_changed(previous, current):
+                if not previous.seat_map_complete and current.seat_map_complete:
+                    # The cycle after a booking-open alert, which was sent off
+                    # the schedule total alone.  Nothing changed for anyone,
+                    # but this is the non-A baseline every later comparison
+                    # measures against, so it has to be stored.
+                    verdicts.setdefault(key, "기록만·좌석표 확인")
+                    if not self.dry_run:
+                        self.state.set_seat_snapshot(key, current)
+                        tally.dirty = True
                 continue
 
             if current.total == 0:
