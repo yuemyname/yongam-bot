@@ -635,45 +635,12 @@ class AlertModeStateTests(unittest.TestCase):
             self.assertEqual(store.subscriber_ids_for(ALERT_SEATS), ("1", "3"))
             self.assertEqual(store.subscriber_ids_for(ALERT_SYSTEM), ("1", "2", "3"))
 
-    def test_unclassified_seat_alerts_skip_verified_only_subscribers(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            store = StateStore(Path(temporary) / "notified.json")
-            for chat_id in ("1", "2", "3"):
-                store.add_subscriber(chat_id)
-            store.set_alert_mode("3", ALERT_MODE_OPEN_ONLY)
-            self.assertTrue(store.set_verified_seats_only("2", True))
-
-            # Classified seat alerts still reach both seat subscribers.
-            self.assertEqual(store.subscriber_ids_for(ALERT_SEATS), ("1", "2"))
-            # Unclassified ones skip the subscriber who asked for verified only.
-            self.assertEqual(
-                store.subscriber_ids_for(ALERT_SEATS_UNCLASSIFIED), ("1",)
-            )
-            # The open-only subscriber is never in either seat audience.
-            self.assertNotIn("3", store.subscriber_ids_for(ALERT_SEATS))
-
-    def test_verified_seats_preference_defaults_off_and_persists(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "notified.json"
-            store = StateStore(path)
-            store.add_subscriber("111")
-
-            self.assertFalse(store.verified_seats_only("111"))
-            self.assertTrue(store.set_verified_seats_only("111", True))
-            self.assertFalse(store.set_verified_seats_only("111", True))
-            store.save()
-
-            reloaded = StateStore(path)
-            reloaded.load()
-            self.assertTrue(reloaded.verified_seats_only("111"))
-            self.assertTrue(reloaded.set_verified_seats_only("111", False))
-
     def test_subscriber_stored_before_the_feature_accepts_unclassified(self):
         with tempfile.TemporaryDirectory() as temporary:
             store = StateStore(Path(temporary) / "notified.json")
             store.data["subscribers"]["999"] = {"subscribed_at": "2026-01-01T00:00:00"}
 
-            self.assertFalse(store.verified_seats_only("999"))
+            self.assertEqual(store.seat_selection("999"), SEAT_SELECTION_ALL)
             self.assertIn("999", store.subscriber_ids_for(ALERT_SEATS_UNCLASSIFIED))
 
     def test_rejects_an_unknown_mode(self):
@@ -1360,7 +1327,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(sent, [])
 
     def _watcher_with_two_seat_audiences(self, temporary, name):
-        """Two seat-alert subscribers: 'open-info' accepts unclassified, 'strict' does not."""
+        """Two seat subscribers: 'open-info' wants every seat, 'strict' only sweet ones."""
 
         config = make_config(Path(temporary))
         logger = logging.getLogger(f"watcher-{name}-{id(self)}")
@@ -1369,63 +1336,8 @@ class WatcherIntegrationTests(unittest.TestCase):
         watcher.state.remove_subscriber(config.telegram_chat_id)
         for chat_id in ("open-info", "strict"):
             watcher.state.add_subscriber(chat_id)
-        watcher.state.set_verified_seats_only("strict", True)
+        watcher.state.set_seat_selection("strict", SEAT_SELECTION_SWEET)
         return watcher
-
-    def test_unclassified_seat_change_skips_verified_only_subscriber(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            watcher = self._watcher_with_two_seat_audiences(temporary, "strict-seat")
-            remaining = {"count": 10}
-            watcher.cgv.fetch_date = lambda _date: self._schedule_payload(
-                remaining["count"]
-            )
-            # No A-row breakdown: CGV's detail response could not be classified,
-            # so the alert carries the "A열 여부 미확인" fallback.
-            watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
-                total=session.remaining_seats
-            )
-            sent = []
-            watcher.telegram.send_message = lambda text, **kwargs: sent.append(
-                (kwargs.get("chat_id"), text)
-            )
-
-            watcher.run_cycle()
-            sent.clear()
-            remaining["count"] = 9
-            result = watcher.run_cycle()
-
-            self.assertEqual(result.seat_changes, 1)
-            self.assertEqual({chat_id for chat_id, _ in sent}, {"open-info"})
-            self.assertIn("A열 여부 미확인", sent[0][1])
-
-    def test_classified_seat_change_reaches_verified_only_subscriber(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            watcher = self._watcher_with_two_seat_audiences(temporary, "classified")
-            remaining = {"count": 10}
-            watcher.cgv.fetch_date = lambda _date: self._schedule_payload(
-                remaining["count"]
-            )
-            watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
-                total=session.remaining_seats,
-                usable=session.remaining_seats - 2,
-                mapped_total=session.remaining_seats,
-                available_rows=("B",),
-            )
-            sent = []
-            watcher.telegram.send_message = lambda text, **kwargs: sent.append(
-                (kwargs.get("chat_id"), text)
-            )
-
-            watcher.run_cycle()
-            sent.clear()
-            remaining["count"] = 9
-            result = watcher.run_cycle()
-
-            self.assertEqual(result.seat_changes, 1)
-            self.assertEqual(
-                {chat_id for chat_id, _ in sent}, {"open-info", "strict"}
-            )
-            self.assertNotIn("A열 여부 미확인", sent[0][1])
 
     def test_unclassified_seat_change_is_recorded_with_no_recipients(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1455,76 +1367,6 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(third.seat_changes, 0)
             self.assertEqual(sent, [])
 
-    def test_seat_info_commands_change_and_report_preference(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            config = dataclasses.replace(
-                make_config(Path(temporary)), subscriptions_enabled=True
-            )
-            logger = logging.getLogger(f"watcher-seat-cmd-{id(self)}")
-            logger.handlers = [logging.NullHandler()]
-            watcher = Watcher(config, logger=logger)
-            replies = []
-
-            def batch(update_id, text, chat_id=111222):
-                return [
-                    {
-                        "update_id": update_id,
-                        "message": {
-                            "text": text,
-                            "chat": {"id": chat_id, "type": "private"},
-                        },
-                    }
-                ]
-
-            batches = [
-                batch(1, "/seat_verified", chat_id=555),
-                batch(2, "/start"),
-                batch(3, "/seat"),
-                batch(4, "/seat_verified@YongsanBot"),
-                batch(5, "/status"),
-                batch(6, "/seat 전체"),
-                batch(7, "/seat nonsense"),
-                batch(8, "/mode_open"),
-                batch(9, "/seat_verified"),
-            ]
-            watcher.telegram.get_updates = lambda **_kwargs: batches.pop(0)
-            watcher.telegram.send_message = lambda text, **kwargs: replies.append(
-                (kwargs.get("chat_id"), text)
-            )
-
-            watcher.sync_subscribers()
-            self.assertIn("구독 중이 아닙니다", replies[-1][1])
-
-            watcher.sync_subscribers()
-            self.assertFalse(watcher.state.verified_seats_only("111222"))
-
-            watcher.sync_subscribers()
-            self.assertIn("현재 잔여 좌석 알림 범위", replies[-1][1])
-
-            watcher.sync_subscribers()
-            self.assertTrue(watcher.state.verified_seats_only("111222"))
-            self.assertIn("A열 제외 좌석이 확인된 알림만", replies[-1][1])
-
-            watcher.sync_subscribers()
-            self.assertIn("좌석 알림 범위:", replies[-1][1])
-
-            watcher.sync_subscribers()
-            self.assertFalse(watcher.state.verified_seats_only("111222"))
-
-            watcher.sync_subscribers()
-            self.assertIn("알 수 없는 좌석 알림 범위", replies[-1][1])
-
-            # Switching to open-only alerts makes the seat preference inert, and
-            # the reply should say so rather than silently accepting it.
-            watcher.sync_subscribers()
-            watcher.sync_subscribers()
-            self.assertTrue(watcher.state.verified_seats_only("111222"))
-            self.assertIn("잔여 좌석 알림을 받지 않는 설정", replies[-1][1])
-
-            reloaded = StateStore(config.state_file)
-            reloaded.load()
-            self.assertTrue(reloaded.verified_seats_only("111222"))
-
     def test_seat_selection_commands_change_and_report_sweet_preference(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = dataclasses.replace(
@@ -1551,9 +1393,9 @@ class WatcherIntegrationTests(unittest.TestCase):
                 batch(2, "/start"),
                 batch(3, "/seat_sweet@YongsanBot"),
                 batch(4, "/status"),
-                batch(5, "/seat_default"),
-                batch(6, "/seat_default"),
-                batch(7, "/seats sweet"),
+                batch(5, "/seat_all"),
+                batch(6, "/seat_all"),
+                batch(7, "/seat"),
             ]
             watcher.telegram.get_updates = lambda **_kwargs: batches.pop(0)
             watcher.telegram.send_message = lambda text, **kwargs: replies.append(
@@ -1575,7 +1417,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertIn("명당 좌석만", replies[-1][1])
 
             watcher.sync_subscribers()
-            self.assertIn("선호 좌석: 명당 좌석만", replies[-1][1])
+            self.assertIn("잔여 좌석 대상: 명당 좌석만", replies[-1][1])
 
             watcher.sync_subscribers()
             self.assertEqual(
@@ -1586,7 +1428,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertIn("이미 이렇게 설정", replies[-1][1])
 
             watcher.sync_subscribers()
-            self.assertIn("사용 가능한 명령어", replies[-1][1])
+            self.assertIn("현재 잔여 좌석 대상", replies[-1][1])
             self.assertEqual(
                 watcher.state.seat_selection("111222"), SEAT_SELECTION_ALL
             )
@@ -2761,7 +2603,7 @@ class WatcherIntegrationTests(unittest.TestCase):
                 )
             watcher.state.set_alert_mode("2000", ALERT_MODE_OPEN_ONLY)
             watcher.state.set_alert_mode("2001", ALERT_MODE_SEATS_ONLY)
-            watcher.state.set_verified_seats_only("2002", True)
+            watcher.state.set_seat_selection("2002", SEAT_SELECTION_SWEET)
             watcher.state.set_seat_selection("2003", SEAT_SELECTION_SWEET)
 
             replies = []
@@ -2786,8 +2628,8 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertIn("전체 5명", operator_reply)
             self.assertIn("신규 오픈만 — 1명", operator_reply)
             self.assertIn("잔여 좌석만 — 1명", operator_reply)
-            self.assertIn("A열 제외 좌석이 확인된 알림만 — 1명", operator_reply)
-            self.assertIn("명당 좌석만 — 1명", operator_reply)
+            self.assertIn("모든 A열 제외 좌석 — 3명", operator_reply)
+            self.assertIn("명당 좌석만 — 2명", operator_reply)
 
             # A subscriber gets the generic reply, so the command stays hidden.
             send(2000, "/stats", 2)
@@ -2807,7 +2649,7 @@ class WatcherIntegrationTests(unittest.TestCase):
                 "/mode_seats -",
                 "/seat -",
                 "/seat_sweet -",
-                "/seat_default -",
+                "/seat_sweet -",
                 "/desc -",
                 "/coffee -",
                 "/help -",
@@ -2824,7 +2666,7 @@ class WatcherIntegrationTests(unittest.TestCase):
 
             self.assertEqual(breakdown["total"], 2)
             self.assertEqual(breakdown["modes"][ALERT_MODE_ALL], 2)
-            self.assertEqual(breakdown["verified_seats_only"], 0)
+            self.assertEqual(breakdown["seat_selections"][SEAT_SELECTION_ALL], 2)
             self.assertEqual(breakdown["seat_selections"][SEAT_SELECTION_ALL], 2)
             self.assertEqual(breakdown["chat_types"]["group"], 1)
             self.assertEqual(breakdown["chat_types"]["unknown"], 1)
@@ -2854,22 +2696,13 @@ class WatcherIntegrationTests(unittest.TestCase):
 
             self.assertIn("🔔 기본 설정", welcome)
             self.assertIn("신규 예매 오픈 + 잔여 좌석 변경 알림", welcome)
-            self.assertIn("모든 A열 제외 좌석 알림", welcome)
-            self.assertIn("좌석 판별 실패 알림도 포함", welcome)
+            self.assertIn("잔여 좌석은 모든 A열 제외 좌석", welcome)
             self.assertIn("알림 종류 선택: /mode", welcome)
-            self.assertIn("좌석 판별 범위 선택: /seat", welcome)
+            self.assertIn("잔여 좌석 대상 선택: /seat", welcome)
             self.assertIn("명당 좌석만 받기: /seat_sweet", welcome)
-            self.assertIn("전체 좌석으로 돌아가기: /seat_default", welcome)
             self.assertIn("신규 예매 오픈은 좌석 설정과 관계없이 항상", welcome)
-            self.assertNotIn("/seats", welcome)
             # Listing every setting made a finished subscription look unfinished.
-            for command in (
-                "/mode_all",
-                "/mode_open",
-                "/mode_seats",
-                "/seat_all",
-                "/seat_verified",
-            ):
+            for command in ("/mode_all", "/mode_open", "/mode_seats", "/seat_all"):
                 self.assertNotIn(command, welcome)
             self.assertLess(len(welcome.splitlines()), 18)
 
@@ -2914,15 +2747,14 @@ class WatcherIntegrationTests(unittest.TestCase):
             )
             self.assertIn("/mode_open — 신규 예매 오픈만", description)
             self.assertIn("/mode_seats — 잔여 좌석 변경만", description)
-            self.assertIn("/seat — 좌석 판별 범위 선택", description)
+            self.assertIn("/seat_all — 모든 A열 제외 좌석 알림 (기본)", description)
             self.assertIn("/seat_sweet", description)
             self.assertIn("Extremer: F16~29, G16~29", description)
             self.assertIn("Experienced: H13~32, I13~32", description)
             self.assertIn("SweetSpot: J11~34, K11~34, L11~34", description)
-            self.assertIn("/seat_default", description)
-            self.assertNotIn("/seats", description)
-            self.assertNotIn("/seat_all", description)
+            # The verified/unverified split is gone; one seat choice remains.
             self.assertNotIn("/seat_verified", description)
+            self.assertNotIn("/seat_default", description)
             self.assertIn("신규 예매 오픈 알림은 좌석 설정과 관계없이 항상", description)
             self.assertIn("/start — 알림 구독", description)
             self.assertIn("명당만 원하면 /seat_sweet", description)
