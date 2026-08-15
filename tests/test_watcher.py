@@ -18,10 +18,13 @@ from watcher import (
     ALERT_MODE_SEATS_ONLY,
     ALERT_OPEN,
     ALERT_SEATS,
+    ALERT_SEATS_SWEET,
     ALERT_SEATS_UNCLASSIFIED,
     ALERT_SYSTEM,
     SCAN_MODE_CURSOR,
     SCAN_MODE_FULL,
+    SEAT_SELECTION_ALL,
+    SEAT_SELECTION_SWEET,
     STATE_VERSION,
     BookingSession,
     CgvClient,
@@ -34,6 +37,7 @@ from watcher import (
     TimezoneFormatter,
     Watcher,
     _available_seat_line,
+    _sweet_seat_snapshot,
     booking_url_for_session,
     _seat_snapshot_changed,
     extract_seat_snapshot,
@@ -384,6 +388,44 @@ class SeatSnapshotTests(unittest.TestCase):
             "A열 제외 잔여 좌석: B열 3석 / C열 3석 (좌석 번호가 많아 행별 수량으로 요약)",
         )
 
+    def test_sweet_preset_combines_all_three_recommended_areas(self):
+        locations = (
+            ("F", "15"),
+            ("F", "16"),
+            ("G", "29"),
+            ("G", "30"),
+            ("H", "13"),
+            ("I", "32"),
+            ("J", "11"),
+            ("K", "34"),
+            ("L", "34"),
+            ("L", "35"),
+            ("M", "20"),
+        )
+        snapshot = SeatSnapshot(
+            total=len(locations),
+            usable=len(locations),
+            mapped_total=len(locations),
+            available_rows=tuple(sorted({row for row, _number in locations})),
+            available_seats=locations,
+        )
+
+        sweet = _sweet_seat_snapshot(snapshot)
+
+        self.assertIsNotNone(sweet)
+        self.assertEqual(
+            sweet.available_seats,
+            (
+                ("F", "16"),
+                ("G", "29"),
+                ("H", "13"),
+                ("I", "32"),
+                ("J", "11"),
+                ("K", "34"),
+                ("L", "34"),
+            ),
+        )
+
 
 class StateStoreTests(unittest.TestCase):
     def test_persists_notification_keys(self):
@@ -639,6 +681,35 @@ class AlertModeStateTests(unittest.TestCase):
             store.add_subscriber("1")
             with self.assertRaises(ValueError):
                 store.set_alert_mode("1", "nope")
+
+    def test_seat_selection_defaults_to_all_and_routes_sweet_separately(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "notified.json"
+            store = StateStore(path)
+            store.add_subscriber("all")
+            store.add_subscriber("sweet")
+
+            self.assertEqual(store.seat_selection("all"), SEAT_SELECTION_ALL)
+            self.assertTrue(
+                store.set_seat_selection("sweet", SEAT_SELECTION_SWEET)
+            )
+            self.assertEqual(store.subscriber_ids_for(ALERT_SEATS), ("all",))
+            self.assertEqual(
+                store.subscriber_ids_for(ALERT_SEATS_SWEET), ("sweet",)
+            )
+            self.assertEqual(
+                store.subscriber_ids_for(ALERT_SEATS_UNCLASSIFIED), ("all",)
+            )
+            self.assertEqual(
+                store.subscriber_ids_for(ALERT_OPEN), ("all", "sweet")
+            )
+            store.save()
+
+            reloaded = StateStore(path)
+            reloaded.load()
+            self.assertEqual(
+                reloaded.seat_selection("sweet"), SEAT_SELECTION_SWEET
+            )
 
 
 class ScanPlanTests(unittest.TestCase):
@@ -1070,6 +1141,59 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual({chat_id for chat_id, _ in sent}, {"2", "3"})
             self.assertIn("잔여 좌석 변경", sent[0][1])
 
+    def test_sweet_selection_filters_changes_but_not_new_openings(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            logger = logging.getLogger(f"watcher-sweet-routing-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            watcher.state.remove_subscriber(config.telegram_chat_id)
+            watcher.state.add_subscriber("all")
+            watcher.state.add_subscriber("sweet")
+            watcher.state.set_seat_selection("sweet", SEAT_SELECTION_SWEET)
+            seats = {("B", "1"), ("J", "20")}
+
+            watcher.cgv.fetch_date = lambda _date: self._schedule_payload(len(seats))
+
+            def snapshot(_session):
+                locations = tuple(sorted(seats))
+                return SeatSnapshot(
+                    total=len(locations),
+                    usable=len(locations),
+                    mapped_total=len(locations),
+                    available_rows=tuple(
+                        sorted({row for row, _number in locations})
+                    ),
+                    available_seats=locations,
+                )
+
+            watcher.cgv.fetch_seat_snapshot = snapshot
+            sent = []
+            watcher.telegram.send_message = lambda text, **kwargs: sent.append(
+                (kwargs.get("chat_id"), text)
+            )
+
+            first = watcher.run_cycle()
+            self.assertEqual(first.new_sessions, 1)
+            self.assertEqual({chat_id for chat_id, _text in sent}, {"all", "sweet"})
+            self.assertTrue(all("예매 오픈 감지" in text for _chat_id, text in sent))
+
+            sent.clear()
+            seats.add(("B", "2"))
+            second = watcher.run_cycle()
+            self.assertEqual(second.seat_changes, 1)
+            self.assertEqual([chat_id for chat_id, _text in sent], ["all"])
+
+            sent.clear()
+            seats.add(("K", "21"))
+            third = watcher.run_cycle()
+            self.assertEqual(third.seat_changes, 1)
+            self.assertEqual({chat_id for chat_id, _text in sent}, {"all", "sweet"})
+            sweet_text = next(text for chat_id, text in sent if chat_id == "sweet")
+            self.assertIn("명당 예매 가능: 1석 → 2석", sweet_text)
+            self.assertIn("명당 잔여 좌석: J20 / K21", sweet_text)
+            self.assertNotIn("B1", sweet_text)
+
     def test_partial_open_delivery_retries_only_the_failed_subscriber(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = make_config(Path(temporary))
@@ -1399,6 +1523,75 @@ class WatcherIntegrationTests(unittest.TestCase):
             reloaded = StateStore(config.state_file)
             reloaded.load()
             self.assertTrue(reloaded.verified_seats_only("111222"))
+
+    def test_seats_command_changes_and_reports_sweet_preference(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = dataclasses.replace(
+                make_config(Path(temporary)), subscriptions_enabled=True
+            )
+            logger = logging.getLogger(f"watcher-seats-cmd-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            replies = []
+
+            def batch(update_id, text, chat_id=111222):
+                return [
+                    {
+                        "update_id": update_id,
+                        "message": {
+                            "text": text,
+                            "chat": {"id": chat_id, "type": "private"},
+                        },
+                    }
+                ]
+
+            batches = [
+                batch(1, "/seats sweet", chat_id=555),
+                batch(2, "/start"),
+                batch(3, "/seats"),
+                batch(4, "/seats@YongsanBot sweet"),
+                batch(5, "/status"),
+                batch(6, "/seats all"),
+                batch(7, "/seats nonsense"),
+            ]
+            watcher.telegram.get_updates = lambda **_kwargs: batches.pop(0)
+            watcher.telegram.send_message = lambda text, **kwargs: replies.append(
+                (kwargs.get("chat_id"), text)
+            )
+
+            watcher.sync_subscribers()
+            self.assertIn("구독 중이 아닙니다", replies[-1][1])
+
+            watcher.sync_subscribers()
+            self.assertEqual(
+                watcher.state.seat_selection("111222"), SEAT_SELECTION_ALL
+            )
+
+            watcher.sync_subscribers()
+            self.assertIn("현재 좌석 선택", replies[-1][1])
+
+            watcher.sync_subscribers()
+            self.assertEqual(
+                watcher.state.seat_selection("111222"), SEAT_SELECTION_SWEET
+            )
+            self.assertIn("명당 좌석만", replies[-1][1])
+
+            watcher.sync_subscribers()
+            self.assertIn("선호 좌석: 명당 좌석만", replies[-1][1])
+
+            watcher.sync_subscribers()
+            self.assertEqual(
+                watcher.state.seat_selection("111222"), SEAT_SELECTION_ALL
+            )
+
+            watcher.sync_subscribers()
+            self.assertIn("알 수 없는 좌석 선택", replies[-1][1])
+
+            reloaded = StateStore(config.state_file)
+            reloaded.load()
+            self.assertEqual(
+                reloaded.seat_selection("111222"), SEAT_SELECTION_ALL
+            )
 
     def _cursor_watcher(self, temporary, name, **overrides):
         settings = {
@@ -2565,6 +2758,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             watcher.state.set_alert_mode("2000", ALERT_MODE_OPEN_ONLY)
             watcher.state.set_alert_mode("2001", ALERT_MODE_SEATS_ONLY)
             watcher.state.set_verified_seats_only("2002", True)
+            watcher.state.set_seat_selection("2003", SEAT_SELECTION_SWEET)
 
             replies = []
             watcher.telegram.send_message = lambda text, **kwargs: replies.append(
@@ -2589,6 +2783,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertIn("신규 오픈만 — 1명", operator_reply)
             self.assertIn("잔여 좌석만 — 1명", operator_reply)
             self.assertIn("A열 제외 좌석이 확인된 알림만 — 1명", operator_reply)
+            self.assertIn("명당 좌석만 — 1명", operator_reply)
 
             # A subscriber gets the generic reply, so the command stays hidden.
             send(2000, "/stats", 2)
@@ -2609,6 +2804,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(breakdown["total"], 2)
             self.assertEqual(breakdown["modes"][ALERT_MODE_ALL], 2)
             self.assertEqual(breakdown["verified_seats_only"], 0)
+            self.assertEqual(breakdown["seat_selections"][SEAT_SELECTION_ALL], 2)
             self.assertEqual(breakdown["chat_types"]["group"], 1)
             self.assertEqual(breakdown["chat_types"]["unknown"], 1)
 
