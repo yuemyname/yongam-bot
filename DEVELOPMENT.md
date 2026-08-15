@@ -43,7 +43,7 @@ SUBSCRIPTIONS_ENABLED=true
 
 `TELEGRAM_CHAT_ID`는 최초 운영자를 기존 알림 구독자로 한 번 등록하는 데 사용됩니다. 이후 일반 사용자는 자신의 채팅에서 `/start`만 보내면 자동 등록됩니다. `/stop`으로 해지한 운영자는 재배포 후에도 자동으로 다시 등록되지 않습니다.
 
-구독자 목록, 처리한 Telegram 명령 위치, 기존 예매 알림 기록과 좌석 수, 실패한 일정 재조회 목록은 `/data/notified.json`에 저장됩니다. Railway가 재시작되거나 새 버전을 배포해도 유지됩니다.
+구독자 목록, 처리한 Telegram 명령 위치, 기존 예매 알림 기록과 좌석 수·A열 제외 좌석 위치, 실패한 일정 재조회 목록은 `/data/notified.json`에 저장됩니다. Railway가 재시작되거나 새 버전을 배포해도 유지됩니다.
 
 > Telegram에 webhook이 설정된 봇은 `getUpdates` 방식과 동시에 사용할 수 없습니다. 이 프로젝트 전용 봇에는 별도 webhook을 설정하지 마세요.
 
