@@ -1327,19 +1327,37 @@ class BookingOpenWithoutSeatDetailTests(unittest.TestCase):
             self.assertIn("A열 제외 예매 가능: 2석 → 4석", pair_message)
             self.assertIn("A열 제외 잔여 좌석: B10 / C11 / J20~21", pair_message)
 
-    def test_a_sold_out_new_showing_is_still_excluded(self):
+    def test_a_sold_out_new_showing_is_announced_anyway(self):
+        """A date and time never seen before is news even at zero seats.
+
+        Withholding it would keep the showing off the announced list, and
+        the cancellation alerts that follow only fire for showings on it.
+        """
+
         with tempfile.TemporaryDirectory() as temporary:
+            sold = {"n": len(self.SEATS)}
             with patch.object(
                 Config, "local_now", return_value=_kst(self.TODAY)
             ):
                 watcher = self._watcher(temporary)
-                seat_requests, sent = self._wire(watcher, {"n": len(self.SEATS)})
+                seat_requests, sent = self._wire(watcher, sold)
                 result = watcher.run_cycle()
+                announced = list(sent)
+                requests_while_sold_out = list(seat_requests)
 
-            self.assertEqual(seat_requests, [])
-            self.assertEqual(sent, [])
-            self.assertEqual(result.new_sessions, 0)
-            self.assertEqual(result.suppressed_sold_out, 1)
+                # It is on the list now, so a returned ticket reaches everyone.
+                sent.clear()
+                sold["n"] = len(self.SEATS) - 2
+                watcher.run_cycle()
+
+            self.assertEqual(requests_while_sold_out, [])
+            self.assertEqual(result.new_sessions, 1)
+            self.assertEqual(len(announced), 3)
+            self.assertIn("0/624석 (매진 · 취소표 나오면 알림)", announced[0][1])
+            self.assertEqual(
+                sorted(chat for chat, _text in sent),
+                ["2매이상", "기본", "명당"],
+            )
 
 
 class ForcedSeatRecheckTests(unittest.TestCase):

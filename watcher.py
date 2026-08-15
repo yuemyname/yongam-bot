@@ -2039,6 +2039,10 @@ def _alert_session_line(
     session: BookingSession, *, seat_detail_unclassified: bool = False
 ) -> str:
     line = f"• 상영 시작시간 {session.start_time} — {_seat_ratio(session)}"
+    if session.remaining_seats == 0:
+        # Announced anyway, but say so plainly rather than sending someone to
+        # a booking page with nothing on it.
+        line += " (매진 · 취소표 나오면 알림)"
     if seat_detail_unclassified:
         line += " ⚠️ A열 여부 미확인 · 전체 잔여 수 기준"
     return line
@@ -3476,31 +3480,16 @@ class Watcher:
             for session in sessions
             if session_keys[session] not in previously_notified
         ]
-        # With the seat map out of the picture, sold out is the only thing
-        # left that can disqualify a newly opened showing.
-        sold_out_new_sessions = [
-            session
-            for session in detected_new_sessions
-            if snapshots.get(session_keys[session]) is not None
-            and snapshots[session_keys[session]].total == 0
-        ]
+        # A date and start time never seen before is news on its own.  Being
+        # sold out at first sight does not withhold it: the showing exists,
+        # the subscriber wants it on their radar, and the cancellation alerts
+        # that follow only work once it is on the announced list.  Nothing
+        # disqualifies a newly discovered showing.
         new_sessions = [
             session
             for session in detected_new_sessions
             if snapshots.get(session_keys[session]) is not None
-            and snapshots[session_keys[session]].total > 0
         ]
-
-        for session in sold_out_new_sessions:
-            verdicts[session_keys[session]] = "제외·매진"
-
-        tally.suppressed_sold_out += len(sold_out_new_sessions)
-
-        if sold_out_new_sessions:
-            self.logger.info(
-                "제외: 잔여 0석인 신규 회차 %d개",
-                len(sold_out_new_sessions),
-            )
 
         if new_sessions:
             if self.dry_run:
