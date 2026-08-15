@@ -1875,8 +1875,6 @@ def _session_line(session: BookingSession) -> str:
     details: list[str] = []
     if session.screen_name:
         details.append(session.screen_name)
-    if session.end_time:
-        details.append(f"종료 {session.end_time}")
     if session.remaining_seats is not None or session.total_seats is not None:
         details.append(f"좌석 {_seat_ratio(session)}")
     suffix = f" — {' / '.join(details)}" if details else ""
