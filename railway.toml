@@ -2,7 +2,7 @@
 builder = "RAILPACK"
 
 [deploy]
-startCommand = "python watcher.py"
+startCommand = "python watcher.py --verbose"
 numReplicas = 1
 requiredMountPath = "/data"
 restartPolicyType = "ON_FAILURE"
