@@ -805,6 +805,173 @@ class ScanPlanTests(unittest.TestCase):
             self.assertEqual(watcher.state.frontier_date, dt.date(2026, 8, 21))
 
 
+class ForcedSeatRecheckTests(unittest.TestCase):
+    """Seat maps re-read even when the schedule total did not move."""
+
+    TODAY = dt.date(2026, 8, 26)
+
+    def _watcher(self, temporary, **overrides):
+        config = dataclasses.replace(make_config(Path(temporary)), **overrides)
+        logger = logging.getLogger(f"forced-recheck-{id(self)}")
+        logger.handlers = [logging.NullHandler()]
+        return Watcher(config, logger=logger)
+
+    def _forced_offsets(self, watcher, cycle, window=14):
+        watcher._cycle_index = cycle
+        return [
+            offset
+            for offset in range(window)
+            if watcher._forces_seat_recheck(
+                self.TODAY + dt.timedelta(days=offset), self.TODAY
+            )
+        ]
+
+    def test_nearest_days_are_rechecked_every_cycle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._watcher(temporary)
+
+            for cycle in range(10):
+                self.assertEqual(
+                    self._forced_offsets(watcher, cycle)[:2], [0, 1]
+                )
+
+    def test_rotation_covers_every_date_once_per_full_pass(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._watcher(temporary)
+            cycles = watcher.config.seat_recheck_rotate_cycles
+
+            rotated = [
+                offset
+                for cycle in range(cycles)
+                for offset in self._forced_offsets(watcher, cycle)
+                if offset >= watcher.config.seat_recheck_always_days
+            ]
+
+            # One slice per cycle, and the whole rotation window exactly once.
+            self.assertEqual(sorted(rotated), [2, 3, 4, 5, 6])
+
+    def test_dates_beyond_the_rotation_window_are_never_forced(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._watcher(temporary)
+
+            forced = {
+                offset
+                for cycle in range(20)
+                for offset in self._forced_offsets(watcher, cycle)
+            }
+
+            self.assertEqual(max(forced), watcher.config.seat_recheck_rotate_days - 1)
+
+    def test_past_show_dates_are_never_forced(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._watcher(temporary)
+
+            for cycle in range(10):
+                watcher._cycle_index = cycle
+                self.assertFalse(
+                    watcher._forces_seat_recheck(
+                        self.TODAY - dt.timedelta(days=1), self.TODAY
+                    )
+                )
+
+    def test_zero_length_windows_disable_the_forced_recheck(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._watcher(
+                temporary,
+                seat_recheck_always_days=0,
+                seat_recheck_rotate_days=0,
+            )
+
+            for cycle in range(10):
+                self.assertEqual(self._forced_offsets(watcher, cycle), [])
+
+    def _watcher_for_composition_change(self, temporary, **overrides):
+        config = dataclasses.replace(
+            make_config(Path(temporary)),
+            target_start=self.TODAY,
+            target_end=self.TODAY,
+            **overrides,
+        )
+        logger = logging.getLogger(f"forced-recheck-run-{id(self)}")
+        logger.handlers = [logging.NullHandler()]
+        return Watcher(config, logger=logger)
+
+    @staticmethod
+    def _snapshot(usable):
+        # Nine seats stay on sale; only the A-row share of them moves.
+        return SeatSnapshot(
+            total=9,
+            usable=usable,
+            mapped_total=9,
+            available_rows=("A", "H"),
+            available_seats=tuple(("H", str(i)) for i in range(1, usable + 1)),
+        )
+
+    def _run_composition_change(self, watcher):
+        """Announce a showing, then move seats between A and H rows."""
+
+        watcher.cgv.fetch_date = lambda _date: {
+            "data": [
+                {
+                    "scnsNm": "IMAX관",
+                    "scnYmd": self.TODAY.strftime("%Y%m%d"),
+                    "scnsrtTm": "2330",
+                    "scnsNo": "13",
+                    "scnSseq": "4",
+                    "frSeatCnt": 9,
+                    "stcnt": 200,
+                }
+            ]
+        }
+        usable = {"count": 7}
+        seat_requests = []
+
+        def fetch_seat(_session):
+            seat_requests.append(usable["count"])
+            return self._snapshot(usable["count"])
+
+        watcher.cgv.fetch_seat_snapshot = fetch_seat
+        alerts = []
+        watcher.telegram.send_message = lambda text, **_kwargs: alerts.append(text)
+
+        watcher.run_cycle()
+        alerts.clear()
+        seat_requests.clear()
+        # The total stays at 9: an A-row seat sells while an H-row seat frees.
+        usable["count"] = 8
+        watcher.run_cycle()
+        return seat_requests, alerts
+
+    def test_composition_change_under_an_unchanged_total_is_detected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(
+                Config, "local_now", return_value=_kst(self.TODAY)
+            ):
+                watcher = self._watcher_for_composition_change(temporary)
+                seat_requests, alerts = self._run_composition_change(watcher)
+
+            self.assertEqual(seat_requests, [8])
+            self.assertEqual(len(alerts), 1)
+            self.assertIn("잔여 좌석 변경", alerts[0])
+
+    def test_composition_change_is_missed_without_the_forced_recheck(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(
+                Config, "local_now", return_value=_kst(self.TODAY)
+            ):
+                watcher = self._watcher_for_composition_change(
+                    temporary,
+                    seat_recheck_always_days=0,
+                    seat_recheck_rotate_days=0,
+                )
+                seat_requests, alerts = self._run_composition_change(watcher)
+
+            # Documents why the forced re-check exists: the schedule total is
+            # identical, so nothing would ask CGV for the seat map again.
+            self.assertEqual(seat_requests, [])
+            self.assertEqual(alerts, [])
+
+
 class ConfigTests(unittest.TestCase):
     def test_dynamic_window_is_today_plus_27_days(self):
         with tempfile.TemporaryDirectory() as temporary:

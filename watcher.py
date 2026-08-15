@@ -247,6 +247,15 @@ def _parse_date(value: str, *, name: str) -> dt.date:
         raise ConfigurationError(f"{name} 값은 YYYY-MM-DD 형식이어야 합니다.") from exc
 
 
+def _parse_show_date(value: str) -> dt.date | None:
+    """Show date from a schedule record, or None when CGV sent junk."""
+
+    try:
+        return dt.date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
 def load_dotenv(path: Path) -> dict[str, str]:
     """Read a small, dependency-free subset of the dotenv format."""
     if not path.exists():
@@ -322,6 +331,9 @@ class Config:
     scan_mode: str
     booking_close_margin_minutes: int
     deferred_recheck_cycles: int
+    seat_recheck_always_days: int
+    seat_recheck_rotate_days: int
+    seat_recheck_rotate_cycles: int
     pending_delivery_max_attempts: int
     cursor_probe_days: int
     cursor_expansion_days: int
@@ -493,6 +505,24 @@ class Config:
             deferred_recheck_cycles=_parse_int(
                 value("DEFERRED_RECHECK_CYCLES", "5"),
                 name="DEFERRED_RECHECK_CYCLES",
+                minimum=1,
+                maximum=60,
+            ),
+            seat_recheck_always_days=_parse_int(
+                value("SEAT_RECHECK_ALWAYS_DAYS", "2"),
+                name="SEAT_RECHECK_ALWAYS_DAYS",
+                minimum=0,
+                maximum=28,
+            ),
+            seat_recheck_rotate_days=_parse_int(
+                value("SEAT_RECHECK_ROTATE_DAYS", "7"),
+                name="SEAT_RECHECK_ROTATE_DAYS",
+                minimum=0,
+                maximum=28,
+            ),
+            seat_recheck_rotate_cycles=_parse_int(
+                value("SEAT_RECHECK_ROTATE_CYCLES", "5"),
+                name="SEAT_RECHECK_ROTATE_CYCLES",
                 minimum=1,
                 maximum=60,
             ),
@@ -3065,6 +3095,32 @@ class Watcher:
                     self._alert_for_sessions(existing_sessions, tally)
             self._flush_state(tally)
 
+    def _forces_seat_recheck(self, show_date: dt.date, today: dt.date) -> bool:
+        """Whether this date's seats are re-read even with an unchanged total.
+
+        The schedule API reports only a total, so a booking and a cancellation
+        landing in the same minute — an A-row seat sold while a non-A seat
+        frees up — leaves the total untouched and the change invisible.
+        Re-reading the seat map catches it, but doing that for every date every
+        cycle roughly triples the cycle, which would slow down the ordinary
+        cancellation alerts this exists to speed up.
+
+        So the nearest days are re-read every cycle, and the days behind them
+        take turns: one slice per cycle, a full pass every rotate_cycles.
+        """
+
+        offset = (show_date - today).days
+        if offset < 0:
+            return False
+        if offset < self.config.seat_recheck_always_days:
+            return True
+        if offset < self.config.seat_recheck_rotate_days:
+            cycles = self.config.seat_recheck_rotate_cycles
+            # Slotting by the date keeps a showing in the same slot across
+            # restarts, so no date can be starved by an unlucky ordering.
+            return show_date.toordinal() % cycles == self._cycle_index % cycles
+        return False
+
     def _alert_for_sessions(
         self, sessions: Sequence[BookingSession], tally: "_CycleTally"
     ) -> None:
@@ -3083,6 +3139,7 @@ class Watcher:
             key: self.state.seat_snapshot(key) for key in session_keys.values()
         }
 
+        today = self.config.local_today()
         verdicts: dict[str, str] = {}
         snapshots: dict[str, SeatSnapshot] = {}
         seat_candidates: list[BookingSession] = []
@@ -3095,9 +3152,14 @@ class Watcher:
                 snapshots[key] = SeatSnapshot(total=0)
                 continue
 
+            show_date = _parse_show_date(session.date)
+            forced_recheck = show_date is not None and self._forces_seat_recheck(
+                show_date, today
+            )
             previous = previous_snapshots.get(key)
             needs_detail = (
-                previous is None
+                forced_recheck
+                or previous is None
                 or previous.total != remaining
                 or (
                     key not in previously_notified
