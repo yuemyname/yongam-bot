@@ -33,6 +33,7 @@ from watcher import (
     TelegramError,
     TimezoneFormatter,
     Watcher,
+    _available_seat_line,
     booking_url_for_session,
     _seat_snapshot_changed,
     extract_seat_snapshot,
@@ -201,6 +202,7 @@ class SeatSnapshotTests(unittest.TestCase):
                             {
                                 "seatLocNo": "1",
                                 "seatRowNm": "B",
+                                "seatNo": "12",
                                 "seatStusCd": "00",
                                 "seatSaleYn": "Y",
                                 "seatSalfrmCd": "01",
@@ -208,6 +210,7 @@ class SeatSnapshotTests(unittest.TestCase):
                             {
                                 "seatLocNo": "2",
                                 "seatRowNm": "A",
+                                "seatNo": "1",
                                 "seatStusCd": "00",
                                 "seatSaleYn": "Y",
                                 "seatSalfrmCd": "04",
@@ -215,6 +218,7 @@ class SeatSnapshotTests(unittest.TestCase):
                             {
                                 "seatLocNo": "3",
                                 "seatRowNm": "C",
+                                "seatNo": "14",
                                 "seatStusCd": "02",
                                 "seatSaleYn": "Y",
                                 "seatSalfrmCd": "01",
@@ -228,6 +232,7 @@ class SeatSnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot.usable, 1)
         self.assertEqual(snapshot.mapped_total, 2)
         self.assertEqual(snapshot.available_rows, ("A", "B"))
+        self.assertEqual(snapshot.available_seats, (("B", "12"),))
         self.assertFalse(snapshot.row_a_only)
 
     def test_row_a_only_ignores_sale_form_code(self):
@@ -289,6 +294,7 @@ class SeatSnapshotTests(unittest.TestCase):
                     {
                         "seatLocNo": "A1",
                         "seatRowNm": "A",
+                        "seatNo": "1",
                         "seatStusCd": "00",
                         "seatSaleYn": "Y",
                         "seatSalfrmCd": "01",
@@ -296,6 +302,7 @@ class SeatSnapshotTests(unittest.TestCase):
                     {
                         "seatLocNo": "W1",
                         "seatRowNm": "B",
+                        "seatNo": "7",
                         "seatStusCd": "00",
                         "seatSaleYn": "Y",
                         "seatSalfrmCd": "04",
@@ -308,8 +315,74 @@ class SeatSnapshotTests(unittest.TestCase):
 
         self.assertEqual(snapshot.usable, 1)
         self.assertEqual(snapshot.available_rows, ("A", "B"))
+        self.assertEqual(snapshot.available_seats, (("B", "7"),))
         self.assertFalse(snapshot.row_a_only)
         self.assertFalse(snapshot.should_suppress)
+
+    def test_formats_rows_and_compacts_consecutive_seat_numbers(self):
+        snapshot = SeatSnapshot(
+            total=7,
+            usable=6,
+            mapped_total=7,
+            available_rows=("A", "B", "C"),
+            available_seats=(
+                ("B", "1"),
+                ("B", "2"),
+                ("B", "3"),
+                ("B", "5"),
+                ("C", "10"),
+                ("C", "11"),
+            ),
+        )
+
+        self.assertEqual(
+            _available_seat_line(snapshot),
+            "A열 제외 잔여 좌석: B열 1~3, 5 / C열 10~11",
+        )
+
+    def test_keeps_row_information_when_seat_number_is_missing(self):
+        payload = {
+            "data": {
+                "seats": [
+                    {
+                        "seatLocNo": "internal-1",
+                        "seatRowNm": "B",
+                        "seatStusCd": "00",
+                        "seatSaleYn": "Y",
+                    }
+                ]
+            }
+        }
+
+        snapshot = extract_seat_snapshot(payload, scheduled_remaining=1)
+
+        self.assertTrue(snapshot.seat_map_complete)
+        self.assertIsNone(snapshot.available_seats)
+        self.assertEqual(
+            _available_seat_line(snapshot),
+            "A열 제외 잔여 좌석: B열 (좌석 번호 미확인)",
+        )
+
+    def test_summarizes_rows_when_seat_location_line_is_too_long(self):
+        snapshot = SeatSnapshot(
+            total=6,
+            usable=6,
+            mapped_total=6,
+            available_rows=("B", "C"),
+            available_seats=(
+                ("B", "1"),
+                ("B", "3"),
+                ("B", "5"),
+                ("C", "2"),
+                ("C", "4"),
+                ("C", "6"),
+            ),
+        )
+
+        self.assertEqual(
+            _available_seat_line(snapshot, max_chars=20),
+            "A열 제외 잔여 좌석: B열 3석 / C열 3석 (좌석 번호가 많아 행별 수량으로 요약)",
+        )
 
 
 class StateStoreTests(unittest.TestCase):
@@ -358,6 +431,7 @@ class StateStoreTests(unittest.TestCase):
                     usable=3,
                     mapped_total=5,
                     available_rows=("A", "B"),
+                    available_seats=(("B", "10"), ("B", "11"), ("B", "12")),
                 ),
             )
             store.save()
@@ -369,10 +443,18 @@ class StateStoreTests(unittest.TestCase):
             self.assertEqual(
                 reloaded.seat_snapshot("session").available_rows, ("A", "B")
             )
+            self.assertEqual(
+                reloaded.seat_snapshot("session").available_seats,
+                (("B", "10"), ("B", "11"), ("B", "12")),
+            )
             record = json.loads(state_path.read_text(encoding="utf-8"))["seat_counts"][
                 "session"
             ]
             self.assertEqual(record["usable"], 3)
+            self.assertEqual(
+                record["available_seats"],
+                [["B", "10"], ["B", "11"], ["B", "12"]],
+            )
             self.assertNotIn("general", record)
             self.assertNotIn("accessible", record)
 
@@ -408,13 +490,21 @@ class StateStoreTests(unittest.TestCase):
 
     def test_change_detection_compares_non_a_usable_count(self):
         previous = SeatSnapshot(
-            total=5, usable=2, mapped_total=5, available_rows=("A", "B")
+            total=5,
+            usable=2,
+            mapped_total=5,
+            available_rows=("A", "B"),
+            available_seats=(("B", "1"), ("B", "2")),
         )
         same = dataclasses.replace(previous)
         changed = dataclasses.replace(previous, usable=3)
+        moved = dataclasses.replace(
+            previous, available_seats=(("B", "1"), ("B", "3"))
+        )
 
         self.assertFalse(_seat_snapshot_changed(previous, same))
         self.assertTrue(_seat_snapshot_changed(previous, changed))
+        self.assertTrue(_seat_snapshot_changed(previous, moved))
 
 class StatePruningTests(unittest.TestCase):
     @staticmethod
@@ -995,6 +1085,10 @@ class WatcherIntegrationTests(unittest.TestCase):
                 usable=session.remaining_seats,
                 mapped_total=session.remaining_seats,
                 available_rows=("B",),
+                available_seats=tuple(
+                    ("B", str(number))
+                    for number in range(1, session.remaining_seats + 1)
+                ),
             )
 
             attempts = []
@@ -2698,6 +2792,10 @@ class WatcherIntegrationTests(unittest.TestCase):
                 usable=session.remaining_seats,
                 mapped_total=session.remaining_seats,
                 available_rows=("B",),
+                available_seats=tuple(
+                    ("B", str(number))
+                    for number in range(1, session.remaining_seats + 1)
+                ),
             )
             sent_messages = []
             watcher.telegram.send_message = (
@@ -2714,6 +2812,10 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertIn("━━━━━━━━━━━━━━━━━━━━", sent_messages[0])
             self.assertIn(
                 "상영 시작시간 14:30 — 100/624석",
+                sent_messages[0],
+            )
+            self.assertIn(
+                "A열 제외 잔여 좌석: B열 1~100",
                 sent_messages[0],
             )
             self.assertLess(
@@ -2752,7 +2854,11 @@ class WatcherIntegrationTests(unittest.TestCase):
                 total=session.remaining_seats,
                 usable=session.remaining_seats - 2,
                 mapped_total=session.remaining_seats,
-                available_rows=("B",),
+                available_rows=("A", "B"),
+                available_seats=tuple(
+                    ("B", str(number))
+                    for number in range(1, session.remaining_seats - 1)
+                ),
             )
             sent_messages = []
             watcher.telegram.send_message = (
@@ -2770,6 +2876,10 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(len(sent_messages), 2)
             self.assertIn(
                 "잔여좌석/총좌석: 9/200석 (이전 10/200석)", sent_messages[1]
+            )
+            self.assertIn(
+                "A열 제외 잔여 좌석: B열 1~7",
+                sent_messages[1],
             )
             self.assertIn("📅 상영일: 2026-08-26 (수)", sent_messages[1])
             self.assertLess(

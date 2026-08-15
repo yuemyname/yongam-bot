@@ -39,7 +39,7 @@ DEFAULT_BOOKING_URL = "https://cgv.co.kr/cnm/movieBook/movie"
 DEFAULT_SEAT_PAGE_URL = "https://cgv.co.kr/cnm/selectVisitorCnt"
 DEFAULT_SITE_NAME = "용산아이파크몰"
 UNCLASSIFIED_ALERT_MIN_SEATS = 7
-STATE_VERSION = 10
+STATE_VERSION = 11
 TELEGRAM_BROADCAST_WORKERS = 4
 # Printed once per cycle so a long log can be read cycle by cycle.
 CYCLE_SEPARATOR = "─" * 60
@@ -854,6 +854,7 @@ class SeatSnapshot:
     usable: int | None = None
     mapped_total: int | None = None
     available_rows: tuple[str, ...] | None = None
+    available_seats: tuple[tuple[str, str], ...] | None = None
 
     @property
     def seat_map_complete(self) -> bool:
@@ -910,6 +911,26 @@ def _normalize_seat_row(value: Any) -> str:
     return re.sub(r"\s*열$", "", row).strip()
 
 
+def _normalize_seat_number(value: Any) -> str:
+    number = str(value if value is not None else "").strip().upper()
+    return re.sub(r"\s*번$", "", number).strip()
+
+
+def _natural_sort_key(value: str) -> tuple[tuple[int, int | str], ...]:
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part)
+        for part in re.split(r"(\d+)", value)
+        if part
+    )
+
+
+def _seat_location_sort_key(
+    location: tuple[str, str],
+) -> tuple[tuple[tuple[int, int | str], ...], tuple[tuple[int, int | str], ...]]:
+    row, number = location
+    return _natural_sort_key(row), _natural_sort_key(number)
+
+
 def extract_seat_snapshot(payload: Any, *, scheduled_remaining: int) -> SeatSnapshot:
     """Count saleable non-A-row seats from CGV's anonymous seat map."""
 
@@ -934,7 +955,9 @@ def extract_seat_snapshot(payload: Any, *, scheduled_remaining: int) -> SeatSnap
     usable = 0
     mapped_total = 0
     available_rows: set[str] = set()
+    available_seats: set[tuple[str, str]] = set()
     row_labels_complete = True
+    seat_numbers_complete = True
     for seat in seats.values():
         if str(_direct_value(seat, {"seatstuscd"}) or "").strip() != "00":
             continue
@@ -949,6 +972,13 @@ def extract_seat_snapshot(payload: Any, *, scheduled_remaining: int) -> SeatSnap
             available_rows.add(seat_row)
             if seat_row != "A":
                 usable += 1
+                seat_number = _normalize_seat_number(
+                    _direct_value(seat, {"seatno"})
+                )
+                if seat_number:
+                    available_seats.add((seat_row, seat_number))
+                else:
+                    seat_numbers_complete = False
         else:
             row_labels_complete = False
 
@@ -959,6 +989,15 @@ def extract_seat_snapshot(payload: Any, *, scheduled_remaining: int) -> SeatSnap
         available_rows=(
             tuple(sorted(available_rows))
             if row_labels_complete and mapped_total > 0
+            else None
+        ),
+        available_seats=(
+            tuple(sorted(available_seats, key=_seat_location_sort_key))
+            if (
+                row_labels_complete
+                and seat_numbers_complete
+                and len(available_seats) == usable
+            )
             else None
         ),
     )
@@ -1722,11 +1761,23 @@ class StateStore:
                 isinstance(row, str) for row in raw_rows
             ):
                 available_rows = tuple(raw_rows)
+            raw_seats = raw.get("available_seats")
+            available_seats = None
+            if isinstance(raw_seats, list) and all(
+                isinstance(location, list)
+                and len(location) == 2
+                and all(isinstance(part, str) for part in location)
+                for location in raw_seats
+            ):
+                available_seats = tuple(
+                    (location[0], location[1]) for location in raw_seats
+                )
             return SeatSnapshot(
                 total=total,
                 usable=_nonnegative_int(raw.get("usable")),
                 mapped_total=_nonnegative_int(raw.get("mapped_total")),
                 available_rows=available_rows,
+                available_seats=available_seats,
             )
 
     def set_seat_snapshot(self, key: str, snapshot: SeatSnapshot) -> None:
@@ -1739,6 +1790,11 @@ class StateStore:
                 "available_rows": (
                     list(snapshot.available_rows)
                     if snapshot.available_rows is not None
+                    else None
+                ),
+                "available_seats": (
+                    [list(location) for location in snapshot.available_seats]
+                    if snapshot.available_seats is not None
                     else None
                 ),
             }
@@ -1878,7 +1934,65 @@ def _seat_snapshot_changed(previous: SeatSnapshot, current: SeatSnapshot) -> boo
         and previous.usable != current.usable
     ):
         return True
+    if (
+        previous.available_seats is not None
+        and current.available_seats is not None
+        and previous.available_seats != current.available_seats
+    ):
+        return True
     return False
+
+
+def _compact_seat_numbers(numbers: Iterable[str]) -> str:
+    unique = sorted(set(numbers), key=_natural_sort_key)
+    numeric = sorted({int(number) for number in unique if number.isdigit()})
+    nonnumeric = [number for number in unique if not number.isdigit()]
+    parts: list[str] = []
+    if numeric:
+        start = end = numeric[0]
+        for number in numeric[1:]:
+            if number == end + 1:
+                end = number
+                continue
+            parts.append(str(start) if start == end else f"{start}~{end}")
+            start = end = number
+        parts.append(str(start) if start == end else f"{start}~{end}")
+    parts.extend(nonnumeric)
+    return ", ".join(parts)
+
+
+def _available_seat_line(
+    snapshot: SeatSnapshot | None, *, max_chars: int = 900
+) -> str | None:
+    if snapshot is None or not snapshot.seat_map_complete:
+        return None
+    non_a_rows = tuple(
+        sorted(
+            (row for row in snapshot.available_rows or () if row != "A"),
+            key=_natural_sort_key,
+        )
+    )
+    if not non_a_rows:
+        return None
+    if snapshot.available_seats is None:
+        rows = ", ".join(f"{row}열" for row in non_a_rows)
+        return f"A열 제외 잔여 좌석: {rows} (좌석 번호 미확인)"
+
+    seats_by_row: dict[str, list[str]] = {}
+    for row, number in snapshot.available_seats:
+        seats_by_row.setdefault(row, []).append(number)
+    details = " / ".join(
+        f"{row}열 {_compact_seat_numbers(seats_by_row.get(row, ()))}"
+        for row in non_a_rows
+    )
+    line = f"A열 제외 잔여 좌석: {details}"
+    if len(line) <= max_chars:
+        return line
+
+    counts = " / ".join(
+        f"{row}열 {len(seats_by_row.get(row, ()))}석" for row in non_a_rows
+    )
+    return f"A열 제외 잔여 좌석: {counts} (좌석 번호가 많아 행별 수량으로 요약)"
 
 
 def seat_change_message(
@@ -1902,6 +2016,8 @@ def seat_change_message(
     ]
     if previous.usable is not None and current.usable is not None:
         lines.append(f"A열 제외 예매 가능: {previous.usable}석 → {current.usable}석")
+    if seat_line := _available_seat_line(current):
+        lines.append(seat_line)
     if current.uses_unclassified_fallback:
         lines.append("⚠️ A열 여부 미확인 · 전체 잔여 수 기준 알림")
     lines.extend(["", f"예매 바로가기: {booking_url_for_session(session, config)}"])
@@ -1913,28 +2029,32 @@ def message_chunks(
     config: Config,
     *,
     unclassified_keys: set[str] | None = None,
+    seat_snapshots: Mapping[str, SeatSnapshot] | None = None,
     max_chars: int = 3500,
 ) -> list[tuple[str, list[BookingSession]]]:
     chunks: list[tuple[str, list[BookingSession]]] = []
     unclassified_keys = unclassified_keys or set()
+    seat_snapshots = seat_snapshots or {}
     sessions_by_date: dict[str, list[BookingSession]] = {}
     for session in sessions:
         sessions_by_date.setdefault(session.date, []).append(session)
 
     def render(date_sessions: Sequence[BookingSession]) -> str:
         show_date = date_sessions[0].date
-        lines = [
-            _alert_session_line(
-                session,
-                seat_detail_unclassified=(
-                    session.notification_key(
-                        site_no=config.site_no, movie_no=config.movie_no
-                    )
-                    in unclassified_keys
-                ),
+        lines = []
+        for session in date_sessions:
+            key = session.notification_key(
+                site_no=config.site_no, movie_no=config.movie_no
             )
-            for session in date_sessions
-        ]
+            session_lines = [
+                _alert_session_line(
+                    session,
+                    seat_detail_unclassified=(key in unclassified_keys),
+                )
+            ]
+            if seat_line := _available_seat_line(seat_snapshots.get(key)):
+                session_lines.append(f"  {seat_line}")
+            lines.append("\n".join(session_lines))
         return (
             "🎟️ CGV 예매 오픈 감지\n"
             + _alert_date_banner(show_date)
@@ -2641,7 +2761,7 @@ class Watcher:
                     "🔔 알려드리는 내용\n"
                     "• 새 IMAX 상영 회차 예매 오픈\n"
                     "• 잔여 좌석 또는 A열 제외 예매 가능 좌석 변경\n"
-                    "• 상영일·시작시간·잔여좌석/총좌석·예매 링크\n\n"
+                    "• 상영일·시작시간·잔여좌석/총좌석·좌석 행/번호·예매 링크\n\n"
                     "🚫 알림 제외\n"
                     "• A열만 남은 경우\n"
                     "• 잔여 좌석이 0석인 경우\n\n"
@@ -3056,6 +3176,7 @@ class Watcher:
                     new_sessions,
                     self.config,
                     unclassified_keys=unclassified_new_keys,
+                    seat_snapshots=snapshots,
                 ):
                     delivered, failed, total = self._broadcast_message(
                         text, category=ALERT_OPEN
