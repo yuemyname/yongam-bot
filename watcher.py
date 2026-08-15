@@ -69,7 +69,7 @@ ALERT_OPEN = "open"
 ALERT_SEATS = "seats"
 # A classified seat-change alert rendered only with the subscriber's preferred
 # central-seat preset.  Keeping a separate category also makes queued Telegram
-# retries respect a later /seats setting change.
+# retries respect a later preferred-seat setting change.
 ALERT_SEATS_SWEET = "seats_sweet"
 # A seat-change alert CGV's detail response could not classify.  It reaches the
 # seat-alert subscribers who did not ask for verified seat information only.
@@ -160,17 +160,11 @@ SEAT_SELECTION_LABELS = {
     SEAT_SELECTION_ALL: "모든 A열 제외 좌석",
     SEAT_SELECTION_SWEET: "명당 좌석만",
 }
-SEAT_SELECTION_ALIASES = {
-    "all": SEAT_SELECTION_ALL,
-    "전체": SEAT_SELECTION_ALL,
-    "모두": SEAT_SELECTION_ALL,
-    "sweet": SEAT_SELECTION_SWEET,
-    "명당": SEAT_SELECTION_SWEET,
-}
 SEAT_SELECTION_COMMAND_TARGETS = {
     "/seat_sweet": SEAT_SELECTION_SWEET,
+    "/seat_default": SEAT_SELECTION_ALL,
 }
-SEAT_SELECTION_COMMANDS = {"/seats", *SEAT_SELECTION_COMMAND_TARGETS}
+SEAT_SELECTION_COMMANDS = set(SEAT_SELECTION_COMMAND_TARGETS)
 SWEET_SEAT_RANGES: dict[str, tuple[int, int]] = {
     "F": (16, 29),
     "G": (16, 29),
@@ -184,7 +178,7 @@ SEAT_SELECTION_GUIDE = (
     "받고 싶은 잔여 좌석을 고를 수 있습니다.\n"
     "/seat_sweet - 명당 좌석만 받기\n"
     "  F16~29 · G16~29 · H13~32 · I13~32 · J11~34 · K11~34 · L11~34\n"
-    "/seats all - 모든 A열 제외 좌석 받기 (기본)\n\n"
+    "/seat_default - 모든 A열 제외 좌석 받기 (기본)\n\n"
     "신규 예매 오픈 알림은 이 설정과 관계없이 항상 전송됩니다."
 )
 
@@ -2775,13 +2769,12 @@ class Watcher:
         return (f"✅ 잔여 좌석 알림 범위를 변경했습니다.\n→ {label}{note}", True)
 
     def _handle_seat_selection_command(
-        self, chat_id: str, argument: str
+        self, chat_id: str, requested: str
     ) -> tuple[str, bool]:
         """Return the seat-selection reply and whether its preference changed."""
 
-        requested = SEAT_SELECTION_ALIASES.get(argument) if argument else None
-        if argument and requested is None:
-            return (f"알 수 없는 좌석 선택입니다.\n\n{SEAT_SELECTION_GUIDE}", False)
+        if requested not in SEAT_SELECTIONS:
+            raise ValueError(f"Unsupported seat selection: {requested}")
         if not self.state.is_subscribed(chat_id):
             return (
                 "🔕 현재 구독 중이 아닙니다. /start로 구독한 뒤 설정할 수 있습니다."
@@ -2792,14 +2785,6 @@ class Watcher:
         note = ""
         if ALERT_SEATS not in ALERT_MODES[self.state.alert_mode(chat_id)]:
             note = "\n\n참고: 현재 잔여 좌석 알림을 받지 않는 설정입니다. /mode 확인"
-
-        current = self.state.seat_selection(chat_id)
-        if requested is None:
-            return (
-                f"🎯 현재 좌석 선택\n→ {SEAT_SELECTION_LABELS[current]}"
-                f"{note}\n\n{SEAT_SELECTION_GUIDE}",
-                False,
-            )
 
         changed = self.state.set_seat_selection(chat_id, requested)
         label = SEAT_SELECTION_LABELS[requested]
@@ -2876,7 +2861,7 @@ class Watcher:
                     "\n\n기본 설정은 모든 A열 제외 좌석이며, "
                     "따로 설정하지 않아도 됩니다."
                     "\n🎯 명당 좌석만 받기: /seat_sweet"
-                    "\n↩️ 전체 좌석으로 돌아가기: /seats all"
+                    "\n↩️ 전체 좌석으로 돌아가기: /seat_default"
                     "\n※ 신규 예매 오픈은 좌석 설정과 관계없이 항상 알려드립니다."
                     "\n\n자세한 설명 /desc · 상태 확인 /status · 해지 /stop"
                 )
@@ -2910,7 +2895,7 @@ class Watcher:
                         "\n\n알림 종류 변경: /mode"
                         "\n좌석 알림 범위 변경: /seat"
                         "\n명당 좌석으로 변경: /seat_sweet"
-                        "\n전체 좌석으로 변경: /seats all"
+                        "\n전체 좌석으로 변경: /seat_default"
                     )
                 else:
                     reply = (
@@ -2928,11 +2913,9 @@ class Watcher:
                 )
                 state_changed = state_changed or seat_info_changed
             elif command in SEAT_SELECTION_COMMANDS:
-                seat_selection_argument = SEAT_SELECTION_COMMAND_TARGETS.get(
-                    command, argument
-                )
+                requested_seat_selection = SEAT_SELECTION_COMMAND_TARGETS[command]
                 reply, seat_selection_changed = self._handle_seat_selection_command(
-                    chat_id, seat_selection_argument
+                    chat_id, requested_seat_selection
                 )
                 state_changed = state_changed or seat_selection_changed
             elif command in ADMIN_STATS_COMMANDS and chat_id == str(
@@ -2950,6 +2933,7 @@ class Watcher:
                     "/mode - 알림 종류 선택\n"
                     "/seat - 잔여 좌석 알림 범위 선택\n"
                     "/seat_sweet - 명당 좌석만 받기\n"
+                    "/seat_default - 모든 A열 제외 좌석 받기\n"
                     "/desc - 봇 설명과 사용 방법\n"
                     "/coffee - 개발자에게 커피 후원\n"
                     "/help - 사용법 보기\n\n"
@@ -2983,8 +2967,8 @@ class Watcher:
                     "  Extremer: F16~29, G16~29\n"
                     "  Experienced: H13~32, I13~32\n"
                     "  SweetSpot: J11~34, K11~34, L11~34\n"
-                    "• /seats all — 모든 A열 제외 좌석 알림으로 복귀\n"
-                    "• /seats — 현재 좌석 설정 확인\n"
+                    "• /seat_default — 모든 A열 제외 좌석 알림으로 복귀\n"
+                    "• /status — 현재 좌석 설정 확인\n"
                     "※ 신규 예매 오픈 알림은 sweet/all과 관계없이 항상 전송\n\n"
                     "📌 사용 방법\n"
                     "1. /start — 알림 구독\n"
@@ -2994,7 +2978,7 @@ class Watcher:
                     "/mode — 현재 알림 종류 확인·변경\n"
                     "/seat — 잔여 좌석 알림 범위 확인·변경\n"
                     "/seat_sweet — 명당 좌석만 받기\n"
-                    "/seats — 현재 좌석 설정 확인·전체 좌석으로 변경\n"
+                    "/seat_default — 모든 A열 제외 좌석 받기\n"
                     "/status — 구독 상태 확인\n"
                     "/stop — 알림 해지\n"
                     "/coffee — 개발자에게 커피 후원\n"
