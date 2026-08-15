@@ -2127,20 +2127,21 @@ def _freed_seat_count(
 ) -> int:
     """Bookable seats that appeared since the previous observation.
 
-    Only growth counts: a seat selling is not a cancellation, so a net loss
-    reads as zero freed seats.  When the seat map could not classify rows the
-    non-A count is not trustworthy, so the schedule total stands in — the same
-    number the alert itself falls back to.
+    Only growth counts, and only growth that was actually seen: a seat
+    selling is not a cancellation, and an unreadable seat map means no
+    trustworthy non-A count, which reads as zero rather than as the schedule
+    total.  Falling back to the total would count A-row seats the subscriber
+    asked to exclude — two seats freeing up, one of them in row A, would
+    satisfy a two-seat minimum it does not really meet.
     """
 
-    if current.seat_map_complete and current.usable is not None:
-        if previous is None:
-            return current.usable
-        if previous.seat_map_complete and previous.usable is not None:
-            return max(0, current.usable - previous.usable)
+    if current.usable is None:
+        return 0
     if previous is None:
-        return current.total
-    return max(0, current.total - previous.total)
+        return current.usable
+    if previous.usable is None:
+        return 0
+    return max(0, current.usable - previous.usable)
 
 
 def _sweet_seats_became_available(

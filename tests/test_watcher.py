@@ -836,12 +836,30 @@ class MinimumCancellationTests(unittest.TestCase):
         )
         self.assertEqual(_freed_seat_count(None, self._snapshot(3)), 3)
 
-    def test_freed_count_falls_back_to_the_total_when_rows_are_unreadable(self):
-        # Same fallback the alert text itself uses: no rows, no non-A count.
-        previous = SeatSnapshot(total=8)
-        current = SeatSnapshot(total=11)
+    def test_freed_count_is_zero_when_rows_cannot_be_read(self):
+        # The schedule total counts A-row seats, which is exactly what this
+        # audience excluded, so an unreadable map confirms nothing.
+        self.assertEqual(
+            _freed_seat_count(SeatSnapshot(total=8), SeatSnapshot(total=11)), 0
+        )
 
-        self.assertEqual(_freed_seat_count(previous, current), 3)
+    def test_a_partly_read_map_is_sized_by_its_confirmed_non_a_seats(self):
+        """Regression: total 6 -> 8, but only one confirmed non-A seat.
+
+        The alert said "A열 제외 예매 가능: 0석 → 1석" while the two-seat
+        minimum was judged on the 6 -> 8 total, so it reached subscribers who
+        had asked for pairs.
+        """
+
+        previous = SeatSnapshot(
+            total=6, usable=0, mapped_total=1, available_rows=("A",)
+        )
+        current = SeatSnapshot(
+            total=8, usable=1, mapped_total=2, available_rows=("A", "H")
+        )
+
+        self.assertTrue(current.uses_unclassified_fallback)
+        self.assertEqual(_freed_seat_count(previous, current), 1)
 
     def _watcher(self, temporary, **overrides):
         config = dataclasses.replace(
