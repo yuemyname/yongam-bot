@@ -1524,7 +1524,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             reloaded.load()
             self.assertTrue(reloaded.verified_seats_only("111222"))
 
-    def test_seats_command_changes_and_reports_sweet_preference(self):
+    def test_seat_selection_commands_change_and_report_sweet_preference(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = dataclasses.replace(
                 make_config(Path(temporary)), subscriptions_enabled=True
@@ -1546,15 +1546,13 @@ class WatcherIntegrationTests(unittest.TestCase):
                 ]
 
             batches = [
-                batch(1, "/seats sweet", chat_id=555),
+                batch(1, "/seat_sweet", chat_id=555),
                 batch(2, "/start"),
-                batch(3, "/seats"),
-                batch(4, "/seat_sweet@YongsanBot"),
-                batch(5, "/status"),
-                batch(6, "/seats all"),
+                batch(3, "/seat_sweet@YongsanBot"),
+                batch(4, "/status"),
+                batch(5, "/seat_default"),
+                batch(6, "/seat_default"),
                 batch(7, "/seats sweet"),
-                batch(8, "/seats all"),
-                batch(9, "/seats nonsense"),
             ]
             watcher.telegram.get_updates = lambda **_kwargs: batches.pop(0)
             watcher.telegram.send_message = lambda text, **kwargs: replies.append(
@@ -1568,9 +1566,6 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(
                 watcher.state.seat_selection("111222"), SEAT_SELECTION_ALL
             )
-
-            watcher.sync_subscribers()
-            self.assertIn("현재 좌석 선택", replies[-1][1])
 
             watcher.sync_subscribers()
             self.assertEqual(
@@ -1587,17 +1582,13 @@ class WatcherIntegrationTests(unittest.TestCase):
             )
 
             watcher.sync_subscribers()
-            self.assertEqual(
-                watcher.state.seat_selection("111222"), SEAT_SELECTION_SWEET
-            )
+            self.assertIn("이미 이렇게 설정", replies[-1][1])
 
             watcher.sync_subscribers()
+            self.assertIn("사용 가능한 명령어", replies[-1][1])
             self.assertEqual(
                 watcher.state.seat_selection("111222"), SEAT_SELECTION_ALL
             )
-
-            watcher.sync_subscribers()
-            self.assertIn("알 수 없는 좌석 선택", replies[-1][1])
 
             reloaded = StateStore(config.state_file)
             reloaded.load()
@@ -2846,8 +2837,9 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertIn("따로 설정하지 않아도 됩니다", welcome)
             self.assertIn("기본 설정은 모든 A열 제외 좌석", welcome)
             self.assertIn("명당 좌석만 받기: /seat_sweet", welcome)
-            self.assertIn("전체 좌석으로 돌아가기: /seats all", welcome)
+            self.assertIn("전체 좌석으로 돌아가기: /seat_default", welcome)
             self.assertIn("신규 예매 오픈은 좌석 설정과 관계없이 항상", welcome)
+            self.assertNotIn("/seats", welcome)
             # Listing every setting made a finished subscription look unfinished.
             for command in (
                 "/mode_all",
@@ -2897,7 +2889,8 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertIn("Extremer: F16~29, G16~29", description)
             self.assertIn("Experienced: H13~32, I13~32", description)
             self.assertIn("SweetSpot: J11~34, K11~34, L11~34", description)
-            self.assertIn("/seats all", description)
+            self.assertIn("/seat_default", description)
+            self.assertNotIn("/seats", description)
             self.assertIn("신규 예매 오픈 알림은 sweet/all과 관계없이 항상", description)
             self.assertIn("/start — 알림 구독", description)
             self.assertIn("명당만 원하면 /seat_sweet", description)
