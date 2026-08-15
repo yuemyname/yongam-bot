@@ -121,7 +121,7 @@ MODE_GUIDE = (
 )
 
 # Operator-only. Deliberately left out of /help and the BotFather command list.
-ADMIN_STATS_COMMANDS = {"/stats", "/subscribers"}
+ADMIN_STATS_COMMAND = "/stats"
 # Preferred seats for cancellation-ticket alerts.  Booking-open alerts remain
 # unfiltered because detecting a newly opened showing is the bot's top priority.
 SEAT_SELECTION_ALL = "all"
@@ -2825,7 +2825,7 @@ class Watcher:
                     chat_id, command, argument
                 )
                 state_changed = state_changed or seat_selection_changed
-            elif command in ADMIN_STATS_COMMANDS and chat_id == str(
+            elif command == ADMIN_STATS_COMMAND and chat_id == str(
                 self.config.telegram_chat_id
             ):
                 # Anyone else falls through to the unknown-command reply, so the
