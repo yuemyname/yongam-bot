@@ -2867,13 +2867,15 @@ class Watcher:
                     if added
                     else "✅ 이미 CGV 용산 IMAX 알림을 받고 있습니다."
                 )
-                # Lead with "nothing to configure".  Listing the settings here
-                # made a finished subscription read like an unfinished setup.
+                # Keep onboarding short while making the useful seat preference
+                # discoverable.  All seats remains the no-setup default.
                 reply += (
-                    "\n\n따로 설정하실 것은 없습니다."
-                    "\n새 회차가 열리거나 잔여 좌석이 바뀌면 바로 알려드릴게요."
-                    "\n\n알림이 많다고 느껴지면 /mode 로 종류를 줄일 수 있어요."
-                    "\n자세한 설명 /desc · 해지 /stop"
+                    "\n\n기본 설정은 모든 A열 제외 좌석이며, "
+                    "따로 설정하지 않아도 됩니다."
+                    "\n🎯 명당 좌석만 받기: /seats sweet"
+                    "\n↩️ 전체 좌석으로 돌아가기: /seats all"
+                    "\n※ 신규 예매 오픈은 좌석 설정과 관계없이 항상 알려드립니다."
+                    "\n\n자세한 설명 /desc · 상태 확인 /status · 해지 /stop"
                 )
             elif command in {"/stop", "/unsubscribe"}:
                 removed = self.state.remove_subscriber(chat_id)
@@ -2968,15 +2970,20 @@ class Watcher:
                     "💺 잔여 좌석 알림 범위 (선택 사항)\n"
                     "• /seat_all — A열 여부 미확인 알림도 받기 (기본)\n"
                     "• /seat_verified — A열 제외 좌석이 확인된 알림만 받기\n\n"
-                    "🎯 선호 좌석 선택 (선택 사항)\n"
-                    "• /seats sweet — F16~29·G16~29·H13~32·I13~32·"
-                    "J11~34·K11~34·L11~34만 받기\n"
-                    "• /seats all — 모든 A열 제외 좌석 받기 (기본)\n"
-                    "• 신규 예매 오픈 알림은 선택과 관계없이 항상 받기\n\n"
+                    "🎯 명당 좌석 알림 선택 (선택 사항)\n"
+                    "기본값은 모든 A열 제외 좌석입니다.\n"
+                    "• /seats sweet — 아래 세 구역만 좌석 변경 알림\n"
+                    "  Extremer: F16~29, G16~29\n"
+                    "  Experienced: H13~32, I13~32\n"
+                    "  SweetSpot: J11~34, K11~34, L11~34\n"
+                    "• /seats all — 모든 A열 제외 좌석 알림으로 복귀\n"
+                    "• /seats — 현재 좌석 설정 확인\n"
+                    "※ 신규 예매 오픈 알림은 sweet/all과 관계없이 항상 전송\n\n"
                     "📌 사용 방법\n"
                     "1. /start — 알림 구독\n"
-                    "2. 알림이 오면 예매 바로가기 링크 열기\n"
-                    "3. CGV 화면에서 IMAX 버튼 선택 후 예매\n\n"
+                    "2. 명당만 원하면 /seats sweet (선택 사항)\n"
+                    "3. 알림이 오면 예매 바로가기 링크 열기\n"
+                    "4. CGV 화면에서 IMAX 버튼 선택 후 예매\n\n"
                     "/mode — 현재 알림 종류 확인·변경\n"
                     "/seat — 잔여 좌석 알림 범위 확인·변경\n"
                     "/seats — 선호 좌석 확인·변경\n"
