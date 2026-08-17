@@ -342,6 +342,7 @@ class Config:
     booking_url: str
     company_code: str
     site_no: str
+    site_name: str
     movie_no: str
     movie_label: str
     rtctl_scope_code: str
@@ -475,6 +476,7 @@ class Config:
             booking_url=value("CGV_BOOKING_URL", DEFAULT_BOOKING_URL),
             company_code=value("CGV_COMPANY_CODE", "A420"),
             site_no=value("CGV_SITE_NO", "0013"),
+            site_name=value("CGV_SITE_NAME", DEFAULT_SITE_NAME),
             movie_no=value("CGV_MOVIE_NO", "30001323"),
             movie_label=value("MOVIE_LABEL", "오디세이"),
             rtctl_scope_code=value("CGV_RTCTL_SCOPE_CODE", "08"),
@@ -2078,7 +2080,7 @@ def _alert_date_banner(date_text: str) -> str:
 
 
 def booking_url_for_session(session: BookingSession, config: Config) -> str:
-    """Build a CGV booking URL with movie, theater, and date preselected."""
+    """Build a CGV booking URL with every shareable selection preselected."""
 
     split = urllib.parse.urlsplit(config.booking_url)
     query = dict(urllib.parse.parse_qsl(split.query, keep_blank_values=True))
@@ -2086,7 +2088,7 @@ def booking_url_for_session(session: BookingSession, config: Config) -> str:
         {
             "coCd": config.company_code,
             "siteNo": config.site_no,
-            "siteNm": DEFAULT_SITE_NAME,
+            "siteNm": config.site_name,
             "movNo": config.movie_no,
             "scnYmd": session.date.replace("-", ""),
         }
@@ -2109,10 +2111,13 @@ def _booking_footer(
     for session in sessions:
         links.setdefault(session.date, booking_url_for_session(session, config))
     if len(links) == 1:
-        lines = [f"예매 바로가기: {next(iter(links.values()))}"]
+        lines = [
+            "🎟️ 예매 바로가기 (영화·극장·날짜 선택됨): "
+            f"{next(iter(links.values()))}"
+        ]
     else:
         lines = [
-            f"예매 바로가기 ({show_date}): {url}"
+            f"🎟️ 예매 바로가기 ({show_date} · 영화·극장·날짜 선택됨): {url}"
             for show_date, url in links.items()
         ]
     return "\n\n" + "\n".join(lines)
@@ -2258,7 +2263,7 @@ def seat_change_message(
         "💺 CGV 예매 가능 좌석",
         _alert_date_banner(session.date),
         f"영화: {config.movie_label} ({config.movie_no})",
-        f"극장: 용산아이파크몰 ({config.site_no})",
+        f"극장: {config.site_name} ({config.site_no})",
         "",
         f"상영 시작시간: {session.start_time}",
         f"잔여좌석/총좌석: {ratio}",
@@ -2281,7 +2286,13 @@ def seat_change_message(
         lines.append(seat_line)
     if current.uses_unclassified_fallback:
         lines.append("⚠️ A열 여부 미확인 · 전체 잔여 수 기준 알림")
-    lines.extend(["", f"예매 바로가기: {booking_url_for_session(session, config)}"])
+    lines.extend(
+        [
+            "",
+            "🎟️ 예매 바로가기 (영화·극장·날짜 선택됨): "
+            f"{booking_url_for_session(session, config)}",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -2321,7 +2332,7 @@ def message_chunks(
             + _alert_date_banner(show_date)
             + "\n"
             + f"영화: {config.movie_label} ({config.movie_no})\n"
-            + f"극장: 용산아이파크몰 ({config.site_no})\n\n"
+            + f"극장: {config.site_name} ({config.site_no})\n\n"
             + "\n".join(lines)
             + _booking_footer(date_sessions, config)
         )
@@ -3162,7 +3173,7 @@ class Watcher:
                     "📌 사용 방법\n"
                     "1. /start — 알림 구독\n"
                     "2. 명당만 원하면 /seat_sweet (선택 사항)\n"
-                    "3. 알림이 오면 예매 바로가기 링크 열기\n"
+                    "3. 영화·극장·날짜가 선택된 예매 바로가기 링크 열기\n"
                     "4. CGV 화면에서 IMAX 버튼 선택 후 예매\n\n"
                     "📋 기타 명령어\n"
                     "• /stop — 알림 해지\n"
@@ -4076,7 +4087,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             client.send_message(
                 "✅ CGV 감시기 Telegram 연결 테스트 성공\n"
-                f"대상: {config.movie_label} / 용산아이파크몰 IMAX"
+                f"대상: {config.movie_label} / {config.site_name} IMAX"
             )
         except TelegramError as exc:
             logger.error("%s", exc)
