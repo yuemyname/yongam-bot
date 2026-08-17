@@ -1,4 +1,4 @@
-# CGV 용산 IMAX Telegram 알림 봇
+# CGV 용산 IMAX 아이맥스 예매 오픈 Telegram 알림 봇
 
 CGV 용산아이파크몰 IMAX의 예매 오픈과 예매 가능한 좌석을 Telegram으로 알려주는 비공식 알림 봇입니다.
 
