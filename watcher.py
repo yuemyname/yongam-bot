@@ -41,6 +41,8 @@ DEFAULT_SITE_NAME = "용산아이파크몰"
 UNCLASSIFIED_ALERT_MIN_SEATS = 7
 STATE_VERSION = 13
 TELEGRAM_BROADCAST_WORKERS = 4
+# Ceiling for the command-poll backoff while Telegram is unreachable.
+TELEGRAM_POLL_BACKOFF_MAX_SECONDS = 60
 # Printed once per cycle so a long log can be read cycle by cycle.
 CYCLE_SEPARATOR = "─" * 60
 # Telegram descriptions that mean the chat is permanently unreachable.
@@ -2426,6 +2428,7 @@ class Watcher:
         self._last_cgv_request_finished_at: float | None = None
         # Cycle 0 always sweeps the full window; a cursor scan runs in between.
         self._cycle_index = 0
+        self._command_poll_failures = 0
         self.state.load()
         if not self.state.subscribers_initialized:
             self.state.initialize_subscribers(config.telegram_chat_id)
@@ -2946,18 +2949,33 @@ class Watcher:
             return (f"🎫 이미 이렇게 설정되어 있습니다.\n→ {label}{note}", False)
         return (f"✅ 예매 가능 최소 좌석을 변경했습니다.\n→ {label}{note}", True)
 
-    def sync_subscribers(self) -> None:
-        """Apply Telegram /start and /stop commands to the persistent list."""
+    def sync_subscribers(self) -> bool:
+        """Apply Telegram /start and /stop commands to the persistent list.
+
+        Returns False when Telegram could not be reached, so the caller can
+        slow down instead of hammering an API that is already failing.
+        """
 
         if self.dry_run or not self.config.subscriptions_enabled:
-            return
+            return True
         try:
             updates = self.telegram.get_updates(
                 offset=self.state.telegram_update_offset
             )
         except TelegramError as exc:
-            self.logger.warning("%s", exc)
-            return
+            # One line per outage, not one per poll.  Nothing is lost: the
+            # offset only advances on a successful fetch, so every pending
+            # command is still queued on Telegram's side.
+            self._command_poll_failures += 1
+            if self._command_poll_failures == 1:
+                self.logger.warning("%s", exc)
+            return False
+        if self._command_poll_failures:
+            self.logger.info(
+                "Telegram 명령 조회 복구: 연속 %d회 실패 후 정상화",
+                self._command_poll_failures,
+            )
+            self._command_poll_failures = 0
 
         # Any incoming update advances the offset and so has to be saved, but
         # only an actual join or leave is worth an INFO line — otherwise every
@@ -3177,6 +3195,7 @@ class Watcher:
                 "Telegram 구독자 변경: 현재 %d명",
                 len(self.state.subscriber_ids()),
             )
+        return True
 
     def _record_verdicts(
         self,
@@ -3912,12 +3931,23 @@ def rate_limit_backoff_seconds(config: Config, consecutive_cycles: int) -> int:
 def run_command_loop(watcher: Watcher, stop_event: threading.Event) -> None:
     """Keep Telegram commands responsive without delaying CGV requests."""
 
+    base_delay = max(1, watcher.config.telegram_command_poll_seconds)
+    delay = base_delay
     while not stop_event.is_set():
         try:
-            watcher.sync_subscribers()
+            reachable = watcher.sync_subscribers()
         except Exception:
             watcher.logger.exception("Telegram 명령 처리 중 예상하지 못한 오류")
-        stop_event.wait(watcher.config.telegram_command_poll_seconds)
+            reachable = False
+        # Polling every two seconds through a Telegram outage buys nothing —
+        # the commands stay queued either way — and a few hundred failed
+        # requests an hour is how a bot earns a rate limit of its own.
+        delay = (
+            base_delay
+            if reachable
+            else min(delay * 2, TELEGRAM_POLL_BACKOFF_MAX_SECONDS)
+        )
+        stop_event.wait(delay)
 
 
 def configure_logging(config: Config, *, verbose: bool = False) -> logging.Logger:

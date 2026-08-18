@@ -35,6 +35,7 @@ from watcher import (
     SeatSnapshot,
     StateStore,
     PENDING_DELIVERY_TTL_HOURS,
+    TELEGRAM_POLL_BACKOFF_MAX_SECONDS,
     TelegramError,
     TimezoneFormatter,
     Watcher,
@@ -1753,6 +1754,73 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(result.rate_limited_requests, 1)
             self.assertEqual(result.seat_detail_errors, 1)
             self.assertEqual(result.seat_detail_skipped, 2)
+
+    def test_command_polling_backs_off_while_telegram_is_unreachable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = dataclasses.replace(
+                make_config(Path(temporary)), subscriptions_enabled=True
+            )
+            logger = logging.getLogger(f"poll-backoff-{id(self)}")
+            records = []
+
+            class Capture(logging.Handler):
+                def emit(self, record):
+                    records.append((record.levelname, record.getMessage()))
+
+            logger.handlers = [Capture()]
+            logger.setLevel(logging.INFO)
+            watcher = Watcher(config, logger=logger)
+            watcher.telegram.send_message = lambda *_args, **_kwargs: None
+
+            polls = {"count": 0}
+
+            def get_updates(**_kwargs):
+                polls["count"] += 1
+                if polls["count"] <= 5:
+                    raise TelegramError("Telegram 구독 명령 조회 오류: HTTP 502")
+                return []
+
+            watcher.telegram.get_updates = get_updates
+
+            waits = []
+            stop = threading.Event()
+
+            def fake_wait(timeout=None):
+                waits.append(timeout)
+                if len(waits) >= 7:
+                    stop.set()
+                return stop.is_set()
+
+            stop.wait = fake_wait
+            run_command_loop(watcher, stop)
+
+            # Doubling from the poll interval up to the ceiling, then straight
+            # back to normal once Telegram answers again.
+            self.assertEqual(waits, [4, 8, 16, 32, 60, 2, 2])
+            self.assertLessEqual(max(waits), TELEGRAM_POLL_BACKOFF_MAX_SECONDS)
+            # One line for the outage, one for the recovery — not one per poll.
+            self.assertEqual(
+                [level for level, _message in records], ["WARNING", "INFO"]
+            )
+            self.assertIn("연속 5회 실패 후 정상화", records[1][1])
+
+    def test_a_failed_poll_leaves_the_update_offset_alone(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = dataclasses.replace(
+                make_config(Path(temporary)), subscriptions_enabled=True
+            )
+            logger = logging.getLogger(f"poll-offset-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            watcher.state.set_telegram_update_offset(41)
+            watcher.telegram.get_updates = lambda **_kwargs: (
+                _ for _ in ()
+            ).throw(TelegramError("Telegram 구독 명령 조회 오류: HTTP 502"))
+
+            self.assertFalse(watcher.sync_subscribers())
+            # Telegram only drops an update once it is fetched with a higher
+            # offset, so a failed poll must not consume anything.
+            self.assertEqual(watcher.state.telegram_update_offset, 41)
 
     def test_start_and_stop_commands_persist_subscribers(self):
         with tempfile.TemporaryDirectory() as temporary:
