@@ -635,7 +635,9 @@ class AlertModeStateTests(unittest.TestCase):
 
             self.assertEqual(store.subscriber_ids_for(ALERT_OPEN), ("1", "2"))
             self.assertEqual(store.subscriber_ids_for(ALERT_SEATS), ("1", "3"))
-            self.assertEqual(store.subscriber_ids_for(ALERT_SYSTEM), ("1", "2", "3"))
+            # Fetch failures are routed by the watcher to the operator, so
+            # the subscriber list has nobody for them.
+            self.assertEqual(store.subscriber_ids_for(ALERT_SYSTEM), ())
 
     def test_subscriber_stored_before_the_feature_accepts_unclassified(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -925,9 +927,7 @@ class MinimumSeatsTests(unittest.TestCase):
             self.assertEqual(
                 watcher.state.subscriber_ids_for(ALERT_OPEN), ("pair",)
             )
-            self.assertEqual(
-                watcher.state.subscriber_ids_for(ALERT_SYSTEM), ("pair",)
-            )
+            self.assertEqual(watcher.state.subscriber_ids_for(ALERT_SYSTEM), ())
 
     def _run_seat_levels(self, watcher, levels):
         usable = {"n": levels[0]}
@@ -3210,7 +3210,13 @@ class WatcherIntegrationTests(unittest.TestCase):
         for error in transient:
             self.assertFalse(error.recipient_gone, error.description)
 
-    def test_fetch_error_alert_reaches_every_alert_mode(self):
+    def test_fetch_error_alert_goes_only_to_the_operator(self):
+        """Nobody but the operator can act on a CGV outage.
+
+        The watcher retries the failed dates by itself, so a subscriber
+        would get an alarming message about something that fixes itself.
+        """
+
         with tempfile.TemporaryDirectory() as temporary:
             watcher = self._watcher_with_three_alert_modes(temporary, "error-fanout")
 
@@ -3225,8 +3231,30 @@ class WatcherIntegrationTests(unittest.TestCase):
 
             watcher.run_cycle()
 
-            self.assertEqual({chat_id for chat_id, _ in sent}, {"1", "2", "3"})
+            self.assertEqual(
+                [chat_id for chat_id, _ in sent],
+                [str(watcher.config.telegram_chat_id)],
+            )
             self.assertIn("CGV 감시 조회 오류", sent[0][1])
+
+    def test_the_operator_hears_about_an_outage_after_unsubscribing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._watcher_with_three_alert_modes(temporary, "error-solo")
+            operator = str(watcher.config.telegram_chat_id)
+            watcher.state.remove_subscriber(operator)
+
+            watcher.cgv.fetch_date = lambda _date: (_ for _ in ()).throw(
+                FetchError("CGV 연결 실패: 테스트")
+            )
+            sent = []
+            watcher.telegram.send_message = lambda text, **kwargs: sent.append(
+                kwargs.get("chat_id")
+            )
+
+            watcher.run_cycle()
+
+            # It is addressed to whoever runs the bot, not to a subscription.
+            self.assertEqual(sent, [operator])
 
     def test_run_cycle_prunes_records_for_shows_that_already_played(self):
         with tempfile.TemporaryDirectory() as temporary:

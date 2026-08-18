@@ -74,6 +74,8 @@ ALERT_SEATS_SWEET = "seats_sweet"
 # A seat-change alert CGV's detail response could not classify.  It reaches the
 # seat-alert subscribers who did not ask for verified seat information only.
 ALERT_SEATS_UNCLASSIFIED = "seats_unclassified"
+# A CGV fetch failure.  Operator-only: a subscriber can do nothing about it,
+# and the watcher retries the failed dates on its own within a cycle or two.
 ALERT_SYSTEM = "system"
 
 # Per-subscriber alert preference.  Subscribers stored before this feature have
@@ -1844,7 +1846,8 @@ class StateStore:
             return minimum <= seats_available
 
         if category == ALERT_SYSTEM:
-            return self.subscriber_ids()
+            # Routed by the caller, which knows who the operator is.
+            return ()
         if category == ALERT_SEATS_UNCLASSIFIED:
             # Sweetness cannot be judged without a readable row, so an
             # unclassified alert only ever concerns whole-auditorium
@@ -2625,22 +2628,40 @@ class Watcher:
     def _mark_cgv_request_finished(self) -> None:
         self._last_cgv_request_finished_at = time.monotonic()
 
+    def _operator_recipients(self) -> tuple[str, ...]:
+        """The one chat that gets fetch-failure notices, if it is configured.
+
+        Deliberately not gated on subscription: this is an operations notice
+        addressed to whoever runs the bot, not something anyone opted into.
+        """
+
+        operator = str(self.config.telegram_chat_id or "").strip()
+        return (operator,) if operator else ()
+
     def _broadcast_message(
         self,
         text: str,
         *,
         category: str = ALERT_SYSTEM,
         seats_available: int | None = None,
+        recipients: Sequence[str] | None = None,
     ) -> tuple[int, int, int]:
         """Send to subscribers opted in to ``category``.
 
         The returned total counts only those recipients, so callers that gate
         state updates on delivery still advance when nobody wants this
         category (total == 0) instead of retrying forever.
+
+        ``recipients`` addresses named chats instead, for a message that is
+        not a subscription at all.
         """
 
-        subscriber_ids = self.state.subscriber_ids_for(
-            category, seats_available=seats_available
+        subscriber_ids = (
+            tuple(recipients)
+            if recipients is not None
+            else self.state.subscriber_ids_for(
+                category, seats_available=seats_available
+            )
         )
         delivered = 0
         failed = 0
@@ -3793,7 +3814,9 @@ class Watcher:
                     + "감시기는 계속 실행되며 자동 대기 후 다시 시도합니다."
                 )
                 delivered, _failed, total = self._broadcast_message(
-                    error_text, category=ALERT_SYSTEM
+                    error_text,
+                    category=ALERT_SYSTEM,
+                    recipients=self._operator_recipients(),
                 )
                 if delivered or _failed or total == 0:
                     self.state.mark_error_notified(fingerprint)
