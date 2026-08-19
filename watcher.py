@@ -141,6 +141,10 @@ ADMIN_COMMANDS = {
 }
 # A draft goes stale rather than waiting around to be sent by accident.
 NOTICE_DRAFT_TTL_MINUTES = 10
+# Plain-text messages are relayed to the operator.  The bot is public, so one
+# chat is capped per hour and a long message is trimmed.
+FORWARD_MAX_PER_HOUR = 5
+FORWARD_MAX_CHARS = 500
 # Marks the message as something a person wrote, not one of the alerts.
 NOTICE_HEADER = "📢 공지"
 NOTICE_GUIDE = (
@@ -2498,6 +2502,7 @@ class Watcher:
         # Drafted announcement awaiting confirmation; in memory only, so a
         # restart drops it rather than sending something the operator forgot.
         self._notice_draft: tuple[str, dt.datetime] | None = None
+        self._forwarded_at: dict[str, list[dt.datetime]] = {}
         self.state.load()
         if not self.state.subscribers_initialized:
             self.state.initialize_subscribers(config.telegram_chat_id)
@@ -2952,6 +2957,62 @@ class Watcher:
                 lines.append(f"… 외 {len(records) - listed}명")
         return "\n".join(lines)
 
+    def _forward_to_operator(
+        self, chat: Mapping[str, Any], chat_id: str, text: str
+    ) -> None:
+        """Relay a subscriber's plain-text message to the operator."""
+
+        operator = self._operator_recipients()
+        if not text or not operator or chat_id in operator:
+            return
+        # The bot is public, so anyone can type into it.  Cap each chat per
+        # hour rather than letting one person fill the operator's inbox.
+        now = self.config.local_now()
+        recent = [
+            seen
+            for seen in self._forwarded_at.get(chat_id, ())
+            if now - seen < dt.timedelta(hours=1)
+        ]
+        if len(recent) >= FORWARD_MAX_PER_HOUR:
+            self._forwarded_at[chat_id] = recent
+            self.logger.info(
+                "메시지 전달 생략: chat_id=%s 가 1시간 안에 %d건을 넘겼습니다.",
+                chat_id,
+                FORWARD_MAX_PER_HOUR,
+            )
+            return
+        self._forwarded_at[chat_id] = [*recent, now]
+
+        body = text[:FORWARD_MAX_CHARS]
+        if len(text) > FORWARD_MAX_CHARS:
+            body += f"\n… (뒷부분 {len(text) - FORWARD_MAX_CHARS}자 생략)"
+        who = [chat_id]
+        label = str(
+            chat.get("title") or chat.get("username") or chat.get("first_name") or ""
+        )
+        if label:
+            who.append(label)
+        if not self.state.is_subscribed(chat_id):
+            who.append("구독 안 함")
+        self._broadcast_message(
+            "💬 구독자 메시지\n"
+            + " · ".join(who)
+            + "\n━━━━━━━━━━━━━━━━━━━━\n"
+            + body,
+            category=ALERT_SYSTEM,
+            recipients=operator,
+        )
+        # Silence would read as the bot being broken, and the sender has no
+        # way to know a person will see this.
+        try:
+            self.telegram.send_message(
+                "메시지를 운영자에게 전달했습니다. 답장이 늦을 수 있어요.\n"
+                "사용법은 /help, 설정은 /status 로 확인하실 수 있습니다.",
+                chat_id=chat_id,
+            )
+        except TelegramError as exc:
+            self.logger.warning("메시지 수신 확인 답장 실패: %s", exc)
+
     def _handle_notice_command(
         self, command: str, body: str
     ) -> tuple[str, bool]:
@@ -3178,10 +3239,14 @@ class Watcher:
             if not isinstance(chat, Mapping) or chat.get("id") is None:
                 continue
             text = str(message.get("text") or "").strip()
+            chat_id = str(chat["id"])
             if not text.startswith("/"):
+                # Somebody wrote a sentence, not a command.  Relay it: the
+                # bot is public, and a question typed here would otherwise
+                # vanish into silence.
+                self._forward_to_operator(chat, chat_id, text)
                 continue
 
-            chat_id = str(chat["id"])
             fields = text.split()
             command = fields[0].lower().split("@", 1)[0]
             argument = fields[1].lower() if len(fields) > 1 else ""

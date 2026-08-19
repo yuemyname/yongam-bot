@@ -26,6 +26,8 @@ from watcher import (
     ADMIN_NOTICE_COMMAND,
     ADMIN_NOTICE_SEND_COMMAND,
     ADMIN_STATS_COMMAND,
+    FORWARD_MAX_CHARS,
+    FORWARD_MAX_PER_HOUR,
     NOTICE_DRAFT_TTL_MINUTES,
     STATS_MAX_CHARS,
     SCAN_MODE_CURSOR,
@@ -3488,6 +3490,107 @@ class WatcherIntegrationTests(unittest.TestCase):
             watcher.sync_subscribers()
             self.assertEqual(len(counted("leave")), 2)
             self.assertFalse(watcher.state.is_subscribed("4242"))
+
+    def _forwarding_watcher(self, temporary, name):
+        config = dataclasses.replace(
+            make_config(Path(temporary)), subscriptions_enabled=True
+        )
+        logger = logging.getLogger(f"watcher-{name}-{id(self)}")
+        logger.handlers = [logging.NullHandler()]
+        watcher = Watcher(config, logger=logger)
+        watcher.state.add_subscriber(
+            "7061234567", chat_type="private", label="홍길동"
+        )
+        sent = []
+        watcher.telegram.send_message = lambda text, **kwargs: sent.append(
+            (str(kwargs.get("chat_id")), text)
+        )
+        return watcher, sent
+
+    @staticmethod
+    def _incoming(watcher, chat_id, text, update_id, **chat_fields):
+        watcher.telegram.get_updates = lambda **_kwargs: [
+            {
+                "update_id": update_id,
+                "message": {
+                    "text": text,
+                    "chat": {"id": int(chat_id), "type": "private", **chat_fields},
+                },
+            }
+        ]
+        watcher.sync_subscribers()
+
+    def test_a_plain_message_reaches_the_operator_and_is_acknowledged(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher, sent = self._forwarding_watcher(temporary, "forward")
+            operator = str(watcher.config.telegram_chat_id)
+
+            self._incoming(
+                watcher, "7061234567", "알림 너무 많이 와요", 1, first_name="홍길동"
+            )
+
+            relayed = [text for chat, text in sent if chat == operator]
+            self.assertEqual(len(relayed), 1)
+            self.assertIn("💬 구독자 메시지", relayed[0])
+            self.assertIn("7061234567", relayed[0])
+            self.assertIn("홍길동", relayed[0])
+            self.assertIn("알림 너무 많이 와요", relayed[0])
+            # Silence would read as the bot being broken.
+            acks = [text for chat, text in sent if chat == "7061234567"]
+            self.assertEqual(len(acks), 1)
+            self.assertIn("운영자에게 전달했습니다", acks[0])
+
+    def test_a_non_subscriber_message_is_marked_as_such(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher, sent = self._forwarding_watcher(temporary, "forward-guest")
+            operator = str(watcher.config.telegram_chat_id)
+
+            self._incoming(watcher, "9990001111", "이거 무료인가요?", 1)
+
+            relayed = next(text for chat, text in sent if chat == operator)
+            self.assertIn("구독 안 함", relayed)
+
+    def test_commands_are_handled_rather_than_forwarded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher, sent = self._forwarding_watcher(temporary, "forward-cmd")
+            operator = str(watcher.config.telegram_chat_id)
+
+            self._incoming(watcher, "7061234567", "/status", 1)
+
+            self.assertEqual([text for chat, text in sent if chat == operator], [])
+            self.assertIn("구독 중입니다", sent[-1][1])
+
+    def test_one_chat_cannot_fill_the_operator_inbox(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher, sent = self._forwarding_watcher(temporary, "forward-flood")
+            operator = str(watcher.config.telegram_chat_id)
+
+            for index in range(FORWARD_MAX_PER_HOUR + 5):
+                self._incoming(watcher, "9990001111", f"스팸 {index}", index + 1)
+
+            # The bot is public, so anyone can type into it all day.
+            relayed = [text for chat, text in sent if chat == operator]
+            self.assertEqual(len(relayed), FORWARD_MAX_PER_HOUR)
+
+    def test_a_very_long_message_is_trimmed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher, sent = self._forwarding_watcher(temporary, "forward-long")
+            operator = str(watcher.config.telegram_chat_id)
+
+            self._incoming(watcher, "7061234567", "가" * (FORWARD_MAX_CHARS + 50), 1)
+
+            relayed = next(text for chat, text in sent if chat == operator)
+            self.assertIn("뒷부분 50자 생략", relayed)
+            self.assertLess(len(relayed), FORWARD_MAX_CHARS + 200)
+
+    def test_the_operators_own_message_is_not_echoed_back(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher, sent = self._forwarding_watcher(temporary, "forward-self")
+            operator = str(watcher.config.telegram_chat_id)
+
+            self._incoming(watcher, operator, "혼잣말", 1)
+
+            self.assertEqual(sent, [])
 
     def _notice_watcher(self, temporary, name):
         config = dataclasses.replace(
