@@ -1595,6 +1595,20 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(query["movNo"], "30001323")
             self.assertEqual(query["scnYmd"], "20260826")
 
+    def test_booking_url_uses_the_configured_theater_name(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = dataclasses.replace(
+                make_config(Path(temporary)),
+                site_no="0074",
+                site_name="왕십리",
+            )
+            session = BookingSession(date="2026-08-26", start_time="14:30")
+            url = booking_url_for_session(session, config)
+            query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
+
+            self.assertEqual(query["siteNo"], "0074")
+            self.assertEqual(query["siteNm"], "왕십리")
+
     def test_railway_environment_works_without_dotenv_and_uses_volume(self):
         with tempfile.TemporaryDirectory() as temporary:
             project_dir = Path(temporary)
@@ -3683,7 +3697,9 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertIn("신규 예매 오픈 알림은 좌석 설정과 관계없이 항상", description)
             self.assertIn("/start — 알림 구독", description)
             self.assertIn("명당만 원하면 /seat_sweet", description)
-            self.assertIn("예매 바로가기 링크 열기", description)
+            self.assertIn(
+                "영화·극장·날짜가 선택된 예매 바로가기 링크 열기", description
+            )
             self.assertIn("/stop — 알림 해지", description)
             self.assertIn("/status — 현재 구독 및 설정 확인", description)
             self.assertIn("/desc — 봇 설명과 사용 방법", description)
