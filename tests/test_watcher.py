@@ -4478,6 +4478,17 @@ class DocumentedCommandTests(unittest.TestCase):
                 documented - known, set(), f"{name}에 없는 설정이 적혀 있습니다"
             )
 
+    def test_the_landing_page_only_advertises_real_commands(self):
+        page = (self.REPO / "docs" / "index.html").read_text(encoding="utf-8")
+        listed = set(re.findall(r"<code>(/[a-z0-9_]+)</code>", page))
+
+        self.assertTrue(listed, "소개 페이지에서 명령어를 찾지 못했습니다")
+        self.assertEqual(listed - self._handled_commands(), set())
+        # The page is what a stranger reads before installing anything, so the
+        # two promises the bot must never break belong in the drift check too.
+        self.assertIn("자동 예매나 좌석 선점 기능은 <strong>없습니다.</strong>", page)
+        self.assertIn("요구하지도 저장하지도 않습니다", page)
+
     def test_the_operator_command_stays_out_of_public_lists(self):
         development = (self.REPO / "DEVELOPMENT.md").read_text(encoding="utf-8")
         readme = (self.REPO / "README.md").read_text(encoding="utf-8")

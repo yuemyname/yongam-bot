@@ -6,6 +6,8 @@ CGV 용산아이파크몰 IMAX의 예매 오픈과 예매 가능한 좌석을 Te
 
 ### 👉 [@yongambot](https://t.me/yongambot) — 봇 열고 `/start` 보내기
 
+소개 페이지: **https://yuemyname.github.io/yongam-bot/**
+
 - 영화: 오디세이 (`movNo=30001323`)
 - 극장: CGV 용산아이파크몰 (`siteNo=0013`)
 - 감시 기간: 한국시간 기준 오늘을 포함한 28일(4주)

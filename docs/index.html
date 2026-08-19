@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>용아맥 취소표 알림 봇 — CGV 용산 IMAX 예매 오픈·잔여좌석 텔레그램 알리미</title>
+<meta name="description" content="CGV 용산아이파크몰 IMAX(용아맥)의 예매 오픈과 취소표를 1분마다 확인해 텔레그램으로 알려주는 무료 봇입니다. 로그인 없이 /start 한 번이면 끝.">
+<link rel="canonical" href="https://yuemyname.github.io/yongam-bot/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="용아맥 취소표 알림 봇 — CGV 용산 IMAX 텔레그램 알리미">
+<meta property="og:description" content="CGV 용산 IMAX의 예매 오픈과 취소표를 1분마다 확인해 텔레그램으로 알려드립니다. 무료, 로그인 불필요.">
+<meta property="og:url" content="https://yuemyname.github.io/yongam-bot/">
+<meta property="og:locale" content="ko_KR">
+<meta name="twitter:card" content="summary">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "용아맥 취소표 알림 봇",
+  "alternateName": "yongambot",
+  "applicationCategory": "UtilitiesApplication",
+  "operatingSystem": "Telegram",
+  "url": "https://yuemyname.github.io/yongam-bot/",
+  "installUrl": "https://t.me/yongambot",
+  "inLanguage": "ko",
+  "description": "CGV 용산아이파크몰 IMAX의 예매 오픈과 취소표를 약 1분 주기로 확인해 텔레그램으로 알려주는 비공식 알림 봇입니다.",
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "KRW" }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "용아맥 취소표는 어떻게 잡나요?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "매진된 회차라도 예매 취소가 나오면 좌석이 다시 풀립니다. 이 봇은 CGV 공개 예매 정보를 약 1분마다 확인해 예매 가능한 좌석이 생기면 텔레그램으로 알려줍니다. 알림에는 상영일, 시작시간, 남은 좌석 수와 위치, 예매 링크가 들어갑니다."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "무료인가요? 로그인이 필요한가요?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "무료입니다. CGV 로그인 정보나 쿠키는 요구하지도 저장하지도 않습니다. 텔레그램에서 봇을 열고 /start를 보내면 바로 구독됩니다."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "예매도 대신 해주나요?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "아니요. 자동 예매나 좌석 선점 기능은 없습니다. 알림만 보내드리며 예매는 직접 하셔야 합니다."
+      }
+    }
+  ]
+}
+</script>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1b1b1f; --muted: #5b5b66;
+    --line: #e4e4ea; --card: #f7f7fa; --accent: #1f6feb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14141a; --fg: #ececf1; --muted: #a0a0ad;
+      --line: #2c2c36; --card: #1c1c24; --accent: #79a9ff;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 16px/1.75 -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo",
+      "Pretendard", "Malgun Gothic", sans-serif;
+    word-break: keep-all;
+  }
+  .wrap { max-width: 46rem; margin: 0 auto; padding: 3rem 1.25rem 5rem; }
+  h1 { font-size: 1.9rem; line-height: 1.35; margin: 0 0 .6rem; letter-spacing: -.02em; }
+  h2 { font-size: 1.25rem; margin: 2.75rem 0 .75rem; letter-spacing: -.01em; }
+  h3 { font-size: 1rem; margin: 1.5rem 0 .35rem; }
+  p, li { color: var(--fg); }
+  .lead { font-size: 1.075rem; color: var(--muted); margin: 0 0 1.75rem; }
+  .cta {
+    display: inline-block; background: var(--accent); color: #fff;
+    text-decoration: none; font-weight: 600;
+    padding: .85rem 1.6rem; border-radius: .6rem;
+  }
+  .cta:hover { filter: brightness(1.08); }
+  .note { color: var(--muted); font-size: .9rem; margin-top: .75rem; }
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: .7rem; padding: 1rem 1.25rem; margin: 1rem 0;
+  }
+  pre {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: .7rem; padding: 1rem; overflow-x: auto;
+    font-size: .875rem; line-height: 1.6;
+  }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  ul { padding-left: 1.2rem; }
+  li { margin: .3rem 0; }
+  a { color: var(--accent); }
+  table { border-collapse: collapse; width: 100%; font-size: .95rem; }
+  th, td { border-bottom: 1px solid var(--line); padding: .55rem .5rem; text-align: left; }
+  th { color: var(--muted); font-weight: 600; }
+  footer {
+    margin-top: 4rem; padding-top: 1.5rem; border-top: 1px solid var(--line);
+    color: var(--muted); font-size: .875rem;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>용아맥 취소표 알림 봇</h1>
+<p class="lead">
+  CGV 용산아이파크몰 IMAX의 <strong>예매 오픈</strong>과 <strong>취소표</strong>를
+  약 1분마다 확인해 텔레그램으로 알려드립니다. 무료이고, CGV 로그인은 필요 없습니다.
+</p>
+
+<p><a class="cta" href="https://t.me/yongambot">텔레그램에서 열기 → @yongambot</a></p>
+<p class="note">봇을 연 뒤 <code>/start</code> 한 번이면 끝입니다. 따로 설정할 것은 없습니다.</p>
+
+<h2>매진된 회차, 계속 새로고침하고 계신가요</h2>
+<p>
+  용아맥은 인기 회차가 순식간에 매진됩니다. 그런데 매진이라고 끝이 아닙니다.
+  예매를 취소하는 사람이 늘 있고, 그 좌석은 다시 풀립니다.
+  문제는 <strong>언제 풀릴지 아무도 모른다</strong>는 것입니다.
+</p>
+<p>
+  이 봇이 대신 지켜봅니다. 예매 가능한 자리가 생기면 그 자리가 남아 있는 동안
+  텔레그램으로 알려드립니다. 새 상영일이 열릴 때도 바로 알려드립니다.
+</p>
+
+<h2>어떤 알림이 오나요</h2>
+
+<h3>🎟️ 예매 오픈 알림</h3>
+<p>처음 보는 상영일·시작시간이 나타나면 날짜별로 모아서 보냅니다. 매진 상태로 열린 회차도 알려드립니다.</p>
+<pre><code>🎟️ CGV 예매 오픈 감지
+📅 상영일: 2026-08-26 (수)
+영화: 오디세이
+극장: 용산아이파크몰
+
+• 상영 시작시간 11:00 — 624/624석
+• 상영 시작시간 14:30 — 624/624석
+• 상영 시작시간 18:00 — 0/624석 (매진 · 취소표 나오면 알림)</code></pre>
+
+<h3>💺 예매 가능 좌석 알림 (취소표)</h3>
+<p>예매할 수 있는 자리가 있으면 알려드립니다. 좌석의 행과 번호까지 나옵니다.</p>
+<pre><code>💺 CGV 예매 가능 좌석
+📅 상영일: 2026-08-26 (수)
+상영 시작시간: 18:00
+잔여좌석/총좌석: 4/624석 (이전 2/624석)
+A열 제외 예매 가능: 2석 → 4석
+A열 제외 잔여 좌석: H20~21 / J7</code></pre>
+
+<h2>알림이 너무 많다면</h2>
+<p>기본값 그대로 두셔도 됩니다. 줄이고 싶을 때만 아래 명령을 쓰세요.</p>
+<table>
+  <tr><th>명령어</th><th>기능</th></tr>
+  <tr><td><code>/mode_open</code></td><td>새 회차 오픈 알림만 받기</td></tr>
+  <tr><td><code>/seat_sweet</code></td><td>중앙 명당 구역에 자리가 있을 때만 받기</td></tr>
+  <tr><td><code>/count_2</code></td><td>2석 이상 남아 있을 때만 받기 (둘이 볼 자리)</td></tr>
+  <tr><td><code>/stop</code></td><td>알림 해지</td></tr>
+</table>
+<p class="note">맨 앞줄 A열은 기본적으로 알림에서 제외합니다.</p>
+
+<h2>자주 묻는 질문</h2>
+
+<h3>무료인가요?</h3>
+<p>네. 후원 여부와 관계없이 모든 기능이 동일합니다.</p>
+
+<h3>CGV 로그인 정보가 필요한가요?</h3>
+<p>아니요. CGV 아이디, 비밀번호, 쿠키는 <strong>요구하지도 저장하지도 않습니다.</strong> 공개된 예매 정보만 봅니다.</p>
+
+<h3>예매도 대신 해주나요?</h3>
+<p>아니요. 자동 예매나 좌석 선점 기능은 <strong>없습니다.</strong> 알림만 보내드리고, 예매는 직접 하셔야 합니다.</p>
+
+<h3>어떤 정보를 저장하나요?</h3>
+<p>알림을 보내는 데 필요한 텔레그램 채팅 ID와 알림 설정만 저장합니다. <code>/stop</code>을 보내면 바로 삭제됩니다.</p>
+
+<h3>공식 CGV 서비스인가요?</h3>
+<p>아닙니다. 개인이 만든 비공식 알림 봇입니다. CGV가 예매 정보 제공 방식을 바꾸면 조회가 일시적으로 실패할 수 있습니다.</p>
+
+<div class="card">
+  <p style="margin:0"><strong>지금 시작하기</strong><br>
+  텔레그램에서 <a href="https://t.me/yongambot">@yongambot</a>을 열고 <code>/start</code>를 보내세요.</p>
+</div>
+
+<footer>
+  <p>
+    비공식 개인 프로젝트입니다 ·
+    <a href="https://github.com/yuemyname/yongam-bot">소스 코드 (GitHub)</a> ·
+    <a href="https://github.com/yuemyname/yongam-bot/blob/main/docs/alert-flow.md">알림 판정 방식</a>
+  </p>
+</footer>
+
+</div>
+</body>
+</html>

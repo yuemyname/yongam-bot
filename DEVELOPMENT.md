@@ -29,6 +29,35 @@ help - 사용법 보기
 
 BotFather의 `/setdescription`에는 저장소에서 제공하는 한글·영문 소개문을 등록할 수 있습니다.
 
+## 소개 페이지 (GitHub Pages)
+
+`docs/index.html`이 검색에 노출되는 소개 페이지입니다. 저장소 README는 검색 결과에서 잘 잡히지 않기 때문에 별도로 둡니다.
+
+**최초 1회 설정**
+
+1. GitHub 저장소 → **Settings → Pages**
+2. Source를 **Deploy from a branch**, 브랜치를 `main`, 폴더를 **`/docs`**로 지정하고 Save
+3. 몇 분 뒤 `https://yuemyname.github.io/yongam-bot/` 로 열리는지 확인
+4. 저장소 첫 화면 오른쪽 **About** 톱니바퀴 → Website에 같은 주소 입력
+
+**검색 등록**
+
+| 서비스 | 등록 위치 | 제출할 것 |
+|---|---|---|
+| Google | [Search Console](https://search.google.com/search-console) | 사이트 주소 확인 후 `sitemap.xml` 제출, 색인 요청 |
+| 네이버 | [서치어드바이저](https://searchadvisor.naver.com) | 사이트 등록 + 사이트맵 제출 |
+| 다음 | [검색등록](https://register.search.daum.net) | 사이트 등록 |
+
+한국어 영화·예매 검색은 네이버 비중이 커서 서치어드바이저 등록이 구글보다 효과가 클 수 있습니다.
+
+색인까지는 보통 며칠에서 2~3주 걸립니다. 등록 직후 검색해도 안 나오는 것이 정상입니다.
+
+**페이지를 고칠 때**
+
+`docs/index.html` 한 파일에 모두 들어 있습니다. 외부 스크립트나 폰트를 쓰지 않고, 다크 모드도 자동 대응합니다. `docs/.nojekyll`은 GitHub이 파일을 그대로 서빙하도록 하는 표시라 지우지 마세요.
+
+알림 문구나 명령어를 바꾸면 이 페이지의 예시도 같이 고쳐야 합니다.
+
 ## Railway 배포
 
 저장소: [yuemyname/yongam-bot](https://github.com/yuemyname/yongam-bot)
