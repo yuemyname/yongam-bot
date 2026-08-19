@@ -124,8 +124,12 @@ MODE_GUIDE = (
     "/mode_seats - 잔여 좌석만"
 )
 
-# Operator-only. Deliberately left out of /help and the BotFather command list.
-ADMIN_STATS_COMMAND = "/stats"
+# Operator-only. Deliberately left out of /help and the BotFather command list,
+# and spelled so a subscriber does not land on it by guessing.
+ADMIN_STATS_COMMAND = "/statss"
+# The reply carries every subscriber and Telegram rejects a message past 4096
+# characters, so the list is trimmed to fit rather than losing the whole reply.
+STATS_MAX_CHARS = 3900
 # Preferred seats for cancellation-ticket alerts.  Booking-open alerts remain
 # unfiltered because detecting a newly opened showing is the bot's top priority.
 SEAT_SELECTION_ALL = "all"
@@ -1496,6 +1500,28 @@ class StateStore:
         with self._lock:
             return str(chat_id) in self.data["subscribers"]
 
+    def subscriber_details(self) -> tuple[dict[str, Any], ...]:
+        """Every subscriber with the settings that decide what they receive."""
+
+        with self._lock:
+            chat_ids = tuple(str(chat_id) for chat_id in self.data["subscribers"])
+            records = []
+            for chat_id in chat_ids:
+                record = self.data["subscribers"].get(chat_id)
+                stored = record if isinstance(record, Mapping) else {}
+                records.append(
+                    {
+                        "chat_id": chat_id,
+                        "label": str(stored.get("label") or ""),
+                        "chat_type": str(stored.get("chat_type") or ""),
+                        "subscribed_at": str(stored.get("subscribed_at") or ""),
+                        "alert_mode": self.alert_mode(chat_id),
+                        "seat_selection": self.seat_selection(chat_id),
+                        "min_seats": self.min_seats(chat_id),
+                    }
+                )
+            return tuple(records)
+
     def alert_mode(self, chat_id: str) -> str:
         """Return a subscriber's alert preference, defaulting to everything."""
 
@@ -2839,7 +2865,56 @@ class Watcher:
                 f"• {MIN_SEATS_LABELS[minimum]} — "
                 f"{stats['min_seats'][minimum]}명"
             )
+
+        records = self.state.subscriber_details()
+        if records:
+            lines.append("")
+            lines.append("📋 구독자 목록")
+            # Budget by characters, not by a subscriber count: one group with a
+            # long title costs several times what a bare chat id does, and
+            # overshooting loses the whole message including the totals above.
+            budget = STATS_MAX_CHARS - len("\n".join(lines)) - len("\n… 외 999명")
+            listed = 0
+            for record in records:
+                kind = chat_labels.get(record["chat_type"] or "unknown", "미상")
+                parts = [record["chat_id"], kind]
+                if record["label"]:
+                    parts.insert(1, record["label"])
+                if joined := self._local_join_date(record["subscribed_at"]):
+                    parts.append(joined)
+                entry = (
+                    f"{listed + 1}. "
+                    + " · ".join(parts)
+                    + "\n   "
+                    + " · ".join(
+                        (
+                            ALERT_MODE_LABELS[record["alert_mode"]],
+                            SEAT_SELECTION_LABELS[record["seat_selection"]],
+                            MIN_SEATS_LABELS[record["min_seats"]],
+                        )
+                    )
+                )
+                if len(entry) + 1 > budget:
+                    break
+                budget -= len(entry) + 1
+                lines.append(entry)
+                listed += 1
+            if listed < len(records):
+                lines.append(f"… 외 {len(records) - listed}명")
         return "\n".join(lines)
+
+    def _local_join_date(self, stored: str) -> str:
+        """The subscription date in the operator's timezone, or "" if unusable."""
+
+        try:
+            moment = dt.datetime.fromisoformat(stored)
+        except ValueError:
+            return ""
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=dt.timezone.utc)
+        return moment.astimezone(ZoneInfo(self.config.timezone_name)).strftime(
+            "%m-%d"
+        )
 
     def _handle_mode_command(
         self, chat_id: str, command: str, argument: str

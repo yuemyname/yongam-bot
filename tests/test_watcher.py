@@ -22,6 +22,8 @@ from watcher import (
     ALERT_SEATS_SWEET,
     ALERT_SEATS_UNCLASSIFIED,
     ALERT_SYSTEM,
+    ADMIN_STATS_COMMAND,
+    STATS_MAX_CHARS,
     SCAN_MODE_CURSOR,
     SCAN_MODE_FULL,
     MIN_SEATS_DEFAULT,
@@ -3469,6 +3471,36 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(len(counted("leave")), 2)
             self.assertFalse(watcher.state.is_subscribed("4242"))
 
+    def test_a_long_subscriber_list_is_trimmed_not_dropped(self):
+        for label in ("", "용아맥 오디세이 취소표 대기방입니다 여기서 기다려요"):
+            with self.subTest(label=label or "이름 없음"), \
+                    tempfile.TemporaryDirectory() as temporary:
+                config = make_config(Path(temporary))
+                logger = logging.getLogger(f"watcher-stats-cap-{id(self)}")
+                logger.handlers = [logging.NullHandler()]
+                watcher = Watcher(config, logger=logger)
+                for index in range(80):
+                    watcher.state.add_subscriber(
+                        f"-100{7061234567 + index}",
+                        chat_type="supergroup",
+                        label=label,
+                    )
+
+                message = watcher._subscriber_stats_message()
+
+                # Telegram rejects a message past 4096 characters, which would
+                # lose the totals at the top along with the list.
+                self.assertLessEqual(len(message), STATS_MAX_CHARS)
+                self.assertIn("전체 81명", message)
+                self.assertRegex(message, r"… 외 \d+명")
+                # A long group title costs several times a bare chat id, so the
+                # trim point moves with the content rather than a fixed count.
+                listed = len(re.findall(r"^\d+\. ", message, re.MULTILINE))
+                self.assertGreater(listed, 0)
+                self.assertEqual(
+                    int(re.search(r"… 외 (\d+)명", message).group(1)), 81 - listed
+                )
+
     def test_stats_command_answers_the_operator_only(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = dataclasses.replace(
@@ -3503,7 +3535,7 @@ class WatcherIntegrationTests(unittest.TestCase):
                 ]
                 watcher.sync_subscribers()
 
-            send(int(config.telegram_chat_id), "/stats", 1)
+            send(int(config.telegram_chat_id), ADMIN_STATS_COMMAND, 1)
             operator_reply = replies[-1][1]
             self.assertIn("전체 5명", operator_reply)
             self.assertIn("신규 오픈만 — 1명", operator_reply)
@@ -3511,10 +3543,23 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertIn("모든 A열 제외 좌석 — 3명", operator_reply)
             self.assertIn("명당 좌석만 — 2명", operator_reply)
 
+            # Every subscriber is listed with the settings that decide what
+            # they receive, not just the totals.
+            self.assertIn("📋 구독자 목록", operator_reply)
+            for index in range(4):
+                self.assertIn(str(2000 + index), operator_reply)
+            self.assertIn(
+                "신규 오픈만 · 모든 A열 제외 좌석 · 1석부터 모두", operator_reply
+            )
+
             # A subscriber gets the generic reply, so the command stays hidden.
-            send(2000, "/stats", 2)
+            send(2000, ADMIN_STATS_COMMAND, 2)
             self.assertIn("사용 가능한 명령어", replies[-1][1])
             self.assertNotIn("구독 현황", replies[-1][1])
+
+            # The old spelling is not a command any more.
+            send(int(config.telegram_chat_id), "/stats", 3)
+            self.assertIn("사용 가능한 명령어", replies[-1][1])
 
             send(int(config.telegram_chat_id), "/help", 3)
             help_reply = replies[-1][1]
@@ -4422,5 +4467,7 @@ class DocumentedCommandTests(unittest.TestCase):
         readme = (self.REPO / "README.md").read_text(encoding="utf-8")
         block = development.split("`/setcommands`")[1].split("```")[1]
 
-        self.assertNotIn("stats", block)
-        self.assertNotIn("| `/stats` |", readme)
+        # Tied to the constant so a rename cannot quietly publish the command.
+        self.assertNotIn(ADMIN_STATS_COMMAND.lstrip("/"), block)
+        self.assertNotIn(f"| `{ADMIN_STATS_COMMAND}` |", readme)
+        self.assertNotIn(ADMIN_STATS_COMMAND, self._botfather_commands())
