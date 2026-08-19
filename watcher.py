@@ -79,6 +79,9 @@ ALERT_SEATS_UNCLASSIFIED = "seats_unclassified"
 # A CGV fetch failure.  Operator-only: a subscriber can do nothing about it,
 # and the watcher retries the failed dates on its own within a cycle or two.
 ALERT_SYSTEM = "system"
+# An announcement the operator typed.  Everyone subscribed gets it, whatever
+# they set /mode to — it is not one of the alerts those settings filter.
+ALERT_NOTICE = "notice"
 
 # Per-subscriber alert preference.  Subscribers stored before this feature have
 # no saved mode and fall back to DEFAULT_ALERT_MODE, preserving old behaviour.
@@ -127,6 +130,30 @@ MODE_GUIDE = (
 # Operator-only. Deliberately left out of /help and the BotFather command list,
 # and spelled so a subscriber does not land on it by guessing.
 ADMIN_STATS_COMMAND = "/statss"
+# Operator-only broadcast.  Two steps on purpose: a typo here reaches every
+# subscriber at once and cannot be taken back.
+ADMIN_NOTICE_COMMAND = "/notice"
+ADMIN_NOTICE_SEND_COMMAND = "/notice_send"
+ADMIN_COMMANDS = {
+    ADMIN_STATS_COMMAND,
+    ADMIN_NOTICE_COMMAND,
+    ADMIN_NOTICE_SEND_COMMAND,
+}
+# A draft goes stale rather than waiting around to be sent by accident.
+NOTICE_DRAFT_TTL_MINUTES = 10
+# Marks the message as something a person wrote, not one of the alerts.
+NOTICE_HEADER = "📢 공지"
+NOTICE_GUIDE = (
+    "공지를 구독자 전원에게 보냅니다.\n"
+    "사용법: /notice 보낼 내용\n\n"
+    "먼저 미리보기가 나오고, /notice_send 로 확인해야 실제로 전송됩니다.\n\n"
+    "알림이 잦다는 얘기가 나올 때 쓸 문구 예시입니다. 그대로 복사해서 쓰세요.\n\n"
+    "/notice 알림이 너무 자주 오면 아래처럼 줄일 수 있어요.\n"
+    "• /count_2 — 2석 이상 남았을 때만 받기\n"
+    "• /seat_sweet — 중앙 명당 구역에 자리가 있을 때만 받기\n"
+    "• /mode_open — 새 회차 오픈 알림만 받기\n"
+    "지금 설정은 /status 로 확인할 수 있어요."
+)
 # The reply carries every subscriber and Telegram rejects a message past 4096
 # characters, so the list is trimmed to fit rather than losing the whole reply.
 STATS_MAX_CHARS = 3900
@@ -1875,6 +1902,8 @@ class StateStore:
                 return True
             return minimum <= seats_available
 
+        if category == ALERT_NOTICE:
+            return self.subscriber_ids()
         if category == ALERT_SYSTEM:
             # Routed by the caller, which knows who the operator is.
             return ()
@@ -2466,6 +2495,9 @@ class Watcher:
         # Cycle 0 always sweeps the full window; a cursor scan runs in between.
         self._cycle_index = 0
         self._command_poll_failures = 0
+        # Drafted announcement awaiting confirmation; in memory only, so a
+        # restart drops it rather than sending something the operator forgot.
+        self._notice_draft: tuple[str, dt.datetime] | None = None
         self.state.load()
         if not self.state.subscribers_initialized:
             self.state.initialize_subscribers(config.telegram_chat_id)
@@ -2776,7 +2808,13 @@ class Watcher:
         ):
             chat_id = record["chat_id"]
             category = record["category"]
-            eligible = set(self.state.subscriber_ids_for(category))
+            # ALERT_SYSTEM has no subscribers by design — it is addressed to
+            # the operator — so ask the same source the original send used.
+            eligible = set(
+                self._operator_recipients()
+                if category == ALERT_SYSTEM
+                else self.state.subscriber_ids_for(category)
+            )
             if chat_id not in eligible:
                 changed = self.state.remove_pending_delivery(key) or changed
                 continue
@@ -2913,6 +2951,60 @@ class Watcher:
             if listed < len(records):
                 lines.append(f"… 외 {len(records) - listed}명")
         return "\n".join(lines)
+
+    def _handle_notice_command(
+        self, command: str, body: str
+    ) -> tuple[str, bool]:
+        """Draft, preview, and send an announcement to every subscriber."""
+
+        if command == ADMIN_NOTICE_SEND_COMMAND:
+            draft = self._notice_draft
+            if draft is None:
+                return ("보낼 공지가 없습니다. /notice 로 먼저 작성하세요.", False)
+            text, drafted_at = draft
+            age = self.config.local_now() - drafted_at
+            if age > dt.timedelta(minutes=NOTICE_DRAFT_TTL_MINUTES):
+                self._notice_draft = None
+                return (
+                    f"작성한 지 {NOTICE_DRAFT_TTL_MINUTES}분이 지나 취소했습니다."
+                    " /notice 로 다시 작성하세요.",
+                    False,
+                )
+            delivered, failed, total = self._broadcast_message(
+                text, category=ALERT_NOTICE
+            )
+            self._notice_draft = None
+            self.logger.info(
+                "공지 발송: 대상 %d명, 성공 %d명, 실패 %d명",
+                total,
+                delivered,
+                failed,
+            )
+            return (
+                f"✅ 공지를 보냈습니다.\n대상 {total}명 · 성공 {delivered}명"
+                f" · 실패 {failed}명"
+                + ("\n실패한 분에게는 다음 주기에 다시 시도합니다." if failed else ""),
+                False,
+            )
+
+        if not body:
+            self._notice_draft = None
+            return (NOTICE_GUIDE, False)
+
+        text = f"{NOTICE_HEADER}\n\n{body}"
+        self._notice_draft = (text, self.config.local_now())
+        recipients = len(self.state.subscriber_ids_for(ALERT_NOTICE))
+        return (
+            "미리보기 — 아직 아무에게도 가지 않았습니다.\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"{text}\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"수신 대상 {recipients}명\n\n"
+            f"보내려면 {ADMIN_NOTICE_SEND_COMMAND}\n"
+            f"고치려면 {ADMIN_NOTICE_COMMAND} 로 다시 작성\n"
+            f"{NOTICE_DRAFT_TTL_MINUTES}분 안에 보내지 않으면 취소됩니다.",
+            False,
+        )
 
     def _local_join_date(self, stored: str) -> str:
         """The subscription date in the operator's timezone, or "" if unusable."""
@@ -3093,6 +3185,8 @@ class Watcher:
             fields = text.split()
             command = fields[0].lower().split("@", 1)[0]
             argument = fields[1].lower() if len(fields) > 1 else ""
+            # An announcement body is prose: keep its case and spacing.
+            body = text.split(None, 1)[1].strip() if len(fields) > 1 else ""
             label = str(
                 chat.get("title")
                 or chat.get("username")
@@ -3179,12 +3273,15 @@ class Watcher:
                     chat_id, command, argument
                 )
                 state_changed = state_changed or min_seats_changed
-            elif command == ADMIN_STATS_COMMAND and chat_id == str(
+            elif command in ADMIN_COMMANDS and chat_id == str(
                 self.config.telegram_chat_id
             ):
-                # Anyone else falls through to the unknown-command reply, so the
-                # command is not advertised to subscribers at all.
-                reply = self._subscriber_stats_message()
+                # Anyone else falls through to the unknown-command reply, so
+                # these are not advertised to subscribers at all.
+                if command == ADMIN_STATS_COMMAND:
+                    reply = self._subscriber_stats_message()
+                else:
+                    reply, _changed = self._handle_notice_command(command, body)
             elif command == "/help":
                 reply = (
                     "🎬 CGV 용산 IMAX 알림 봇\n\n"

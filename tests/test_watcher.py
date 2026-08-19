@@ -21,8 +21,12 @@ from watcher import (
     ALERT_SEATS,
     ALERT_SEATS_SWEET,
     ALERT_SEATS_UNCLASSIFIED,
+    ALERT_NOTICE,
     ALERT_SYSTEM,
+    ADMIN_NOTICE_COMMAND,
+    ADMIN_NOTICE_SEND_COMMAND,
     ADMIN_STATS_COMMAND,
+    NOTICE_DRAFT_TTL_MINUTES,
     STATS_MAX_CHARS,
     SCAN_MODE_CURSOR,
     SCAN_MODE_FULL,
@@ -3484,6 +3488,135 @@ class WatcherIntegrationTests(unittest.TestCase):
             watcher.sync_subscribers()
             self.assertEqual(len(counted("leave")), 2)
             self.assertFalse(watcher.state.is_subscribed("4242"))
+
+    def _notice_watcher(self, temporary, name):
+        config = dataclasses.replace(
+            make_config(Path(temporary)), subscriptions_enabled=True
+        )
+        logger = logging.getLogger(f"watcher-{name}-{id(self)}")
+        logger.handlers = [logging.NullHandler()]
+        watcher = Watcher(config, logger=logger)
+        for chat_id in ("구독자1", "구독자2"):
+            watcher.state.add_subscriber(chat_id)
+        return watcher
+
+    def test_a_notice_is_previewed_before_anyone_receives_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._notice_watcher(temporary, "notice-preview")
+            sent = []
+            watcher.telegram.send_message = lambda text, **kwargs: sent.append(
+                (str(kwargs.get("chat_id")), text)
+            )
+            operator = str(watcher.config.telegram_chat_id)
+
+            reply, _changed = watcher._handle_notice_command(
+                ADMIN_NOTICE_COMMAND, "설정을 바꿔보세요"
+            )
+
+            # Drafting must not reach a single subscriber.
+            self.assertEqual(sent, [])
+            self.assertIn("아직 아무에게도 가지 않았습니다", reply)
+            self.assertIn("설정을 바꿔보세요", reply)
+            self.assertIn("수신 대상 3명", reply)
+
+            watcher._handle_notice_command(ADMIN_NOTICE_SEND_COMMAND, "")
+
+            self.assertEqual(
+                sorted(chat for chat, _text in sent),
+                sorted([operator, "구독자1", "구독자2"]),
+            )
+            self.assertTrue(
+                all(text.startswith("📢 공지") for _chat, text in sent)
+            )
+            self.assertTrue(all("설정을 바꿔보세요" in t for _c, t in sent))
+
+    def test_a_notice_cannot_be_sent_twice(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._notice_watcher(temporary, "notice-once")
+            sent = []
+            watcher.telegram.send_message = lambda text, **kwargs: sent.append(
+                text
+            )
+
+            watcher._handle_notice_command(ADMIN_NOTICE_COMMAND, "한 번만")
+            watcher._handle_notice_command(ADMIN_NOTICE_SEND_COMMAND, "")
+            after_first = len(sent)
+            reply, _changed = watcher._handle_notice_command(
+                ADMIN_NOTICE_SEND_COMMAND, ""
+            )
+
+            self.assertEqual(len(sent), after_first)
+            self.assertIn("보낼 공지가 없습니다", reply)
+
+    def test_a_stale_notice_draft_is_dropped_rather_than_sent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._notice_watcher(temporary, "notice-stale")
+            sent = []
+            watcher.telegram.send_message = lambda text, **kwargs: sent.append(
+                text
+            )
+
+            watcher._handle_notice_command(ADMIN_NOTICE_COMMAND, "오래된 초안")
+            text, drafted_at = watcher._notice_draft
+            watcher._notice_draft = (
+                text,
+                drafted_at - dt.timedelta(minutes=NOTICE_DRAFT_TTL_MINUTES + 1),
+            )
+            reply, _changed = watcher._handle_notice_command(
+                ADMIN_NOTICE_SEND_COMMAND, ""
+            )
+
+            self.assertEqual(sent, [])
+            self.assertIn("취소했습니다", reply)
+            self.assertIsNone(watcher._notice_draft)
+
+    def test_notice_commands_answer_the_operator_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._notice_watcher(temporary, "notice-admin")
+            replies = []
+            watcher.telegram.send_message = lambda text, **kwargs: replies.append(
+                (str(kwargs.get("chat_id")), text)
+            )
+
+            def send(chat_id, text, update_id):
+                watcher.telegram.get_updates = lambda **_kwargs: [
+                    {
+                        "update_id": update_id,
+                        "message": {
+                            "text": text,
+                            "chat": {"id": chat_id, "type": "private"},
+                        },
+                    }
+                ]
+                watcher.sync_subscribers()
+
+            send(999111, f"{ADMIN_NOTICE_COMMAND} 아무나 보내는 공지", 1)
+
+            self.assertIn("사용 가능한 명령어", replies[-1][1])
+            self.assertIsNone(watcher._notice_draft)
+
+            send(999111, ADMIN_NOTICE_SEND_COMMAND, 2)
+            self.assertIn("사용 가능한 명령어", replies[-1][1])
+
+    def test_a_queued_notice_retry_survives_the_eligibility_check(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher = self._notice_watcher(temporary, "notice-retry")
+            operator = str(watcher.config.telegram_chat_id)
+            watcher.state.queue_pending_delivery(
+                operator, "⚠️ CGV 감시 조회 오류", ALERT_SYSTEM
+            )
+            watcher.state.queue_pending_delivery("구독자1", "📢 공지", ALERT_NOTICE)
+            resent = []
+            watcher.telegram.send_message = lambda text, **kwargs: resent.append(
+                str(kwargs.get("chat_id"))
+            )
+
+            watcher._retry_pending_deliveries()
+
+            # ALERT_SYSTEM has no subscribers by design; resolving its retries
+            # against the subscriber list would silently discard them.
+            self.assertEqual(sorted(resent), sorted([operator, "구독자1"]))
+            self.assertEqual(watcher.state.pending_deliveries(), ())
 
     def test_a_long_subscriber_list_is_trimmed_not_dropped(self):
         for label in ("", "용아맥 오디세이 취소표 대기방입니다 여기서 기다려요"):
