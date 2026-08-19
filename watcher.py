@@ -134,10 +134,13 @@ ADMIN_STATS_COMMAND = "/statss"
 # subscriber at once and cannot be taken back.
 ADMIN_NOTICE_COMMAND = "/notice"
 ADMIN_NOTICE_SEND_COMMAND = "/notice_send"
+# Answering one chat, as opposed to the whole list.
+ADMIN_REPLY_COMMAND = "/reply"
 ADMIN_COMMANDS = {
     ADMIN_STATS_COMMAND,
     ADMIN_NOTICE_COMMAND,
     ADMIN_NOTICE_SEND_COMMAND,
+    ADMIN_REPLY_COMMAND,
 }
 # A draft goes stale rather than waiting around to be sent by accident.
 NOTICE_DRAFT_TTL_MINUTES = 10
@@ -145,6 +148,16 @@ NOTICE_DRAFT_TTL_MINUTES = 10
 # chat is capped per hour and a long message is trimmed.
 FORWARD_MAX_PER_HOUR = 5
 FORWARD_MAX_CHARS = 500
+# Recent senders, so a reply can name who it reached even before they
+# subscribe.  In memory: a restart just loses the convenience.
+FORWARD_RECENT_SENDERS = 200
+REPLY_HEADER = "💬 운영자 답장"
+REPLY_GUIDE = (
+    "구독자 한 명에게 답장합니다.\n"
+    "사용법: /reply <chat_id> 보낼 내용\n\n"
+    "chat_id 는 '💬 구독자 메시지' 알림 첫 줄에 있습니다.\n"
+    "예: /reply 7061234567 /count_2 로 바꾸시면 알림이 줄어요."
+)
 # Marks the message as something a person wrote, not one of the alerts.
 NOTICE_HEADER = "📢 공지"
 NOTICE_GUIDE = (
@@ -2503,6 +2516,7 @@ class Watcher:
         # restart drops it rather than sending something the operator forgot.
         self._notice_draft: tuple[str, dt.datetime] | None = None
         self._forwarded_at: dict[str, list[dt.datetime]] = {}
+        self._recent_senders: dict[str, str] = {}
         self.state.load()
         if not self.state.subscribers_initialized:
             self.state.initialize_subscribers(config.telegram_chat_id)
@@ -2994,6 +3008,9 @@ class Watcher:
             who.append(label)
         if not self.state.is_subscribed(chat_id):
             who.append("구독 안 함")
+        if len(self._recent_senders) >= FORWARD_RECENT_SENDERS:
+            self._recent_senders.pop(next(iter(self._recent_senders)), None)
+        self._recent_senders[chat_id] = label
         self._broadcast_message(
             "💬 구독자 메시지\n"
             + " · ".join(who)
@@ -3012,6 +3029,49 @@ class Watcher:
             )
         except TelegramError as exc:
             self.logger.warning("메시지 수신 확인 답장 실패: %s", exc)
+
+    def _handle_reply_command(self, body: str) -> str:
+        """Answer one chat by id, the way the relayed message reports it."""
+
+        target, _, message = body.partition(" ")
+        target = target.strip()
+        message = message.strip()
+        if not target or not message:
+            return REPLY_GUIDE
+        # Telegram chat ids are integers, negative for groups.  Catching a
+        # mistyped id here beats sending someone else's answer to a stranger.
+        if not re.fullmatch(r"-?\d+", target):
+            return (
+                f"'{target[:40]}' 은 chat_id 형식이 아닙니다."
+                f"\n\n{REPLY_GUIDE}"
+            )
+        if target in self._operator_recipients():
+            return "자기 자신에게는 보내지 않습니다."
+
+        try:
+            self.telegram.send_message(
+                f"{REPLY_HEADER}\n\n{message}", chat_id=target
+            )
+        except TelegramError as exc:
+            if exc.recipient_gone:
+                self._drop_unreachable_subscriber(target, exc)
+                return f"보낼 수 없는 상대입니다. 구독 목록에서 정리했습니다.\n{exc}"
+            self.logger.warning("답장 실패: chat_id=%s (%s)", target, exc)
+            return f"전송에 실패했습니다. 다시 시도해 주세요.\n{exc}"
+
+        # Name the recipient back, so a wrong id shows up immediately.
+        who = self._recent_senders.get(target, "")
+        if not who:
+            record = self.state.subscriber_details()
+            who = next(
+                (r["label"] for r in record if r["chat_id"] == target), ""
+            )
+        known = self.state.is_subscribed(target) or target in self._recent_senders
+        description = " · ".join(
+            part for part in (target, who, "" if known else "⚠️ 모르는 대상") if part
+        )
+        self.logger.info("답장 전송: chat_id=%s", target)
+        return f"✅ 답장을 보냈습니다.\n{description}"
 
     def _handle_notice_command(
         self, command: str, body: str
@@ -3345,6 +3405,8 @@ class Watcher:
                 # these are not advertised to subscribers at all.
                 if command == ADMIN_STATS_COMMAND:
                     reply = self._subscriber_stats_message()
+                elif command == ADMIN_REPLY_COMMAND:
+                    reply = self._handle_reply_command(body)
                 else:
                     reply, _changed = self._handle_notice_command(command, body)
             elif command == "/help":

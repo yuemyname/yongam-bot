@@ -3592,6 +3592,71 @@ class WatcherIntegrationTests(unittest.TestCase):
 
             self.assertEqual(sent, [])
 
+    def test_a_reply_reaches_one_chat_and_names_who_it_reached(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher, sent = self._forwarding_watcher(temporary, "reply")
+            self._incoming(
+                watcher, "7061234567", "알림 너무 많아요", 1, first_name="홍길동"
+            )
+            sent.clear()
+
+            reply = watcher._handle_reply_command("7061234567 /count_2 써보세요")
+
+            self.assertEqual(
+                sent, [("7061234567", "💬 운영자 답장\n\n/count_2 써보세요")]
+            )
+            # The id came from a relayed message, so a typo is the risk; the
+            # confirmation names the recipient to make one obvious.
+            self.assertIn("7061234567", reply)
+            self.assertIn("홍길동", reply)
+            self.assertNotIn("모르는 대상", reply)
+
+    def test_a_reply_to_an_unknown_id_is_flagged(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher, sent = self._forwarding_watcher(temporary, "reply-unknown")
+
+            reply = watcher._handle_reply_command("9999999999 안녕하세요")
+
+            self.assertEqual(len(sent), 1)
+            self.assertIn("모르는 대상", reply)
+
+    def test_a_reply_needs_a_chat_id_and_a_message(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher, sent = self._forwarding_watcher(temporary, "reply-usage")
+
+            for body in ("", "7061234567", "홍길동 안녕하세요"):
+                with self.subTest(body=body or "빈 입력"):
+                    reply = watcher._handle_reply_command(body)
+                    self.assertEqual(sent, [])
+                    self.assertIn("/reply <chat_id> 보낼 내용", reply)
+
+    def test_a_reply_to_a_blocked_chat_clears_the_subscription(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher, _sent = self._forwarding_watcher(temporary, "reply-blocked")
+
+            def blocked(_text, chat_id=None, **_kwargs):
+                raise TelegramError(
+                    "Telegram 전송 오류: HTTP 403",
+                    status_code=403,
+                    description="bot was blocked by the user",
+                )
+
+            watcher.telegram.send_message = blocked
+            reply = watcher._handle_reply_command("7061234567 안녕하세요")
+
+            self.assertIn("구독 목록에서 정리했습니다", reply)
+            self.assertFalse(watcher.state.is_subscribed("7061234567"))
+
+    def test_the_reply_command_answers_the_operator_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher, sent = self._forwarding_watcher(temporary, "reply-admin")
+
+            self._incoming(watcher, "999111", "/reply 7061234567 남의 답장", 1)
+
+            # It reaches the unknown-command reply, and relays nothing.
+            self.assertEqual([chat for chat, _text in sent], ["999111"])
+            self.assertIn("사용 가능한 명령어", sent[-1][1])
+
     def _notice_watcher(self, temporary, name):
         config = dataclasses.replace(
             make_config(Path(temporary)), subscriptions_enabled=True
