@@ -3956,17 +3956,20 @@ class Watcher:
 
             if current.uses_unclassified_fallback:
                 tally.unclassified_fallback_alerts += 1
-                self.logger.info(
-                    "A열 여부 미확인 알림 허용: %s 잔여 7석 이상입니다.",
-                    _session_line(session),
-                )
+            # Row A could not be ruled out, so say so on the line that reports
+            # the send rather than on one of its own: a line that is not a
+            # delivery should not read like one.
+            unclassified = (
+                " ⚠️A열 여부 미확인" if current.uses_unclassified_fallback else ""
+            )
 
             tally.seat_changes += 1
             if self.dry_run:
                 self.logger.info(
-                    "드라이런 예매 가능 좌석: %s (%d석)",
+                    "드라이런 예매 가능 좌석: %s (%d석)%s",
                     _session_line(session),
                     current.total,
+                    unclassified,
                 )
                 continue
             all_category = (
@@ -4020,9 +4023,10 @@ class Watcher:
                 verdicts[key] = f"발송·예매 가능 {current.total}석"
                 tally.dirty = True
                 self.logger.info(
-                    "전송: 예매 가능 좌석 %s (%d석), 성공 %d명, 실패 %d명",
+                    "전송: 예매 가능 좌석 %s (%d석)%s, 성공 %d명, 실패 %d명",
                     _session_line(session),
                     current.total,
+                    unclassified,
                     delivered,
                     failed,
                 )

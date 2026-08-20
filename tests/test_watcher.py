@@ -2994,7 +2994,9 @@ class WatcherIntegrationTests(unittest.TestCase):
             # so a crash mid-cycle cannot resend what already went out.
             self.assertEqual(seen_on_disk, [0, 1, 2])
 
-    def _run_cycle_capturing(self, level, *, times, now=None):
+    def _run_cycle_capturing(
+        self, level, *, times, now=None, snapshot=None, cycles=1
+    ):
         """Run one cycle at the given log level and return the emitted records."""
 
         records = []
@@ -3029,7 +3031,9 @@ class WatcherIntegrationTests(unittest.TestCase):
                 ]
             }
             watcher.cgv.fetch_seat_snapshot = lambda session: (
-                SeatSnapshot(total=session.remaining_seats)
+                snapshot
+                if snapshot is not None
+                else SeatSnapshot(total=session.remaining_seats)
                 if session.remaining_seats <= 6
                 else SeatSnapshot(
                     total=session.remaining_seats,
@@ -3038,7 +3042,12 @@ class WatcherIntegrationTests(unittest.TestCase):
                     available_rows=("B",),
                 )
             )
-            watcher.run_cycle()
+            for index in range(cycles):
+                # The first cycle only announces the opening; a seat alert
+                # needs the showing to be known already.
+                if index:
+                    records.clear()
+                watcher.run_cycle()
         return records
 
     def test_verbose_runs_summarise_every_showing_in_one_line(self):
@@ -3519,6 +3528,35 @@ class WatcherIntegrationTests(unittest.TestCase):
             }
         ]
         watcher.sync_subscribers()
+
+    def test_only_a_real_delivery_logs_a_전송_line(self):
+        """An unclassified seat map used to get an INFO line of its own.
+
+        It read like a decision to send while sitting one line above the
+        actual send, so a log reader saw two lines for one message and
+        neither of them said plainly that anything went out.
+        """
+
+        now = _kst(dt.date(2026, 8, 13))
+        with patch.object(Config, "local_now", return_value=now):
+            records = self._run_cycle_capturing(
+                logging.INFO,
+                times=[("2200", 8)],
+                snapshot=SeatSnapshot(
+                    total=8, usable=2, mapped_total=3, available_rows=("A", "B")
+                ),
+                cycles=2,
+            )
+
+        delivered = [
+            message for level, message in records if message.startswith("전송:")
+        ]
+        self.assertEqual(len(delivered), 1)
+        self.assertIn("⚠️A열 여부 미확인", delivered[0])
+        self.assertIn("성공", delivered[0])
+        self.assertEqual(
+            [m for _l, m in records if m.startswith("A열 여부 미확인")], []
+        )
 
     def test_a_plain_message_reaches_the_operator_and_is_acknowledged(self):
         with tempfile.TemporaryDirectory() as temporary:
