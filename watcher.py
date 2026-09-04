@@ -39,7 +39,7 @@ DEFAULT_BOOKING_URL = "https://cgv.co.kr/cnm/movieBook/movie"
 DEFAULT_SEAT_PAGE_URL = "https://cgv.co.kr/cnm/selectVisitorCnt"
 DEFAULT_SITE_NAME = "용산아이파크몰"
 UNCLASSIFIED_ALERT_MIN_SEATS = 7
-STATE_VERSION = 13
+STATE_VERSION = 14
 TELEGRAM_BROADCAST_WORKERS = 4
 # Ceiling for the command-poll backoff while Telegram is unreachable.
 TELEGRAM_POLL_BACKOFF_MAX_SECONDS = 60
@@ -125,6 +125,36 @@ MODE_GUIDE = (
     "/mode_all - 신규 오픈 + 잔여 좌석 (기본)\n"
     "/mode_open - 신규 오픈만\n"
     "/mode_seats - 잔여 좌석만"
+)
+
+# Which show dates a subscriber wants. This is based on the movie's show date,
+# not the day when the bot happens to discover the opening.
+SHOW_DAY_ALL = "all"
+SHOW_DAY_WEEKEND = "weekend"
+DEFAULT_SHOW_DAY = SHOW_DAY_ALL
+SHOW_DAY_SELECTIONS = (SHOW_DAY_ALL, SHOW_DAY_WEEKEND)
+SHOW_DAY_LABELS = {
+    SHOW_DAY_ALL: "모든 요일 상영분",
+    SHOW_DAY_WEEKEND: "주말(토·일) 상영분만",
+}
+SHOW_DAY_COMMAND_TARGETS = {
+    "/day_all": SHOW_DAY_ALL,
+    "/day_weekend": SHOW_DAY_WEEKEND,
+}
+SHOW_DAY_COMMANDS = {"/day", *SHOW_DAY_COMMAND_TARGETS}
+SHOW_DAY_ALIASES = {
+    "all": SHOW_DAY_ALL,
+    "전체": SHOW_DAY_ALL,
+    "모두": SHOW_DAY_ALL,
+    "weekend": SHOW_DAY_WEEKEND,
+    "주말": SHOW_DAY_WEEKEND,
+    "토일": SHOW_DAY_WEEKEND,
+}
+SHOW_DAY_GUIDE = (
+    "알림을 받을 상영일을 고를 수 있습니다.\n"
+    "/day_all - 모든 요일 상영분 받기 (기본)\n"
+    "/day_weekend - 토·일 상영분만 받기\n\n"
+    "알림이 도착한 요일이 아니라 영화 상영일 기준입니다."
 )
 
 # Operator-only. Deliberately left out of /help and the BotFather command list,
@@ -1562,6 +1592,7 @@ class StateStore:
                         "chat_type": str(stored.get("chat_type") or ""),
                         "subscribed_at": str(stored.get("subscribed_at") or ""),
                         "alert_mode": self.alert_mode(chat_id),
+                        "show_day": self.show_day_selection(chat_id),
                         "seat_selection": self.seat_selection(chat_id),
                         "min_seats": self.min_seats(chat_id),
                     }
@@ -1595,6 +1626,47 @@ class StateStore:
             updated["alert_mode"] = mode
             self.data["subscribers"][str(chat_id)] = updated
             return True
+
+    def show_day_selection(self, chat_id: str) -> str:
+        """Return which show dates this subscriber wants to hear about."""
+
+        with self._lock:
+            record = self.data["subscribers"].get(str(chat_id))
+            if not isinstance(record, Mapping):
+                return DEFAULT_SHOW_DAY
+            selection = record.get("show_day")
+            if isinstance(selection, str) and selection in SHOW_DAY_SELECTIONS:
+                return selection
+            return DEFAULT_SHOW_DAY
+
+    def set_show_day_selection(self, chat_id: str, selection: str) -> bool:
+        """Store a show-day preference; returns False when unchanged."""
+
+        if selection not in SHOW_DAY_SELECTIONS:
+            raise ValueError(f"알 수 없는 상영일 선택: {selection}")
+        with self._lock:
+            record = self.data["subscribers"].get(str(chat_id))
+            if not isinstance(record, Mapping):
+                return False
+            if record.get("show_day", DEFAULT_SHOW_DAY) == selection:
+                return False
+            updated = dict(record)
+            updated["show_day"] = selection
+            self.data["subscribers"][str(chat_id)] = updated
+            return True
+
+    def wants_show_date(self, chat_id: str, show_date: str | None) -> bool:
+        """Whether ``show_date`` passes this subscriber's weekday filter."""
+
+        if show_date is None or self.show_day_selection(chat_id) == SHOW_DAY_ALL:
+            return True
+        try:
+            parsed = dt.date.fromisoformat(show_date)
+        except ValueError:
+            # Session dates are validated before this point. If an old queued
+            # record lacks a readable date, favor not missing an opening.
+            return True
+        return parsed.weekday() >= 5
 
     def seat_selection(self, chat_id: str) -> str:
         """Return the subscriber's preferred-seat preset."""
@@ -1730,10 +1802,17 @@ class StateStore:
             bucket[key] = {"total": remaining, "skips": skips - 1}
             return True
 
-    def queue_pending_delivery(self, chat_id: str, text: str, category: str) -> bool:
+    def queue_pending_delivery(
+        self,
+        chat_id: str,
+        text: str,
+        category: str,
+        *,
+        show_date: str | None = None,
+    ) -> bool:
         """Remember a failed Telegram delivery without duplicating the queue."""
 
-        key_source = f"{chat_id}\0{category}\0{text}"
+        key_source = f"{chat_id}\0{category}\0{show_date or ''}\0{text}"
         key = hashlib.sha256(key_source.encode("utf-8")).hexdigest()
         with self._lock:
             bucket = self.data.setdefault("pending_deliveries", {})
@@ -1743,6 +1822,7 @@ class StateStore:
                 "chat_id": str(chat_id),
                 "text": text,
                 "category": category,
+                "show_date": show_date or "",
                 "queued_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                 "attempts": 0,
             }
@@ -1858,14 +1938,18 @@ class StateStore:
                     isinstance(value, str) and value
                     for value in (chat_id, text, category)
                 ):
+                    copied = {
+                        "chat_id": chat_id,
+                        "text": text,
+                        "category": category,
+                    }
+                    show_date = raw.get("show_date")
+                    if isinstance(show_date, str) and show_date:
+                        copied["show_date"] = show_date
                     records.append(
                         (
                             str(key),
-                            {
-                                "chat_id": chat_id,
-                                "text": text,
-                                "category": category,
-                            },
+                            copied,
                         )
                     )
             return tuple(records)
@@ -1881,10 +1965,12 @@ class StateStore:
         with self._lock:
             modes = {mode: 0 for mode in ALERT_MODES}
             chat_types: dict[str, int] = {}
+            show_days = {selection: 0 for selection in SHOW_DAY_SELECTIONS}
             seat_selections = {selection: 0 for selection in SEAT_SELECTIONS}
             min_seats_counts = {minimum: 0 for minimum in MIN_SEATS_CHOICES}
             for chat_id, record in self.data["subscribers"].items():
                 modes[self.alert_mode(chat_id)] += 1
+                show_days[self.show_day_selection(chat_id)] += 1
                 seat_selections[self.seat_selection(chat_id)] += 1
                 min_seats_counts[self.min_seats(chat_id)] += 1
                 kind = ""
@@ -1894,13 +1980,18 @@ class StateStore:
             return {
                 "total": len(self.data["subscribers"]),
                 "modes": modes,
+                "show_days": show_days,
                 "seat_selections": seat_selections,
                 "min_seats": min_seats_counts,
                 "chat_types": chat_types,
             }
 
     def subscriber_ids_for(
-        self, category: str, *, seats_available: int | None = None
+        self,
+        category: str,
+        *,
+        seats_available: int | None = None,
+        show_date: str | None = None,
     ) -> tuple[str, ...]:
         """Subscribers who opted in to this alert category.
 
@@ -1908,6 +1999,9 @@ class StateStore:
         counted inside whatever scope the category names.  Passing it applies
         each subscriber's minimum; leaving it None means the alert is not
         about seat availability, so nobody is filtered out.
+
+        ``show_date`` is the ISO date printed in a movie alert.  Omitting it
+        keeps non-show messages such as announcements outside the day filter.
         """
 
         def wants_this_many(chat_id: str) -> bool:
@@ -1919,6 +2013,9 @@ class StateStore:
                 return True
             return minimum <= seats_available
 
+        def wants_this_date(chat_id: str) -> bool:
+            return self.wants_show_date(chat_id, show_date)
+
         if category == ALERT_NOTICE:
             return self.subscriber_ids()
         if category == ALERT_SYSTEM:
@@ -1929,7 +2026,9 @@ class StateStore:
             # unclassified alert only ever concerns whole-auditorium
             # subscribers.
             return self.subscriber_ids_for(
-                ALERT_SEATS, seats_available=seats_available
+                ALERT_SEATS,
+                seats_available=seats_available,
+                show_date=show_date,
             )
         if category in {ALERT_SEATS, ALERT_SEATS_SWEET}:
             selection = (
@@ -1942,6 +2041,7 @@ class StateStore:
                     str(chat_id)
                     for chat_id in self.data["subscribers"]
                     if ALERT_SEATS in ALERT_MODES[self.alert_mode(chat_id)]
+                    and wants_this_date(chat_id)
                     and self.seat_selection(chat_id) == selection
                     and wants_this_many(chat_id)
                 )
@@ -1950,6 +2050,7 @@ class StateStore:
                 str(chat_id)
                 for chat_id in self.data["subscribers"]
                 if category in ALERT_MODES[self.alert_mode(chat_id)]
+                and wants_this_date(chat_id)
             )
 
     def add_subscriber(
@@ -1964,6 +2065,7 @@ class StateStore:
                 "label": label[:100],
                 "chat_type": chat_type[:30],
                 "alert_mode": DEFAULT_ALERT_MODE,
+                "show_day": DEFAULT_SHOW_DAY,
                 "seat_selection": DEFAULT_SEAT_SELECTION,
                 "min_seats": MIN_SEATS_DEFAULT,
             }
@@ -2735,6 +2837,7 @@ class Watcher:
         *,
         category: str = ALERT_SYSTEM,
         seats_available: int | None = None,
+        show_date: str | None = None,
         recipients: Sequence[str] | None = None,
     ) -> tuple[int, int, int]:
         """Send to subscribers opted in to ``category``.
@@ -2751,7 +2854,9 @@ class Watcher:
             tuple(recipients)
             if recipients is not None
             else self.state.subscriber_ids_for(
-                category, seats_available=seats_available
+                category,
+                seats_available=seats_available,
+                show_date=show_date,
             )
         )
         delivered = 0
@@ -2780,7 +2885,9 @@ class Watcher:
                     # send /stop to remove themselves, so drop them here.
                     self._drop_unreachable_subscriber(chat_id, error)
                 else:
-                    self.state.queue_pending_delivery(chat_id, text, category)
+                    self.state.queue_pending_delivery(
+                        chat_id, text, category, show_date=show_date
+                    )
                     self.logger.error(
                         "전송 실패(다음 주기 재시도): %s", error
                     )
@@ -2832,7 +2939,9 @@ class Watcher:
             eligible = set(
                 self._operator_recipients()
                 if category == ALERT_SYSTEM
-                else self.state.subscriber_ids_for(category)
+                else self.state.subscriber_ids_for(
+                    category, show_date=record.get("show_date")
+                )
             )
             if chat_id not in eligible:
                 changed = self.state.remove_pending_delivery(key) or changed
@@ -2919,6 +3028,14 @@ class Watcher:
             lines.append(f"• {ALERT_MODE_LABELS[mode]} — {stats['modes'][mode]}명")
 
         lines.append("")
+        lines.append("상영일")
+        for selection in SHOW_DAY_SELECTIONS:
+            lines.append(
+                f"• {SHOW_DAY_LABELS[selection]} — "
+                f"{stats['show_days'][selection]}명"
+            )
+
+        lines.append("")
         lines.append("잔여 좌석 대상")
         for selection in (SEAT_SELECTION_ALL, SEAT_SELECTION_SWEET):
             lines.append(
@@ -2957,6 +3074,7 @@ class Watcher:
                     + " · ".join(
                         (
                             ALERT_MODE_LABELS[record["alert_mode"]],
+                            SHOW_DAY_LABELS[record["show_day"]],
                             SEAT_SELECTION_LABELS[record["seat_selection"]],
                             MIN_SEATS_LABELS[record["min_seats"]],
                         )
@@ -3214,6 +3332,36 @@ class Watcher:
             return (f"🎯 이미 이렇게 설정되어 있습니다.\n→ {label}{note}", False)
         return (f"✅ 좌석 선택을 변경했습니다.\n→ {label}{note}", True)
 
+    def _handle_show_day_command(
+        self, chat_id: str, command: str, argument: str
+    ) -> tuple[str, bool]:
+        """Return the show-day reply and whether its preference changed."""
+
+        requested = SHOW_DAY_COMMAND_TARGETS.get(command)
+        if requested is None and argument:
+            requested = SHOW_DAY_ALIASES.get(argument)
+            if requested is None:
+                return (f"알 수 없는 상영일 선택입니다.\n\n{SHOW_DAY_GUIDE}", False)
+        if not self.state.is_subscribed(chat_id):
+            return (
+                "🔕 현재 구독 중이 아닙니다. /start로 구독한 뒤 설정할 수 있습니다."
+                f"\n\n{SHOW_DAY_GUIDE}",
+                False,
+            )
+
+        if requested is None:
+            current = SHOW_DAY_LABELS[self.state.show_day_selection(chat_id)]
+            return (
+                f"📅 현재 알림 상영일\n→ {current}\n\n{SHOW_DAY_GUIDE}",
+                False,
+            )
+
+        changed = self.state.set_show_day_selection(chat_id, requested)
+        label = SHOW_DAY_LABELS[requested]
+        if not changed:
+            return (f"📅 이미 이렇게 설정되어 있습니다.\n→ {label}", False)
+        return (f"✅ 알림 상영일을 변경했습니다.\n→ {label}", True)
+
     def _handle_min_seats_command(
         self, chat_id: str, command: str, argument: str
     ) -> tuple[str, bool]:
@@ -3337,10 +3485,12 @@ class Watcher:
                 reply += (
                     "\n\n🔔 기본 설정"
                     "\n• 신규 예매 오픈 + 예매 가능 좌석 알림"
+                    "\n• 모든 요일 상영분"
                     "\n• 잔여 좌석은 모든 A열 제외 좌석"
                     "\n• 1석부터 모두 알림"
                     "\n\n필요할 때만 설정을 바꾸세요."
                     "\n• 알림 종류 선택: /mode"
+                    "\n• 주말 상영분만 받기: /day_weekend"
                     "\n• 잔여 좌석 대상 선택: /seat"
                     "\n• 명당 좌석만 받기: /seat_sweet"
                     "\n• 2석 이상 남았을 때만 받기: /count_2"
@@ -3362,7 +3512,9 @@ class Watcher:
                     mode_label = ALERT_MODE_LABELS[mode]
                     reply = (
                         "✅ 현재 CGV 용산 IMAX 알림을 구독 중입니다.\n"
-                        f"알림 종류: {mode_label}"
+                        f"알림 종류: {mode_label}\n"
+                        "알림 상영일: "
+                        f"{SHOW_DAY_LABELS[self.state.show_day_selection(chat_id)]}"
                     )
                     if ALERT_SEATS in ALERT_MODES[mode]:
                         selection_label = SEAT_SELECTION_LABELS[
@@ -3375,6 +3527,7 @@ class Watcher:
                         )
                     reply += (
                         "\n\n알림 종류 변경: /mode"
+                        "\n알림 상영일 변경: /day"
                         "\n잔여 좌석 대상 변경: /seat"
                         "\n예매 가능 최소 좌석 변경: /count"
                     )
@@ -3388,6 +3541,11 @@ class Watcher:
                     chat_id, command, argument
                 )
                 state_changed = state_changed or mode_changed
+            elif command in SHOW_DAY_COMMANDS:
+                reply, show_day_changed = self._handle_show_day_command(
+                    chat_id, command, argument
+                )
+                state_changed = state_changed or show_day_changed
             elif command in SEAT_SELECTION_COMMANDS:
                 reply, seat_selection_changed = self._handle_seat_selection_command(
                     chat_id, command, argument
@@ -3419,6 +3577,9 @@ class Watcher:
                     "/mode_all - 신규 오픈과 잔여 좌석 모두 받기\n"
                     "/mode_open - 신규 예매 오픈만 받기\n"
                     "/mode_seats - 예매 가능 좌석만 받기\n"
+                    "/day - 알림 상영일 선택\n"
+                    "/day_all - 모든 요일 상영분 받기\n"
+                    "/day_weekend - 토·일 상영분만 받기\n"
                     "/seat - 잔여 좌석 대상 선택\n"
                     "/seat_all - 모든 A열 제외 좌석 받기 (기본)\n"
                     "/seat_sweet - 명당 좌석만 받기\n"
@@ -3428,7 +3589,7 @@ class Watcher:
                     "/desc - 봇 설명과 사용 방법\n"
                     "/coffee - 개발자에게 커피 후원\n"
                     "/help - 전체 명령어 보기\n\n"
-                    "/mode · /seat · /count 는 선택 사항입니다.\n"
+                    "/mode · /day · /seat · /count 는 선택 사항입니다.\n"
                     "그대로 두시면 모든 알림을 받습니다."
                 )
             elif command in {"/desc", "/description"}:
@@ -3455,6 +3616,13 @@ class Watcher:
                     "• /mode_all — 신규 오픈과 예매 가능 좌석 모두 받기 (기본)\n"
                     "• /mode_open — 신규 예매 오픈만\n"
                     "• /mode_seats — 예매 가능 좌석만\n\n"
+                    "📅 알림 상영일 선택 (선택 사항)\n"
+                    "기본값은 모든 요일 상영분 받기입니다.\n"
+                    "• /day_all — 모든 요일 상영분 받기 (기본)\n"
+                    "• /day_weekend — 토·일 상영분만 받기\n"
+                    "• /day — 현재 설정 확인\n"
+                    "※ 알림 도착 요일이 아니라 영화 상영일 기준이며, "
+                    "오픈·좌석 알림에 모두 적용\n\n"
                     "💺 잔여 좌석 대상 (선택 사항)\n"
                     "기본값은 모든 A열 제외 좌석입니다.\n"
                     "• /seat_all — 모든 A열 제외 좌석 알림 (기본)\n"
@@ -3471,9 +3639,10 @@ class Watcher:
                     "• /count — 현재 설정 확인\n\n"
                     "📌 사용 방법\n"
                     "1. /start — 알림 구독\n"
-                    "2. 명당만 원하면 /seat_sweet (선택 사항)\n"
-                    "3. 영화·극장·날짜가 선택된 예매 바로가기 링크 열기\n"
-                    "4. CGV 화면에서 IMAX 버튼 선택 후 예매\n\n"
+                    "2. 주말 상영분만 원하면 /day_weekend (선택 사항)\n"
+                    "3. 명당만 원하면 /seat_sweet (선택 사항)\n"
+                    "4. 영화·극장·날짜가 선택된 예매 바로가기 링크 열기\n"
+                    "5. CGV 화면에서 IMAX 버튼 선택 후 예매\n\n"
                     "📋 기타 명령어\n"
                     "• /stop — 알림 해지\n"
                     "• /status — 현재 구독 및 설정 확인\n"
@@ -3865,7 +4034,9 @@ class Watcher:
                     seat_snapshots=snapshots,
                 ):
                     delivered, failed, total = self._broadcast_message(
-                        text, category=ALERT_OPEN
+                        text,
+                        category=ALERT_OPEN,
+                        show_date=chunk_sessions[0].date,
                     )
                     for session in chunk_sessions:
                         self.state.mark_notified(session_keys[session], session)
@@ -3982,12 +4153,15 @@ class Watcher:
             # sweet subscriber's two-seat minimum.
             open_all = _available_seat_count(current)
             if self.state.subscriber_ids_for(
-                all_category, seats_available=open_all
+                all_category,
+                seats_available=open_all,
+                show_date=session.date,
             ):
                 delivered, failed, total = self._broadcast_message(
                     seat_change_message(session, previous, current, self.config),
                     category=all_category,
                     seats_available=open_all,
+                    show_date=session.date,
                 )
             else:
                 delivered = failed = total = 0
@@ -3999,7 +4173,9 @@ class Watcher:
                 not current.uses_unclassified_fallback
                 and sweet_delivery is not None
                 and self.state.subscriber_ids_for(
-                    ALERT_SEATS_SWEET, seats_available=open_sweet
+                    ALERT_SEATS_SWEET,
+                    seats_available=open_sweet,
+                    show_date=session.date,
                 )
             ):
                 sweet_delivered, sweet_failed, sweet_total = self._broadcast_message(
@@ -4013,6 +4189,7 @@ class Watcher:
                     ),
                     category=ALERT_SEATS_SWEET,
                     seats_available=open_sweet,
+                    show_date=session.date,
                 )
                 delivered += sweet_delivered
                 failed += sweet_failed

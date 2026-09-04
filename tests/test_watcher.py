@@ -35,6 +35,8 @@ from watcher import (
     MIN_SEATS_DEFAULT,
     SEAT_SELECTION_ALL,
     SEAT_SELECTION_SWEET,
+    SHOW_DAY_ALL,
+    SHOW_DAY_WEEKEND,
     STATE_VERSION,
     BookingSession,
     CgvClient,
@@ -690,6 +692,58 @@ class AlertModeStateTests(unittest.TestCase):
             reloaded.load()
             self.assertEqual(
                 reloaded.seat_selection("sweet"), SEAT_SELECTION_SWEET
+            )
+
+    def test_weekend_selection_filters_both_alerts_by_show_date(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "notified.json"
+            store = StateStore(path)
+            store.add_subscriber("all")
+            store.add_subscriber("weekend")
+
+            self.assertEqual(store.show_day_selection("weekend"), SHOW_DAY_ALL)
+            self.assertTrue(
+                store.set_show_day_selection("weekend", SHOW_DAY_WEEKEND)
+            )
+            self.assertFalse(
+                store.set_show_day_selection("weekend", SHOW_DAY_WEEKEND)
+            )
+
+            # 2026-08-26 is Wednesday; 2026-08-29 is Saturday.
+            for category in (ALERT_OPEN, ALERT_SEATS):
+                self.assertEqual(
+                    store.subscriber_ids_for(
+                        category, show_date="2026-08-26"
+                    ),
+                    ("all",),
+                )
+            self.assertEqual(
+                store.subscriber_ids_for(ALERT_OPEN, show_date="2026-08-29"),
+                ("all", "weekend"),
+            )
+            # Announcements are not tied to a show date.
+            self.assertEqual(
+                store.subscriber_ids_for(ALERT_NOTICE), ("all", "weekend")
+            )
+
+            store.save()
+            reloaded = StateStore(path)
+            reloaded.load()
+            self.assertEqual(
+                reloaded.show_day_selection("weekend"), SHOW_DAY_WEEKEND
+            )
+
+    def test_subscriber_stored_before_show_day_feature_defaults_to_all_days(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = StateStore(Path(temporary) / "notified.json")
+            store.data["subscribers"]["999"] = {
+                "subscribed_at": "2026-01-01T00:00:00"
+            }
+
+            self.assertEqual(store.show_day_selection("999"), SHOW_DAY_ALL)
+            self.assertEqual(
+                store.subscriber_ids_for(ALERT_OPEN, show_date="2026-08-26"),
+                ("999",),
             )
 
 
@@ -1898,12 +1952,12 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertTrue(reloaded.is_subscribed(config.telegram_chat_id))
 
     @staticmethod
-    def _schedule_payload(remaining: int) -> dict:
+    def _schedule_payload(remaining: int, show_date: str = "20260826") -> dict:
         return {
             "data": [
                 {
                     "scnsNm": "IMAX관",
-                    "scnYmd": "20260826",
+                    "scnYmd": show_date,
                     "scnsrtTm": "1430",
                     "scnsNo": "13",
                     "scnSseq": "4",
@@ -1957,6 +2011,59 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(second.seat_changes, 1)
             self.assertEqual({chat_id for chat_id, _ in sent}, {"2", "3"})
             self.assertIn("예매 가능 좌석", sent[0][1])
+
+    def test_weekend_setting_reaches_open_and_seat_alert_call_sites(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            logger = logging.getLogger(f"watcher-weekend-routing-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            watcher.state.remove_subscriber(config.telegram_chat_id)
+            watcher.state.add_subscriber("all")
+            watcher.state.add_subscriber("weekend")
+            watcher.state.set_show_day_selection("weekend", SHOW_DAY_WEEKEND)
+
+            current = {"date": "20260826", "count": 10}
+            watcher.cgv.fetch_date = lambda _date: self._schedule_payload(
+                current["count"], current["date"]
+            )
+            watcher.cgv.fetch_seat_snapshot = lambda session: SeatSnapshot(
+                total=session.remaining_seats,
+                usable=session.remaining_seats,
+                mapped_total=session.remaining_seats,
+                available_rows=("B",),
+                available_seats=tuple(
+                    ("B", str(number))
+                    for number in range(1, session.remaining_seats + 1)
+                ),
+            )
+            sent = []
+            watcher.telegram.send_message = lambda text, **kwargs: sent.append(
+                (kwargs.get("chat_id"), text)
+            )
+
+            # Wednesday opening: the weekend-only subscriber is filtered out.
+            watcher.run_cycle()
+            self.assertEqual([chat_id for chat_id, _text in sent], ["all"])
+
+            # Saturday opening: both subscribers receive it even though the
+            # watcher itself is running on another day.
+            sent.clear()
+            current.update(date="20260829", count=10)
+            watcher.run_cycle()
+            self.assertEqual(
+                {chat_id for chat_id, _text in sent}, {"all", "weekend"}
+            )
+            self.assertTrue(all("예매 오픈 감지" in text for _id, text in sent))
+
+            # The same filter is carried into later availability alerts.
+            sent.clear()
+            current["count"] = 9
+            watcher.run_cycle()
+            self.assertEqual(
+                {chat_id for chat_id, _text in sent}, {"all", "weekend"}
+            )
+            self.assertTrue(all("예매 가능 좌석" in text for _id, text in sent))
 
     def test_sweet_selection_filters_changes_but_not_new_openings(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2080,6 +2187,31 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(attempts.count("retry"), 2)
             self.assertEqual(successful, ["ok", "retry"])
             self.assertEqual(restarted.state.pending_deliveries(), ())
+
+    def test_pending_retry_respects_a_later_weekend_setting(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            logger = logging.getLogger(f"watcher-weekend-retry-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            watcher.state.remove_subscriber(config.telegram_chat_id)
+            watcher.state.add_subscriber("retry")
+            watcher.state.queue_pending_delivery(
+                "retry",
+                "평일 회차 알림",
+                ALERT_OPEN,
+                show_date="2026-08-26",
+            )
+            watcher.state.set_show_day_selection("retry", SHOW_DAY_WEEKEND)
+            sent = []
+            watcher.telegram.send_message = lambda text, **kwargs: sent.append(
+                (kwargs.get("chat_id"), text)
+            )
+
+            watcher._retry_pending_deliveries()
+
+            self.assertEqual(sent, [])
+            self.assertEqual(watcher.state.pending_deliveries(), ())
 
     def test_broadcasts_to_multiple_subscribers_concurrently(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3444,6 +3576,71 @@ class WatcherIntegrationTests(unittest.TestCase):
             reloaded.load()
             self.assertEqual(reloaded.alert_mode("111222"), ALERT_MODE_OPEN_ONLY)
 
+    def test_day_commands_change_and_report_show_date_preference(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = dataclasses.replace(
+                make_config(Path(temporary)), subscriptions_enabled=True
+            )
+            logger = logging.getLogger(f"watcher-day-cmd-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            replies = []
+
+            def batch(update_id, text, chat_id=111222):
+                return [
+                    {
+                        "update_id": update_id,
+                        "message": {
+                            "text": text,
+                            "chat": {"id": chat_id, "type": "private"},
+                        },
+                    }
+                ]
+
+            batches = [
+                batch(1, "/day_weekend", chat_id=555),
+                batch(2, "/start"),
+                batch(3, "/day_weekend@YongsanBot"),
+                batch(4, "/status"),
+                batch(5, "/day"),
+                batch(6, "/day_all"),
+            ]
+            watcher.telegram.get_updates = lambda **_kwargs: batches.pop(0)
+            watcher.telegram.send_message = lambda text, **kwargs: replies.append(
+                (kwargs.get("chat_id"), text)
+            )
+
+            watcher.sync_subscribers()
+            self.assertIn("현재 구독 중이 아닙니다", replies[-1][1])
+            self.assertEqual(watcher.state.show_day_selection("555"), SHOW_DAY_ALL)
+
+            watcher.sync_subscribers()
+            self.assertEqual(
+                watcher.state.show_day_selection("111222"), SHOW_DAY_ALL
+            )
+
+            watcher.sync_subscribers()
+            self.assertEqual(
+                watcher.state.show_day_selection("111222"), SHOW_DAY_WEEKEND
+            )
+            self.assertIn("주말(토·일) 상영분만", replies[-1][1])
+
+            watcher.sync_subscribers()
+            self.assertIn("알림 상영일: 주말(토·일) 상영분만", replies[-1][1])
+
+            watcher.sync_subscribers()
+            self.assertIn("현재 알림 상영일", replies[-1][1])
+            self.assertIn("영화 상영일 기준", replies[-1][1])
+
+            watcher.sync_subscribers()
+            self.assertEqual(
+                watcher.state.show_day_selection("111222"), SHOW_DAY_ALL
+            )
+
+            reloaded = StateStore(config.state_file)
+            reloaded.load()
+            self.assertEqual(reloaded.show_day_selection("111222"), SHOW_DAY_ALL)
+
     def test_only_a_join_or_leave_logs_the_subscriber_count(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = dataclasses.replace(
@@ -3893,6 +4090,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertIn("전체 5명", operator_reply)
             self.assertIn("신규 오픈만 — 1명", operator_reply)
             self.assertIn("잔여 좌석만 — 1명", operator_reply)
+            self.assertIn("모든 요일 상영분 — 5명", operator_reply)
             self.assertIn("모든 A열 제외 좌석 — 3명", operator_reply)
             self.assertIn("명당 좌석만 — 2명", operator_reply)
 
@@ -3902,7 +4100,9 @@ class WatcherIntegrationTests(unittest.TestCase):
             for index in range(4):
                 self.assertIn(str(2000 + index), operator_reply)
             self.assertIn(
-                "신규 오픈만 · 모든 A열 제외 좌석 · 1석부터 모두", operator_reply
+                "신규 오픈만 · 모든 요일 상영분 · 모든 A열 제외 좌석 · "
+                "1석부터 모두",
+                operator_reply,
             )
 
             # A subscriber gets the generic reply, so the command stays hidden.
@@ -3925,6 +4125,9 @@ class WatcherIntegrationTests(unittest.TestCase):
                 "/mode_all -",
                 "/mode_open -",
                 "/mode_seats -",
+                "/day -",
+                "/day_all -",
+                "/day_weekend -",
                 "/seat -",
                 "/seat_sweet -",
                 "/seat_sweet -",
@@ -3944,6 +4147,7 @@ class WatcherIntegrationTests(unittest.TestCase):
 
             self.assertEqual(breakdown["total"], 2)
             self.assertEqual(breakdown["modes"][ALERT_MODE_ALL], 2)
+            self.assertEqual(breakdown["show_days"][SHOW_DAY_ALL], 2)
             self.assertEqual(breakdown["seat_selections"][SEAT_SELECTION_ALL], 2)
             self.assertEqual(breakdown["seat_selections"][SEAT_SELECTION_ALL], 2)
             self.assertEqual(breakdown["chat_types"]["group"], 1)
@@ -3974,8 +4178,10 @@ class WatcherIntegrationTests(unittest.TestCase):
 
             self.assertIn("🔔 기본 설정", welcome)
             self.assertIn("신규 예매 오픈 + 예매 가능 좌석 알림", welcome)
+            self.assertIn("모든 요일 상영분", welcome)
             self.assertIn("잔여 좌석은 모든 A열 제외 좌석", welcome)
             self.assertIn("알림 종류 선택: /mode", welcome)
+            self.assertIn("주말 상영분만 받기: /day_weekend", welcome)
             self.assertIn("잔여 좌석 대상 선택: /seat", welcome)
             self.assertIn("명당 좌석만 받기: /seat_sweet", welcome)
             self.assertIn("신규 예매 오픈은 좌석 설정과 관계없이 항상", welcome)
@@ -4025,6 +4231,9 @@ class WatcherIntegrationTests(unittest.TestCase):
             )
             self.assertIn("/mode_open — 신규 예매 오픈만", description)
             self.assertIn("/mode_seats — 예매 가능 좌석만", description)
+            self.assertIn("/day_all — 모든 요일 상영분 받기", description)
+            self.assertIn("/day_weekend — 토·일 상영분만 받기", description)
+            self.assertIn("영화 상영일 기준", description)
             self.assertIn("/seat_all — 모든 A열 제외 좌석 알림 (기본)", description)
             self.assertIn("/seat_sweet", description)
             self.assertIn("Extremer: F16~29, G16~29", description)
