@@ -1577,7 +1577,7 @@ class StateStore:
             return str(chat_id) in self.data["subscribers"]
 
     def subscriber_details(self) -> tuple[dict[str, Any], ...]:
-        """Every subscriber with the settings that decide what they receive."""
+        """Subscribers ordered by join time with their delivery settings."""
 
         with self._lock:
             chat_ids = tuple(str(chat_id) for chat_id in self.data["subscribers"])
@@ -1597,7 +1597,20 @@ class StateStore:
                         "min_seats": self.min_seats(chat_id),
                     }
                 )
-            return tuple(records)
+            def joined_at(record: Mapping[str, Any]) -> tuple[int, float, str]:
+                stored = str(record.get("subscribed_at") or "")
+                try:
+                    moment = dt.datetime.fromisoformat(stored)
+                    if moment.tzinfo is None:
+                        moment = moment.replace(tzinfo=dt.timezone.utc)
+                    timestamp = moment.timestamp()
+                except (OSError, OverflowError, ValueError):
+                    # Legacy records without a usable timestamp stay visible,
+                    # but follow every record whose join time can be ordered.
+                    return (1, 0.0, str(record.get("chat_id") or ""))
+                return (0, timestamp, str(record.get("chat_id") or ""))
+
+            return tuple(sorted(records, key=joined_at))
 
     def alert_mode(self, chat_id: str) -> str:
         """Return a subscriber's alert preference, defaulting to everything."""

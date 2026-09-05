@@ -562,6 +562,22 @@ class StateStoreTests(unittest.TestCase):
         self.assertTrue(_seat_snapshot_changed(previous, changed))
         self.assertTrue(_seat_snapshot_changed(previous, moved))
 
+    def test_subscriber_details_are_sorted_by_join_time(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = StateStore(Path(temporary) / "notified.json")
+            # Deliberately insert them in a different order from their dates.
+            store.data["subscribers"] = {
+                "late": {"subscribed_at": "2026-08-20T03:00:00+00:00"},
+                "missing": {},
+                "middle": {"subscribed_at": "2026-08-15T12:00:00+09:00"},
+                "early": {"subscribed_at": "2026-08-01T00:00:00+00:00"},
+            }
+
+            self.assertEqual(
+                tuple(record["chat_id"] for record in store.subscriber_details()),
+                ("early", "middle", "late", "missing"),
+            )
+
 class StatePruningTests(unittest.TestCase):
     @staticmethod
     def _key(date_text: str, start_time: str = "14:30") -> str:
