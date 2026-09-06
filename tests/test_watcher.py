@@ -5057,7 +5057,10 @@ class DocumentedCommandTests(unittest.TestCase):
 
         self.assertIn('name="robots" content="index, follow', page)
         self.assertIn('name="google-site-verification"', page)
+        self.assertIn('name="keywords" content="용아맥 알람, 용아맥 알림', page)
         self.assertIn(f'<link rel="canonical" href="{site_url}">', page)
+        self.assertIn(f'<meta property="og:url" content="{site_url}">', page)
+        self.assertIn("yongam-bot", page)
         self.assertIn('"@type": "WebSite"', page)
         self.assertIn("User-agent: *", robots)
         self.assertIn("Allow: /", robots)
