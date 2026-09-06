@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://yuemyname.github.io/yongam-bot/sitemap.xml

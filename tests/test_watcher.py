@@ -5048,6 +5048,21 @@ class DocumentedCommandTests(unittest.TestCase):
 
         self.assertTrue(listed, "소개 페이지에서 명령어를 찾지 못했습니다")
         self.assertEqual(listed - self._handled_commands(), set())
+
+    def test_search_engines_are_invited_to_index_the_landing_page(self):
+        page = (self.REPO / "docs" / "index.html").read_text(encoding="utf-8")
+        robots = (self.REPO / "docs" / "robots.txt").read_text(encoding="utf-8")
+        sitemap = (self.REPO / "docs" / "sitemap.xml").read_text(encoding="utf-8")
+        site_url = "https://yuemyname.github.io/yongam-bot/"
+
+        self.assertIn('name="robots" content="index, follow', page)
+        self.assertIn(f'<link rel="canonical" href="{site_url}">', page)
+        self.assertIn('"@type": "WebSite"', page)
+        self.assertIn("User-agent: *", robots)
+        self.assertIn("Allow: /", robots)
+        self.assertIn(f"Sitemap: {site_url}sitemap.xml", robots)
+        self.assertIn(f"<loc>{site_url}</loc>", sitemap)
+        self.assertRegex(sitemap, r"<lastmod>\d{4}-\d{2}-\d{2}</lastmod>")
         # The page is what a stranger reads before installing anything, so the
         # two promises the bot must never break belong in the drift check too.
         self.assertIn("자동 예매나 좌석 선점 기능은 <strong>없습니다.</strong>", page)
