@@ -5056,6 +5056,7 @@ class DocumentedCommandTests(unittest.TestCase):
         site_url = "https://yuemyname.github.io/yongam-bot/"
 
         self.assertIn('name="robots" content="index, follow', page)
+        self.assertIn('name="google-site-verification"', page)
         self.assertIn(f'<link rel="canonical" href="{site_url}">', page)
         self.assertIn('"@type": "WebSite"', page)
         self.assertIn("User-agent: *", robots)
