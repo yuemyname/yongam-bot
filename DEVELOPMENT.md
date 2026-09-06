@@ -41,7 +41,8 @@ BotFather의 `/setdescription`에는 저장소에서 제공하는 한글·영문
 1. GitHub 저장소 → **Settings → Pages**
 2. Source를 **Deploy from a branch**, 브랜치를 `main`, 폴더를 **`/docs`**로 지정하고 Save
 3. 몇 분 뒤 `https://yuemyname.github.io/yongam-bot/` 로 열리는지 확인
-4. 저장소 첫 화면 오른쪽 **About** 톱니바퀴 → Website에 같은 주소 입력
+4. 저장소 첫 화면 오른쪽 **About** 톱니바퀴 → Website에 같은 소개 페이지 주소를 입력합니다. Telegram 주소를 넣으면 저장소에서 소개 페이지로 이어지는 검색 신호가 약해지므로 Website에는 GitHub Pages 주소를 사용합니다.
+5. About의 Topics에는 `telegram-bot`, `cgv`, `imax`, `yongsan-imax`, `movie-ticket`, `ticket-alert`, `python`, `railway`를 등록합니다.
 
 **검색 등록**
 
