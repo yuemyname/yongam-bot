@@ -26,6 +26,7 @@ from watcher import (
     ADMIN_NOTICE_COMMAND,
     ADMIN_NOTICE_SEND_COMMAND,
     ADMIN_STATS_COMMAND,
+    ADMIN_STATS_SUMMARY_COMMAND,
     FORWARD_MAX_CHARS,
     FORWARD_MAX_PER_HOUR,
     NOTICE_DRAFT_TTL_MINUTES,
@@ -4121,16 +4122,29 @@ class WatcherIntegrationTests(unittest.TestCase):
                 operator_reply,
             )
 
+            send(int(config.telegram_chat_id), ADMIN_STATS_SUMMARY_COMMAND, 2)
+            summary_reply = replies[-1][1]
+            self.assertIn("전체 5명", summary_reply)
+            self.assertIn("신규 오픈만 — 1명", summary_reply)
+            self.assertIn("명당 좌석만 — 2명", summary_reply)
+            self.assertNotIn("📋 구독자 목록", summary_reply)
+            for index in range(4):
+                self.assertNotIn(str(2000 + index), summary_reply)
+
             # A subscriber gets the generic reply, so the command stays hidden.
-            send(2000, ADMIN_STATS_COMMAND, 2)
+            send(2000, ADMIN_STATS_COMMAND, 3)
+            self.assertIn("사용 가능한 명령어", replies[-1][1])
+            self.assertNotIn("구독 현황", replies[-1][1])
+
+            send(2000, ADMIN_STATS_SUMMARY_COMMAND, 4)
             self.assertIn("사용 가능한 명령어", replies[-1][1])
             self.assertNotIn("구독 현황", replies[-1][1])
 
             # The old spelling is not a command any more.
-            send(int(config.telegram_chat_id), "/stats", 3)
+            send(int(config.telegram_chat_id), "/stats", 5)
             self.assertIn("사용 가능한 명령어", replies[-1][1])
 
-            send(int(config.telegram_chat_id), "/help", 3)
+            send(int(config.telegram_chat_id), "/help", 6)
             help_reply = replies[-1][1]
             self.assertNotIn("stats", help_reply)
             for command in (
@@ -5077,7 +5091,9 @@ class DocumentedCommandTests(unittest.TestCase):
         readme = (self.REPO / "README.md").read_text(encoding="utf-8")
         block = development.split("`/setcommands`")[1].split("```")[1]
 
-        # Tied to the constant so a rename cannot quietly publish the command.
-        self.assertNotIn(ADMIN_STATS_COMMAND.lstrip("/"), block)
-        self.assertNotIn(f"| `{ADMIN_STATS_COMMAND}` |", readme)
-        self.assertNotIn(ADMIN_STATS_COMMAND, self._botfather_commands())
+        # Tied to the constants so a rename cannot quietly publish either
+        # operator-only command to every subscriber.
+        for command in (ADMIN_STATS_COMMAND, ADMIN_STATS_SUMMARY_COMMAND):
+            self.assertNotIn(command.lstrip("/"), block)
+            self.assertNotIn(f"| `{command}` |", readme)
+            self.assertNotIn(command, self._botfather_commands())

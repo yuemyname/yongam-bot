@@ -160,6 +160,8 @@ SHOW_DAY_GUIDE = (
 # Operator-only. Deliberately left out of /help and the BotFather command list,
 # and spelled so a subscriber does not land on it by guessing.
 ADMIN_STATS_COMMAND = "/statss"
+# Same aggregate view without the potentially long per-subscriber list.
+ADMIN_STATS_SUMMARY_COMMAND = "/statsss"
 # Operator-only broadcast.  Two steps on purpose: a typo here reaches every
 # subscriber at once and cannot be taken back.
 ADMIN_NOTICE_COMMAND = "/notice"
@@ -168,6 +170,7 @@ ADMIN_NOTICE_SEND_COMMAND = "/notice_send"
 ADMIN_REPLY_COMMAND = "/reply"
 ADMIN_COMMANDS = {
     ADMIN_STATS_COMMAND,
+    ADMIN_STATS_SUMMARY_COMMAND,
     ADMIN_NOTICE_COMMAND,
     ADMIN_NOTICE_SEND_COMMAND,
     ADMIN_REPLY_COMMAND,
@@ -3006,8 +3009,8 @@ class Watcher:
         if changed:
             self.state.save()
 
-    def _subscriber_stats_message(self) -> str:
-        """Operator-facing snapshot of the subscriber list."""
+    def _subscriber_stats_message(self, *, include_subscribers: bool = True) -> str:
+        """Operator-facing aggregate snapshot, optionally with subscriber rows."""
 
         stats = self.state.subscriber_breakdown()
         total = stats["total"]
@@ -3063,6 +3066,9 @@ class Watcher:
                 f"• {MIN_SEATS_LABELS[minimum]} — "
                 f"{stats['min_seats'][minimum]}명"
             )
+
+        if not include_subscribers:
+            return "\n".join(lines)
 
         records = self.state.subscriber_details()
         if records:
@@ -3576,6 +3582,10 @@ class Watcher:
                 # these are not advertised to subscribers at all.
                 if command == ADMIN_STATS_COMMAND:
                     reply = self._subscriber_stats_message()
+                elif command == ADMIN_STATS_SUMMARY_COMMAND:
+                    reply = self._subscriber_stats_message(
+                        include_subscribers=False
+                    )
                 elif command == ADMIN_REPLY_COMMAND:
                     reply = self._handle_reply_command(body)
                 else:
