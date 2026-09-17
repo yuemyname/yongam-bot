@@ -25,7 +25,7 @@ import ssl
 import sys
 import threading
 import time
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -40,7 +40,10 @@ DEFAULT_SEAT_PAGE_URL = "https://cgv.co.kr/cnm/selectVisitorCnt"
 DEFAULT_SITE_NAME = "용산아이파크몰"
 UNCLASSIFIED_ALERT_MIN_SEATS = 7
 STATE_VERSION = 14
-TELEGRAM_BROADCAST_WORKERS = 4
+DEFAULT_TELEGRAM_BROADCAST_WORKERS = 16
+# Telegram documents a free broadcast ceiling of about 30 messages/second.
+# Leave headroom for command replies and transient timing differences.
+DEFAULT_TELEGRAM_BROADCAST_RATE_PER_SECOND = 25
 # Ceiling for the command-poll backoff while Telegram is unreachable.
 TELEGRAM_POLL_BACKOFF_MAX_SECONDS = 60
 # Printed once per cycle so a long log can be read cycle by cycle.
@@ -434,6 +437,8 @@ class Config:
     target_end: dt.date
     poll_interval_seconds: int
     telegram_command_poll_seconds: int
+    telegram_broadcast_workers: int
+    telegram_broadcast_rate_per_second: int
     cgv_request_spacing_seconds: int
     rate_limit_backoff_initial_seconds: int
     rate_limit_backoff_max_seconds: int
@@ -577,6 +582,24 @@ class Config:
                 name="TELEGRAM_COMMAND_POLL_SECONDS",
                 minimum=1,
                 maximum=60,
+            ),
+            telegram_broadcast_workers=_parse_int(
+                value(
+                    "TELEGRAM_BROADCAST_WORKERS",
+                    str(DEFAULT_TELEGRAM_BROADCAST_WORKERS),
+                ),
+                name="TELEGRAM_BROADCAST_WORKERS",
+                minimum=1,
+                maximum=30,
+            ),
+            telegram_broadcast_rate_per_second=_parse_int(
+                value(
+                    "TELEGRAM_BROADCAST_RATE_PER_SECOND",
+                    str(DEFAULT_TELEGRAM_BROADCAST_RATE_PER_SECOND),
+                ),
+                name="TELEGRAM_BROADCAST_RATE_PER_SECOND",
+                minimum=1,
+                maximum=30,
             ),
             cgv_request_spacing_seconds=_parse_int(
                 value("CGV_REQUEST_SPACING_SECONDS", "2"),
@@ -2608,6 +2631,37 @@ class _CycleTally:
     dirty: bool = False
 
 
+class _BroadcastRateLimiter:
+    """Cap broadcast starts within a rolling one-second window."""
+
+    def __init__(
+        self,
+        max_per_second: int,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
+    ):
+        self.max_per_second = max(1, max_per_second)
+        self._clock = clock
+        self._sleeper = sleeper
+        self._lock = threading.Lock()
+        self._started_at: list[float] = []
+
+    def wait(self) -> None:
+        while True:
+            with self._lock:
+                now = self._clock()
+                cutoff = now - 1.0
+                self._started_at = [
+                    started for started in self._started_at if started > cutoff
+                ]
+                if len(self._started_at) < self.max_per_second:
+                    self._started_at.append(now)
+                    return
+                delay = max(0.001, 1.0 - (now - self._started_at[0]))
+            self._sleeper(delay)
+
+
 class Watcher:
     def __init__(
         self,
@@ -2627,6 +2681,9 @@ class Watcher:
         )
         self.state = StateStore(config.state_file)
         self._last_cgv_request_finished_at: float | None = None
+        self._telegram_broadcast_limiter = _BroadcastRateLimiter(
+            config.telegram_broadcast_rate_per_second
+        )
         # Cycle 0 always sweeps the full window; a cursor scan runs in between.
         self._cycle_index = 0
         self._command_poll_failures = 0
@@ -2877,8 +2934,10 @@ class Watcher:
         )
         delivered = 0
         failed = 0
+        broadcast_started = time.monotonic()
 
         def send(chat_id: str) -> tuple[str, TelegramError | None]:
+            self._telegram_broadcast_limiter.wait()
             try:
                 self.telegram.send_message(text, chat_id=chat_id)
             except TelegramError as exc:
@@ -2888,7 +2947,9 @@ class Watcher:
         results: list[tuple[str, TelegramError | None]] = []
         if subscriber_ids:
             with concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(TELEGRAM_BROADCAST_WORKERS, len(subscriber_ids)),
+                max_workers=min(
+                    self.config.telegram_broadcast_workers, len(subscriber_ids)
+                ),
                 thread_name_prefix="telegram-broadcast",
             ) as executor:
                 results = list(executor.map(send, subscriber_ids))
@@ -2909,6 +2970,14 @@ class Watcher:
                     )
             else:
                 delivered += 1
+        if len(subscriber_ids) > 1:
+            self.logger.info(
+                "Telegram 발송 완료: 대상 %d명, 성공 %d명, 실패 %d명, %.2f초",
+                len(subscriber_ids),
+                delivered,
+                failed,
+                time.monotonic() - broadcast_started,
+            )
         if not subscriber_ids:
             if self.state.subscriber_ids():
                 self.logger.info(
@@ -2969,6 +3038,7 @@ class Watcher:
         ) -> tuple[str, str, TelegramError | None]:
             key, record = item
             chat_id = record["chat_id"]
+            self._telegram_broadcast_limiter.wait()
             try:
                 self.telegram.send_message(record["text"], chat_id=chat_id)
             except TelegramError as exc:
@@ -2979,7 +3049,7 @@ class Watcher:
         if eligible_records:
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=min(
-                    TELEGRAM_BROADCAST_WORKERS, len(eligible_records)
+                    self.config.telegram_broadcast_workers, len(eligible_records)
                 ),
                 thread_name_prefix="telegram-retry",
             ) as executor:

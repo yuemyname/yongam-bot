@@ -50,6 +50,7 @@ from watcher import (
     TelegramError,
     TimezoneFormatter,
     Watcher,
+    _BroadcastRateLimiter,
     _available_seat_line,
     _available_seat_count,
     _sweet_seat_snapshot,
@@ -2237,7 +2238,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             logger.handlers = [logging.NullHandler()]
             watcher = Watcher(config, logger=logger)
             watcher.state.remove_subscriber(config.telegram_chat_id)
-            for chat_id in ("1", "2", "3", "4"):
+            for chat_id in ("1", "2", "3", "4", "5", "6", "7", "8"):
                 watcher.state.add_subscriber(chat_id)
 
             lock = threading.Lock()
@@ -2250,7 +2251,7 @@ class WatcherIntegrationTests(unittest.TestCase):
                 with lock:
                     active += 1
                     max_active = max(max_active, active)
-                    if active >= 2:
+                    if active >= 8:
                         release.set()
                 self.assertTrue(release.wait(timeout=1))
                 with lock:
@@ -2261,8 +2262,26 @@ class WatcherIntegrationTests(unittest.TestCase):
                 "test", category=ALERT_OPEN
             )
 
-            self.assertGreaterEqual(max_active, 2)
-            self.assertEqual((delivered, failed, total), (4, 0, 4))
+            self.assertGreaterEqual(max_active, 8)
+            self.assertEqual((delivered, failed, total), (8, 0, 8))
+
+    def test_broadcast_rate_limiter_keeps_free_api_headroom(self):
+        now = [0.0]
+        waits = []
+
+        def sleep(seconds):
+            waits.append(seconds)
+            now[0] += seconds
+
+        limiter = _BroadcastRateLimiter(
+            2, clock=lambda: now[0], sleeper=sleep
+        )
+        limiter.wait()
+        limiter.wait()
+        limiter.wait()
+
+        self.assertEqual(waits, [1.0])
+        self.assertEqual(now[0], 1.0)
 
     def test_partial_seat_delivery_retries_without_repeating_for_others(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -5038,7 +5057,7 @@ class DocumentedCommandTests(unittest.TestCase):
 
     def test_documented_settings_exist_in_the_code(self):
         source = (self.REPO / "watcher.py").read_text(encoding="utf-8")
-        known = set(re.findall(r'value\("([A-Z_0-9]+)"', source))
+        known = set(re.findall(r'value\(\s*"([A-Z_0-9]+)"', source))
 
         for name, pattern in (
             ("DEVELOPMENT.md", r"`([A-Z_][A-Z_0-9]{4,})`"),
