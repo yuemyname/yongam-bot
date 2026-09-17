@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 import urllib.parse
@@ -2282,6 +2283,74 @@ class WatcherIntegrationTests(unittest.TestCase):
 
         self.assertEqual(waits, [1.0])
         self.assertEqual(now[0], 1.0)
+
+    def test_background_delivery_queue_does_not_block_the_caller_and_is_durable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = dataclasses.replace(
+                make_config(Path(temporary)),
+                telegram_broadcast_workers=1,
+            )
+            logger = logging.getLogger(f"watcher-outbox-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            entered = threading.Event()
+            release = threading.Event()
+
+            def blocked_send(_text, **_kwargs):
+                entered.set()
+                self.assertTrue(release.wait(timeout=2))
+
+            watcher.telegram.send_message = blocked_send
+            watcher.start_delivery_worker()
+            try:
+                accepted, failed, total = watcher._broadcast_message(
+                    "new opening", category=ALERT_OPEN
+                )
+                self.assertEqual((accepted, failed, total), (1, 0, 1))
+                self.assertTrue(entered.wait(timeout=1))
+
+                # The sender is still blocked, but the alert already exists on
+                # disk and the scanner-side call has returned.
+                restored = StateStore(config.state_file)
+                restored.load()
+                self.assertEqual(restored.pending_delivery_count(), 1)
+            finally:
+                release.set()
+                deadline = time.monotonic() + 2
+                while (
+                    watcher.state.pending_delivery_count()
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+                watcher.stop_delivery_worker(timeout=2)
+            self.assertEqual(watcher.state.pending_delivery_count(), 0)
+
+    def test_background_delivery_queue_prioritizes_new_openings(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = dataclasses.replace(
+                make_config(Path(temporary)),
+                telegram_broadcast_workers=1,
+            )
+            logger = logging.getLogger(f"watcher-priority-outbox-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            chat_id = config.telegram_chat_id
+            watcher.state.queue_pending_delivery(chat_id, "seat", ALERT_SEATS)
+            watcher.state.queue_pending_delivery(chat_id, "open", ALERT_OPEN)
+            watcher.state.save()
+            sent = []
+            watcher.telegram.send_message = lambda text, **_kwargs: sent.append(text)
+
+            watcher.start_delivery_worker()
+            try:
+                deadline = time.monotonic() + 2
+                while len(sent) < 2 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+            finally:
+                watcher.stop_delivery_worker(timeout=2)
+
+            self.assertEqual(sent, ["open", "seat"])
+            self.assertEqual(watcher.state.pending_delivery_count(), 0)
 
     def test_partial_seat_delivery_retries_without_repeating_for_others(self):
         with tempfile.TemporaryDirectory() as temporary:

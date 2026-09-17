@@ -39,7 +39,7 @@ DEFAULT_BOOKING_URL = "https://cgv.co.kr/cnm/movieBook/movie"
 DEFAULT_SEAT_PAGE_URL = "https://cgv.co.kr/cnm/selectVisitorCnt"
 DEFAULT_SITE_NAME = "용산아이파크몰"
 UNCLASSIFIED_ALERT_MIN_SEATS = 7
-STATE_VERSION = 14
+STATE_VERSION = 15
 DEFAULT_TELEGRAM_BROADCAST_WORKERS = 16
 # Telegram documents a free broadcast ceiling of about 30 messages/second.
 # Leave headroom for command replies and transient timing differences.
@@ -59,6 +59,10 @@ UNRECOVERABLE_CHAT_MARKERS = (
 )
 # A queued retry that never succeeds is dropped rather than kept forever.
 PENDING_DELIVERY_TTL_HOURS = 24
+# The sender takes at most one second of work before looking at the durable
+# queue again.  That lets a newly discovered opening jump ahead of an older
+# seat-change backlog even when hundreds of people are subscribed.
+DELIVERY_RETRY_BACKOFF_MAX_SECONDS = 300
 
 # Scanning strategy.  "full" requests every date in the window each cycle.
 # "cursor" requests only the already-open range plus a short probe past the
@@ -85,6 +89,19 @@ ALERT_SYSTEM = "system"
 # An announcement the operator typed.  Everyone subscribed gets it, whatever
 # they set /mode to — it is not one of the alerts those settings filter.
 ALERT_NOTICE = "notice"
+
+# Smaller numbers leave the durable Telegram outbox first.  Booking openings
+# are the reason this bot exists, so they always pre-empt seat changes and
+# operator announcements at the next short sender batch boundary.
+DELIVERY_CATEGORY_PRIORITIES = {
+    ALERT_OPEN: 0,
+    ALERT_SEATS: 10,
+    ALERT_SEATS_SWEET: 10,
+    ALERT_SEATS_UNCLASSIFIED: 10,
+    ALERT_NOTICE: 20,
+    ALERT_SYSTEM: 20,
+}
+DEFAULT_DELIVERY_PRIORITY = 30
 
 # Per-subscriber alert preference.  Subscribers stored before this feature have
 # no saved mode and fall back to DEFAULT_ALERT_MODE, preserving old behaviour.
@@ -1848,8 +1865,9 @@ class StateStore:
         category: str,
         *,
         show_date: str | None = None,
+        seats_available: int | None = None,
     ) -> bool:
-        """Remember a failed Telegram delivery without duplicating the queue."""
+        """Persist one Telegram delivery without duplicating the outbox."""
 
         key_source = f"{chat_id}\0{category}\0{show_date or ''}\0{text}"
         key = hashlib.sha256(key_source.encode("utf-8")).hexdigest()
@@ -1862,8 +1880,13 @@ class StateStore:
                 "text": text,
                 "category": category,
                 "show_date": show_date or "",
+                "seats_available": seats_available,
+                "priority": DELIVERY_CATEGORY_PRIORITIES.get(
+                    category, DEFAULT_DELIVERY_PRIORITY
+                ),
                 "queued_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                 "attempts": 0,
+                "next_attempt_at": "",
             }
             return True
 
@@ -1883,7 +1906,7 @@ class StateStore:
             return len(keys)
 
     def note_delivery_attempt(self, key: str, max_attempts: int) -> bool:
-        """Count a failed retry; returns True once the entry is given up on."""
+        """Count a failed send and schedule bounded exponential backoff."""
 
         with self._lock:
             bucket = self.data.setdefault("pending_deliveries", {})
@@ -1896,6 +1919,14 @@ class StateStore:
                 return True
             updated = dict(record)
             updated["attempts"] = attempts
+            retry_seconds = min(
+                DELIVERY_RETRY_BACKOFF_MAX_SECONDS,
+                2 ** min(attempts, 8),
+            )
+            updated["next_attempt_at"] = (
+                dt.datetime.now(dt.timezone.utc)
+                + dt.timedelta(seconds=retry_seconds)
+            ).isoformat()
             bucket[key] = updated
             return False
 
@@ -1962,11 +1993,11 @@ class StateStore:
                     continue
             return tuple(sorted(dates))
 
-    def pending_deliveries(self) -> tuple[tuple[str, dict[str, str]], ...]:
+    def pending_deliveries(self) -> tuple[tuple[str, dict[str, Any]], ...]:
         """Return a stable copy so Telegram calls happen outside the state lock."""
 
         with self._lock:
-            records: list[tuple[str, dict[str, str]]] = []
+            records: list[tuple[str, dict[str, Any]]] = []
             for key, raw in self.data.setdefault("pending_deliveries", {}).items():
                 if not isinstance(raw, Mapping):
                     continue
@@ -1985,6 +2016,23 @@ class StateStore:
                     show_date = raw.get("show_date")
                     if isinstance(show_date, str) and show_date:
                         copied["show_date"] = show_date
+                    seats_available = raw.get("seats_available")
+                    if isinstance(seats_available, int):
+                        copied["seats_available"] = seats_available
+                    copied["priority"] = raw.get(
+                        "priority",
+                        DELIVERY_CATEGORY_PRIORITIES.get(
+                            category, DEFAULT_DELIVERY_PRIORITY
+                        ),
+                    )
+                    copied["queued_at"] = str(raw.get("queued_at") or "")
+                    try:
+                        copied["attempts"] = int(raw.get("attempts") or 0)
+                    except (TypeError, ValueError):
+                        copied["attempts"] = 0
+                    copied["next_attempt_at"] = str(
+                        raw.get("next_attempt_at") or ""
+                    )
                     records.append(
                         (
                             str(key),
@@ -1992,6 +2040,10 @@ class StateStore:
                         )
                     )
             return tuple(records)
+
+    def pending_delivery_count(self) -> int:
+        with self._lock:
+            return len(self.data.setdefault("pending_deliveries", {}))
 
     def remove_pending_delivery(self, key: str) -> bool:
         with self._lock:
@@ -2684,6 +2736,9 @@ class Watcher:
         self._telegram_broadcast_limiter = _BroadcastRateLimiter(
             config.telegram_broadcast_rate_per_second
         )
+        self._delivery_stop_event = threading.Event()
+        self._delivery_wake_event = threading.Event()
+        self._delivery_thread: threading.Thread | None = None
         # Cycle 0 always sweeps the full window; a cursor scan runs in between.
         self._cycle_index = 0
         self._command_poll_failures = 0
@@ -2697,6 +2752,119 @@ class Watcher:
             self.state.initialize_subscribers(config.telegram_chat_id)
             if not self.dry_run:
                 self.state.save()
+
+    def _delivery_worker_running(self) -> bool:
+        worker = self._delivery_thread
+        return worker is not None and worker.is_alive()
+
+    def start_delivery_worker(self) -> None:
+        """Start the persistent outbox sender used by the long-running bot."""
+
+        if self.dry_run or self._delivery_worker_running():
+            return
+        self._delivery_stop_event.clear()
+        self._delivery_wake_event.set()
+        self._delivery_thread = threading.Thread(
+            target=self._delivery_loop,
+            name="telegram-delivery-worker",
+            daemon=True,
+        )
+        self._delivery_thread.start()
+        self.logger.info(
+            "Telegram 영속 발송 대기열 시작: 신규 오픈 최우선, "
+            "최대 초당 %d건",
+            self.config.telegram_broadcast_rate_per_second,
+        )
+
+    def stop_delivery_worker(self, *, timeout: float | None = None) -> None:
+        """Stop sending; unsent records stay on disk for the next process."""
+
+        worker = self._delivery_thread
+        if worker is None:
+            return
+        self._delivery_stop_event.set()
+        self._delivery_wake_event.set()
+        worker.join(timeout=timeout)
+        if worker.is_alive():
+            self.logger.warning(
+                "Telegram 발송 작업 종료 대기 초과: 남은 %d건은 다음 실행에서 복구합니다.",
+                self.state.pending_delivery_count(),
+            )
+        else:
+            self.logger.info(
+                "Telegram 발송 작업 종료: 대기 %d건",
+                self.state.pending_delivery_count(),
+            )
+        self._delivery_thread = None
+
+    @staticmethod
+    def _delivery_due_at(record: Mapping[str, Any]) -> dt.datetime:
+        raw = record.get("next_attempt_at")
+        if isinstance(raw, str) and raw:
+            try:
+                parsed = dt.datetime.fromisoformat(raw)
+                if parsed.tzinfo is None:
+                    return parsed.replace(tzinfo=dt.timezone.utc)
+                return parsed.astimezone(dt.timezone.utc)
+            except ValueError:
+                pass
+        return dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+
+    @staticmethod
+    def _delivery_sort_key(
+        item: tuple[str, Mapping[str, Any]],
+    ) -> tuple[int, str, str]:
+        key, record = item
+        try:
+            priority = int(record.get("priority", DEFAULT_DELIVERY_PRIORITY))
+        except (TypeError, ValueError):
+            priority = DEFAULT_DELIVERY_PRIORITY
+        return priority, str(record.get("queued_at") or ""), key
+
+    def _delivery_loop(self) -> None:
+        """Drain short priority batches while CGV scanning continues."""
+
+        while not self._delivery_stop_event.is_set():
+            now = dt.datetime.now(dt.timezone.utc)
+            pending = self.state.pending_deliveries()
+            due = [
+                item
+                for item in pending
+                if self._delivery_due_at(item[1]) <= now
+            ]
+            if due:
+                due.sort(key=self._delivery_sort_key)
+                # Re-read priorities after at most one second's worth of sends,
+                # so a new opening can jump ahead of a large seat-alert queue.
+                batch_size = min(
+                    self.config.telegram_broadcast_rate_per_second,
+                    len(due),
+                )
+                try:
+                    self._retry_pending_deliveries(due[:batch_size])
+                except Exception:
+                    # A malformed old record or an unforeseen Telegram error
+                    # must not kill the only sender.  The durable records stay
+                    # in place and the worker retries after a short pause.
+                    self.logger.exception(
+                        "Telegram 발송 작업 오류: 대기열을 보존하고 다시 시도합니다."
+                    )
+                    self._delivery_wake_event.wait(1.0)
+                continue
+
+            wait_seconds = 1.0
+            future_due = [
+                self._delivery_due_at(record)
+                for _key, record in pending
+                if self._delivery_due_at(record) > now
+            ]
+            if future_due:
+                wait_seconds = min(
+                    wait_seconds,
+                    max(0.05, (min(future_due) - now).total_seconds()),
+                )
+            self._delivery_wake_event.clear()
+            self._delivery_wake_event.wait(wait_seconds)
 
     def _plan_scan(self, today: dt.date) -> ScanPlan:
         """Choose the dates to request this cycle.
@@ -2913,11 +3081,13 @@ class Watcher:
         show_date: str | None = None,
         recipients: Sequence[str] | None = None,
     ) -> tuple[int, int, int]:
-        """Send to subscribers opted in to ``category``.
+        """Deliver or durably queue a message for the opted-in subscribers.
 
-        The returned total counts only those recipients, so callers that gate
-        state updates on delivery still advance when nobody wants this
-        category (total == 0) instead of retrying forever.
+        In the long-running service the first value is the number accepted by
+        the persistent outbox; without the background worker (tests and
+        ``--once``) it remains the number synchronously delivered.  The total
+        counts only selected recipients, so state still advances when nobody
+        wants this category (total == 0) instead of retrying forever.
 
         ``recipients`` addresses named chats instead, for a message that is
         not a subscription at all.
@@ -2932,6 +3102,30 @@ class Watcher:
                 show_date=show_date,
             )
         )
+        if subscriber_ids and self._delivery_worker_running():
+            added = 0
+            for chat_id in subscriber_ids:
+                if self.state.queue_pending_delivery(
+                    chat_id,
+                    text,
+                    category,
+                    show_date=show_date,
+                    seats_available=seats_available,
+                ):
+                    added += 1
+            # Save before the scan records an alert as handled.  A process
+            # crash can therefore cause a duplicate, but never a missed open.
+            self.state.save()
+            self._delivery_wake_event.set()
+            self.logger.info(
+                "Telegram 발송 대기열 등록: 대상 %d명, 신규 %d건, 현재 %d건, 종류 %s",
+                len(subscriber_ids),
+                added,
+                self.state.pending_delivery_count(),
+                category,
+            )
+            return len(subscriber_ids), 0, len(subscriber_ids)
+
         delivered = 0
         failed = 0
         broadcast_started = time.monotonic()
@@ -2963,7 +3157,11 @@ class Watcher:
                     self._drop_unreachable_subscriber(chat_id, error)
                 else:
                     self.state.queue_pending_delivery(
-                        chat_id, text, category, show_date=show_date
+                        chat_id,
+                        text,
+                        category,
+                        show_date=show_date,
+                        seats_available=seats_available,
                     )
                     self.logger.error(
                         "전송 실패(다음 주기 재시도): %s", error
@@ -3006,14 +3204,14 @@ class Watcher:
 
     def _retry_pending_deliveries(
         self,
-        pending: Sequence[tuple[str, Mapping[str, str]]] | None = None,
+        pending: Sequence[tuple[str, Mapping[str, Any]]] | None = None,
     ) -> None:
         """Retry only recipients who missed an earlier broadcast."""
 
         if self.dry_run:
             return
         changed = False
-        eligible_records: list[tuple[str, Mapping[str, str]]] = []
+        eligible_records: list[tuple[str, Mapping[str, Any]]] = []
         for key, record in (
             self.state.pending_deliveries() if pending is None else pending
         ):
@@ -3025,7 +3223,9 @@ class Watcher:
                 self._operator_recipients()
                 if category == ALERT_SYSTEM
                 else self.state.subscriber_ids_for(
-                    category, show_date=record.get("show_date")
+                    category,
+                    seats_available=record.get("seats_available"),
+                    show_date=record.get("show_date"),
                 )
             )
             if chat_id not in eligible:
@@ -3034,7 +3234,7 @@ class Watcher:
             eligible_records.append((key, record))
 
         def resend(
-            item: tuple[str, Mapping[str, str]],
+            item: tuple[str, Mapping[str, Any]],
         ) -> tuple[str, str, TelegramError | None]:
             key, record = item
             chat_id = record["chat_id"]
@@ -3075,9 +3275,19 @@ class Watcher:
                     self.logger.warning("재전송 실패: %s", error)
                 continue
             changed = self.state.remove_pending_delivery(key) or changed
-            self.logger.info("재전송 성공: chat_id=%s", chat_id)
+            if not self._delivery_worker_running():
+                self.logger.info("재전송 성공: chat_id=%s", chat_id)
         if changed:
             self.state.save()
+        if self._delivery_worker_running() and eligible_records:
+            failures = sum(1 for _key, _chat_id, error in results if error is not None)
+            self.logger.info(
+                "Telegram 대기열 발송: 처리 %d건, 성공 %d건, 실패 %d건, 남음 %d건",
+                len(results),
+                len(results) - failures,
+                failures,
+                self.state.pending_delivery_count(),
+            )
 
     def _subscriber_stats_message(self, *, include_subscribers: bool = True) -> str:
         """Operator-facing aggregate snapshot, optionally with subscriber rows."""
@@ -3302,16 +3512,30 @@ class Watcher:
                 text, category=ALERT_NOTICE
             )
             self._notice_draft = None
-            self.logger.info(
-                "공지 발송: 대상 %d명, 성공 %d명, 실패 %d명",
-                total,
-                delivered,
-                failed,
-            )
+            if self._delivery_worker_running():
+                self.logger.info("공지 발송 대기열 등록: 대상 %d명", total)
+                result = (
+                    f"✅ 공지를 발송 대기열에 등록했습니다.\n대상 {total}명\n"
+                    "신규 오픈 알림을 먼저 보낸 뒤 순서대로 전송합니다."
+                )
+            else:
+                self.logger.info(
+                    "공지 발송: 대상 %d명, 성공 %d명, 실패 %d명",
+                    total,
+                    delivered,
+                    failed,
+                )
+                result = (
+                    f"✅ 공지를 보냈습니다.\n대상 {total}명 · 성공 {delivered}명"
+                    f" · 실패 {failed}명"
+                    + (
+                        "\n실패한 분에게는 다음 주기에 다시 시도합니다."
+                        if failed
+                        else ""
+                    )
+                )
             return (
-                f"✅ 공지를 보냈습니다.\n대상 {total}명 · 성공 {delivered}명"
-                f" · 실패 {failed}명"
-                + ("\n실패한 분에게는 다음 주기에 다시 시도합니다." if failed else ""),
+                result,
                 False,
             )
 
@@ -4133,15 +4357,26 @@ class Watcher:
                     )
                     for session in chunk_sessions:
                         self.state.mark_notified(session_keys[session], session)
-                        verdicts[session_keys[session]] = "발송·예매 오픈"
+                        verdicts[session_keys[session]] = (
+                            "대기열·예매 오픈"
+                            if self._delivery_worker_running()
+                            else "발송·예매 오픈"
+                        )
                         tally.dirty = True
                     tally.new_sessions += len(chunk_sessions)
-                    self.logger.info(
-                        "전송: 신규 회차 알림 %d개, 성공 %d명, 실패 %d명",
-                        len(chunk_sessions),
-                        delivered,
-                        failed,
-                    )
+                    if self._delivery_worker_running():
+                        self.logger.info(
+                            "최우선 대기열: 신규 회차 알림 %d개, 대상 %d명",
+                            len(chunk_sessions),
+                            total,
+                        )
+                    else:
+                        self.logger.info(
+                            "전송: 신규 회차 알림 %d개, 성공 %d명, 실패 %d명",
+                            len(chunk_sessions),
+                            delivered,
+                            failed,
+                        )
 
         for session in sessions:
             key = session_keys[session]
@@ -4290,23 +4525,40 @@ class Watcher:
             if delivered or failed or total == 0:
                 self.state.set_seat_snapshot(key, current)
                 self.state.note_seat_alert(key, self.config.local_now())
-                verdicts[key] = f"발송·예매 가능 {current.total}석"
-                tally.dirty = True
-                self.logger.info(
-                    "전송: 예매 가능 좌석 %s (%d석)%s, 성공 %d명, 실패 %d명",
-                    _session_line(session),
-                    current.total,
-                    unclassified,
-                    delivered,
-                    failed,
+                verdicts[key] = (
+                    f"대기열·예매 가능 {current.total}석"
+                    if self._delivery_worker_running()
+                    else f"발송·예매 가능 {current.total}석"
                 )
+                tally.dirty = True
+                if self._delivery_worker_running():
+                    self.logger.info(
+                        "좌석 대기열: %s (%d석)%s, 대상 %d명",
+                        _session_line(session),
+                        current.total,
+                        unclassified,
+                        total,
+                    )
+                else:
+                    self.logger.info(
+                        "전송: 예매 가능 좌석 %s (%d석)%s, 성공 %d명, 실패 %d명",
+                        _session_line(session),
+                        current.total,
+                        unclassified,
+                        delivered,
+                        failed,
+                    )
 
         self._record_verdicts(tally, sessions, verdicts, session_keys, snapshots)
 
     def run_cycle(self) -> CycleResult:
         # Snapshot before sending anything this cycle. A fresh failure should
         # wait until the next cycle instead of being retried immediately.
-        pending_retries = self.state.pending_deliveries()
+        pending_retries = (
+            ()
+            if self._delivery_worker_running()
+            else self.state.pending_deliveries()
+        )
         today = self.config.local_today()
         plan = self._plan_scan(today)
         dates = list(plan.dates)
@@ -4430,7 +4682,8 @@ class Watcher:
         self._flush_state(tally)
         # Old Telegram failures must never hold up this cycle's highest-priority
         # work: discovering and announcing a newly opened showing.
-        self._retry_pending_deliveries(pending_retries)
+        if not self._delivery_worker_running():
+            self._retry_pending_deliveries(pending_retries)
 
         if tally.verdicts:
             self.logger.debug(
@@ -4713,6 +4966,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     command_stop_event = threading.Event()
     command_thread: threading.Thread | None = None
+    if not args.dry_run:
+        watcher.start_delivery_worker()
     if config.subscriptions_enabled and not args.dry_run:
         command_thread = threading.Thread(
             target=run_command_loop,
@@ -4761,6 +5016,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     command_stop_event.set()
     if command_thread is not None:
         command_thread.join(timeout=config.request_timeout_seconds + 1)
+    watcher.stop_delivery_worker(timeout=config.request_timeout_seconds + 1)
     logger.info("사용자 요청으로 감시기를 종료합니다.")
     return 0
 
