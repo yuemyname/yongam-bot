@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import signal
 from pathlib import Path
 import tempfile
 import threading
@@ -43,6 +44,7 @@ from watcher import (
     BookingSession,
     CgvClient,
     Config,
+    CycleResult,
     FetchError,
     SeatSnapshot,
     StateStore,
@@ -59,7 +61,7 @@ from watcher import (
     _seat_snapshot_changed,
     extract_seat_snapshot,
     extract_sessions,
-    forbidden_backoff_seconds,
+    main,
     rate_limit_backoff_seconds,
     run_command_loop,
 )
@@ -1708,21 +1710,46 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = make_config(Path(temporary))
 
-            self.assertEqual(rate_limit_backoff_seconds(config, 0), 60)
+            self.assertEqual(rate_limit_backoff_seconds(config, 0), 120)
             self.assertEqual(rate_limit_backoff_seconds(config, 1), 1800)
             self.assertEqual(rate_limit_backoff_seconds(config, 2), 3600)
             self.assertEqual(rate_limit_backoff_seconds(config, 3), 7200)
             self.assertEqual(rate_limit_backoff_seconds(config, 4), 7200)
 
-    def test_forbidden_backoff_uses_ten_twenty_thirty_minutes(self):
+    def test_repeated_forbidden_cycles_wait_120_seconds_without_escalating(self):
         with tempfile.TemporaryDirectory() as temporary:
-            config = make_config(Path(temporary))
+            config = dataclasses.replace(
+                make_config(Path(temporary)), dynamic_date_window=True
+            )
+            self.assertEqual(config.poll_interval_seconds, 120)
+            now = [0.0]
+            cycle_starts = []
+            signal_handlers = {}
 
-            self.assertEqual(forbidden_backoff_seconds(config, 0), 60)
-            self.assertEqual(forbidden_backoff_seconds(config, 1), 600)
-            self.assertEqual(forbidden_backoff_seconds(config, 2), 1200)
-            self.assertEqual(forbidden_backoff_seconds(config, 3), 1800)
-            self.assertEqual(forbidden_backoff_seconds(config, 4), 1800)
+            def run_cycle():
+                cycle_starts.append(now[0])
+                now[0] += 5.0  # Time spent reading CGV is not cooldown time.
+                if len(cycle_starts) == 4:
+                    signal_handlers[signal.SIGTERM](signal.SIGTERM, None)
+                    return CycleResult(1, 0, 0, 0)
+                return CycleResult(0, 1, 0, 0, forbidden_requests=1)
+
+            def advance(seconds):
+                now[0] += seconds
+
+            with (
+                patch("watcher.Config.from_env_file", return_value=config),
+                patch("watcher.configure_logging"),
+                patch("watcher.Watcher") as factory,
+                patch("watcher.signal.signal", side_effect=signal_handlers.__setitem__),
+                patch("watcher.time.monotonic", side_effect=lambda: now[0]),
+                patch("watcher.time.sleep", side_effect=advance),
+            ):
+                factory.return_value.run_cycle.side_effect = run_cycle
+                self.assertEqual(main([]), 0)
+
+            self.assertEqual(cycle_starts, [0.0, 125.0, 250.0, 375.0])
+            factory.return_value.stop_delivery_worker.assert_called_once()
 
 
 class LoggingTests(unittest.TestCase):

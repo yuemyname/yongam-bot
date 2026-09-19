@@ -459,8 +459,6 @@ class Config:
     cgv_request_spacing_seconds: int
     rate_limit_backoff_initial_seconds: int
     rate_limit_backoff_max_seconds: int
-    forbidden_backoff_initial_seconds: int
-    forbidden_backoff_max_seconds: int
     request_timeout_seconds: int
     imax_keywords: tuple[str, ...]
     imax_code_values: tuple[str, ...]
@@ -591,7 +589,7 @@ class Config:
             target_start=target_start,
             target_end=target_end,
             poll_interval_seconds=_parse_int(
-                value("POLL_INTERVAL_SECONDS", "60"),
+                value("POLL_INTERVAL_SECONDS", "120"),
                 name="POLL_INTERVAL_SECONDS",
                 minimum=30,
                 maximum=86400,
@@ -635,18 +633,6 @@ class Config:
             rate_limit_backoff_max_seconds=_parse_int(
                 value("RATE_LIMIT_BACKOFF_MAX_SECONDS", "7200"),
                 name="RATE_LIMIT_BACKOFF_MAX_SECONDS",
-                minimum=60,
-                maximum=86400,
-            ),
-            forbidden_backoff_initial_seconds=_parse_int(
-                value("FORBIDDEN_BACKOFF_INITIAL_SECONDS", "600"),
-                name="FORBIDDEN_BACKOFF_INITIAL_SECONDS",
-                minimum=60,
-                maximum=86400,
-            ),
-            forbidden_backoff_max_seconds=_parse_int(
-                value("FORBIDDEN_BACKOFF_MAX_SECONDS", "1800"),
-                name="FORBIDDEN_BACKOFF_MAX_SECONDS",
                 minimum=60,
                 maximum=86400,
             ),
@@ -4093,8 +4079,8 @@ class Watcher:
                         len(dates) - index - 1,
                     )
                 elif "HTTP 403" in message:
-                    # A 403 usually blocks the Railway egress IP, not just one
-                    # date. Continuing through all 28 dates only extends it.
+                    # Stop this cycle after a forbidden response, then let the
+                    # main loop retry after the configured polling interval.
                     tally.rate_limited = True
                     tally.forbidden_requests += 1
                     self.logger.warning(
@@ -4798,18 +4784,6 @@ def rate_limit_backoff_seconds(config: Config, consecutive_cycles: int) -> int:
     )
 
 
-def forbidden_backoff_seconds(config: Config, consecutive_cycles: int) -> int:
-    """Return a linear HTTP 403 cooldown: 10, 20, then 30 minutes."""
-
-    if consecutive_cycles < 1:
-        return config.poll_interval_seconds
-    cooldown = config.forbidden_backoff_initial_seconds * consecutive_cycles
-    return max(
-        config.poll_interval_seconds,
-        min(cooldown, config.forbidden_backoff_max_seconds),
-    )
-
-
 def run_command_loop(watcher: Watcher, stop_event: threading.Event) -> None:
     """Keep Telegram commands responsive without delaying CGV requests."""
 
@@ -5036,13 +5010,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if result.forbidden_requests:
             consecutive_forbidden_cycles += 1
             consecutive_rate_limit_cycles = 0
-            next_interval = forbidden_backoff_seconds(
-                config, consecutive_forbidden_cycles
-            )
+            next_interval = config.poll_interval_seconds
             logger.warning(
-                "CGV HTTP 403 차단 감지: 다음 조회는 %d분 뒤에 시도합니다. "
-                "(이번 주기 %d개, 연속 %d회)",
-                max(1, next_interval // 60),
+                "CGV HTTP 403 차단 감지: 다음 조회는 %d초 뒤에 시도합니다. "
+                "(장시간 대기 해제, "
+                "이번 주기 %d개, 연속 %d회)",
+                next_interval,
                 result.forbidden_requests,
                 consecutive_forbidden_cycles,
             )
