@@ -459,6 +459,8 @@ class Config:
     cgv_request_spacing_seconds: int
     rate_limit_backoff_initial_seconds: int
     rate_limit_backoff_max_seconds: int
+    forbidden_backoff_initial_seconds: int
+    forbidden_backoff_max_seconds: int
     request_timeout_seconds: int
     imax_keywords: tuple[str, ...]
     imax_code_values: tuple[str, ...]
@@ -633,6 +635,18 @@ class Config:
             rate_limit_backoff_max_seconds=_parse_int(
                 value("RATE_LIMIT_BACKOFF_MAX_SECONDS", "7200"),
                 name="RATE_LIMIT_BACKOFF_MAX_SECONDS",
+                minimum=60,
+                maximum=86400,
+            ),
+            forbidden_backoff_initial_seconds=_parse_int(
+                value("FORBIDDEN_BACKOFF_INITIAL_SECONDS", "600"),
+                name="FORBIDDEN_BACKOFF_INITIAL_SECONDS",
+                minimum=60,
+                maximum=86400,
+            ),
+            forbidden_backoff_max_seconds=_parse_int(
+                value("FORBIDDEN_BACKOFF_MAX_SECONDS", "1800"),
+                name="FORBIDDEN_BACKOFF_MAX_SECONDS",
                 minimum=60,
                 maximum=86400,
             ),
@@ -2628,6 +2642,7 @@ class CycleResult:
     unclassified_fallback_alerts: int = 0
     seat_detail_errors: int = 0
     rate_limited_requests: int = 0
+    forbidden_requests: int = 0
     schedule_skipped_dates: int = 0
     seat_detail_skipped: int = 0
     requested_dates: int = 0
@@ -2669,6 +2684,7 @@ class _CycleTally:
     seat_detail_errors: int = 0
     seat_detail_error_sample: str = ""
     rate_limited_requests: int = 0
+    forbidden_requests: int = 0
     schedule_skipped_dates: int = 0
     seat_detail_skipped: int = 0
     deferred_rechecks_skipped: int = 0
@@ -4076,6 +4092,15 @@ class Watcher:
                         "CGV HTTP 429 감지: 남은 일정 조회 %d일을 즉시 생략합니다.",
                         len(dates) - index - 1,
                     )
+                elif "HTTP 403" in message:
+                    # A 403 usually blocks the Railway egress IP, not just one
+                    # date. Continuing through all 28 dates only extends it.
+                    tally.rate_limited = True
+                    tally.forbidden_requests += 1
+                    self.logger.warning(
+                        "CGV HTTP 403 차단 감지: 남은 일정 조회 %d일을 즉시 생략합니다.",
+                        len(dates) - index - 1,
+                    )
             except Exception as exc:  # Keep a single malformed date from stopping the watcher.
                 errors[show_date] = f"예상하지 못한 조회 오류: {type(exc).__name__}"
                 if not self.dry_run:
@@ -4269,9 +4294,14 @@ class Watcher:
                     snapshots[key] = SeatSnapshot(
                         total=session.remaining_seats or 0
                     )
-                    if "HTTP 429" in message:
+                    if "HTTP 429" in message or "HTTP 403" in message:
                         tally.rate_limited = True
-                        tally.rate_limited_requests += 1
+                        if "HTTP 429" in message:
+                            tally.rate_limited_requests += 1
+                            status = "429 요청 제한"
+                        else:
+                            tally.forbidden_requests += 1
+                            status = "403 차단"
                         remaining_sessions = seat_candidates[index + 1 :]
                         tally.seat_detail_skipped += len(remaining_sessions)
                         for skipped_session in remaining_sessions:
@@ -4279,7 +4309,8 @@ class Watcher:
                                 total=skipped_session.remaining_seats or 0
                             )
                         self.logger.warning(
-                            "CGV HTTP 429 감지: 남은 좌석 상세 조회 %d개를 즉시 생략합니다.",
+                            "CGV HTTP %s 감지: 남은 좌석 상세 조회 %d개를 즉시 생략합니다.",
+                            status,
                             len(remaining_sessions),
                         )
                         break
@@ -4697,7 +4728,7 @@ class Watcher:
             "예매 가능 좌석 %d개, A열만 남아 제외 %d개, "
             "0석 제외 %d개, 예매 마감 제외 %d개, 좌석판별 대기 %d개, "
             "미판별 7석 이상 알림 %d개, "
-            "HTTP 429 %d개, 일정 생략 %d일, 좌석상세 생략 %d개, "
+            "HTTP 429 %d개, HTTP 403 %d개, 일정 생략 %d일, 좌석상세 생략 %d개, "
             "보류 재조회 생략 %d개",
             tally.successful_dates,
             len(errors),
@@ -4710,6 +4741,7 @@ class Watcher:
             len(tally.deferred_keys),
             tally.unclassified_fallback_alerts,
             tally.rate_limited_requests,
+            tally.forbidden_requests,
             tally.schedule_skipped_dates,
             tally.seat_detail_skipped,
             tally.deferred_rechecks_skipped,
@@ -4726,6 +4758,7 @@ class Watcher:
             unclassified_fallback_alerts=tally.unclassified_fallback_alerts,
             seat_detail_errors=tally.seat_detail_errors,
             rate_limited_requests=tally.rate_limited_requests,
+            forbidden_requests=tally.forbidden_requests,
             schedule_skipped_dates=tally.schedule_skipped_dates,
             seat_detail_skipped=tally.seat_detail_skipped,
             requested_dates=len(dates),
@@ -4762,6 +4795,18 @@ def rate_limit_backoff_seconds(config: Config, consecutive_cycles: int) -> int:
     return max(
         config.poll_interval_seconds,
         min(cooldown, config.rate_limit_backoff_max_seconds),
+    )
+
+
+def forbidden_backoff_seconds(config: Config, consecutive_cycles: int) -> int:
+    """Return a linear HTTP 403 cooldown: 10, 20, then 30 minutes."""
+
+    if consecutive_cycles < 1:
+        return config.poll_interval_seconds
+    cooldown = config.forbidden_backoff_initial_seconds * consecutive_cycles
+    return max(
+        config.poll_interval_seconds,
+        min(cooldown, config.forbidden_backoff_max_seconds),
     )
 
 
@@ -4978,6 +5023,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         command_thread.start()
 
     consecutive_rate_limit_cycles = 0
+    consecutive_forbidden_cycles = 0
     while not stop_requested:
         if (
             not config.dynamic_date_window
@@ -4987,8 +5033,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             break
         started = time.monotonic()
         result = watcher.run_cycle()
-        if result.rate_limited_requests:
+        if result.forbidden_requests:
+            consecutive_forbidden_cycles += 1
+            consecutive_rate_limit_cycles = 0
+            next_interval = forbidden_backoff_seconds(
+                config, consecutive_forbidden_cycles
+            )
+            logger.warning(
+                "CGV HTTP 403 차단 감지: 다음 조회는 %d분 뒤에 시도합니다. "
+                "(이번 주기 %d개, 연속 %d회)",
+                max(1, next_interval // 60),
+                result.forbidden_requests,
+                consecutive_forbidden_cycles,
+            )
+        elif result.rate_limited_requests:
             consecutive_rate_limit_cycles += 1
+            consecutive_forbidden_cycles = 0
             next_interval = rate_limit_backoff_seconds(
                 config, consecutive_rate_limit_cycles
             )
@@ -5000,15 +5060,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                 consecutive_rate_limit_cycles,
             )
         else:
+            if consecutive_forbidden_cycles:
+                logger.info(
+                    "CGV HTTP 403 차단이 해제되어 %d초 조회 주기로 복귀합니다.",
+                    config.poll_interval_seconds,
+                )
             if consecutive_rate_limit_cycles:
                 logger.info(
                     "CGV HTTP 429 요청 제한이 해제되어 %d초 조회 주기로 복귀합니다.",
                     config.poll_interval_seconds,
                 )
+            consecutive_forbidden_cycles = 0
             consecutive_rate_limit_cycles = 0
             next_interval = config.poll_interval_seconds
         elapsed = time.monotonic() - started
-        sleep_seconds = max(0.5, next_interval - elapsed)
+        if result.forbidden_requests or result.rate_limited_requests:
+            # The log promises a cooldown after the block response, not merely
+            # a start-to-start interval that includes time already spent.
+            sleep_seconds = float(next_interval)
+        else:
+            sleep_seconds = max(0.5, next_interval - elapsed)
         deadline = time.monotonic() + sleep_seconds
         while not stop_requested and time.monotonic() < deadline:
             time.sleep(min(0.5, deadline - time.monotonic()))

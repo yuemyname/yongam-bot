@@ -110,6 +110,8 @@ CGV 조회와 Telegram 발송은 서로 다른 작업에서 실행됩니다. 조
 
 `HTTP 429`는 CGV가 요청을 일시적으로 제한한 상태입니다. 봇은 CGV 요청을 최소 2초 간격으로 하나씩 보내며, 첫 429가 나오면 해당 주기의 남은 일정·좌석 요청을 즉시 중단합니다. 실패하거나 생략된 일정 날짜는 상태 파일에 보존해 다음 정상 주기에 신규 오픈 후보 다음으로 우선 재조회합니다. 다음 조회는 30분 뒤로 미루고, 연속으로 발생하면 60분, 최대 120분까지 대기 시간을 늘립니다. 429 없이 조회가 끝나면 자동으로 1분 주기로 복귀합니다. 좌석 상세에서 A열 여부만 확인하지 못한 경우에는 전체 잔여 좌석이 6석 이하면 알림을 보류하고, 7석 이상이면 A열 여부를 확인하지 못했다는 표시와 함께 전체 잔여 수 기준으로 알림을 보냅니다.
 
+`HTTP 403`은 Railway 서버의 자동 조회가 차단된 상태입니다. 첫 403에서 남은 일정·좌석 요청을 즉시 중단하고, 연속 차단 시 다음 조회를 10분·20분·30분 뒤로 미룹니다. 세 번째 이후에는 30분 간격을 유지하며, 정상 응답이 오면 자동으로 1분 주기로 복귀합니다. 이 값은 `FORBIDDEN_BACKOFF_INITIAL_SECONDS`와 `FORBIDDEN_BACKOFF_MAX_SECONDS`로 조정할 수 있습니다.
+
 ## Mac에서 직접 실행
 
 1. `setup.command`를 실행해 `.env`를 만듭니다.
@@ -129,6 +131,8 @@ Mac이 잠자기 상태이거나 덮개가 닫혀 있으면 감시가 중단될 
 | `CGV_REQUEST_SPACING_SECONDS` | `2` | 연속 CGV 요청 사이의 최소 간격 |
 | `RATE_LIMIT_BACKOFF_INITIAL_SECONDS` | `1800` | HTTP 429 발생 후 첫 대기 시간(30분) |
 | `RATE_LIMIT_BACKOFF_MAX_SECONDS` | `7200` | 연속 HTTP 429 시 최대 대기 시간(120분) |
+| `FORBIDDEN_BACKOFF_INITIAL_SECONDS` | `600` | HTTP 403 발생 후 첫 대기 시간(10분) |
+| `FORBIDDEN_BACKOFF_MAX_SECONDS` | `1800` | 연속 HTTP 403 시 최대 대기 시간(30분) |
 | `DYNAMIC_DATE_WINDOW` | `true` | 오늘 기준 감시 범위를 매일 이동 |
 | `TARGET_WINDOW_DAYS` | `28` | 오늘을 포함해 감시할 날짜 수 |
 | `APP_TIMEZONE` | `Asia/Seoul` | 날짜 계산 기준 시간대 |

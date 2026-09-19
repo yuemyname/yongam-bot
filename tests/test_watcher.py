@@ -59,6 +59,7 @@ from watcher import (
     _seat_snapshot_changed,
     extract_seat_snapshot,
     extract_sessions,
+    forbidden_backoff_seconds,
     rate_limit_backoff_seconds,
     run_command_loop,
 )
@@ -1713,6 +1714,16 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(rate_limit_backoff_seconds(config, 3), 7200)
             self.assertEqual(rate_limit_backoff_seconds(config, 4), 7200)
 
+    def test_forbidden_backoff_uses_ten_twenty_thirty_minutes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+
+            self.assertEqual(forbidden_backoff_seconds(config, 0), 60)
+            self.assertEqual(forbidden_backoff_seconds(config, 1), 600)
+            self.assertEqual(forbidden_backoff_seconds(config, 2), 1200)
+            self.assertEqual(forbidden_backoff_seconds(config, 3), 1800)
+            self.assertEqual(forbidden_backoff_seconds(config, 4), 1800)
+
 
 class LoggingTests(unittest.TestCase):
     def test_formats_railway_utc_timestamp_as_korean_time(self):
@@ -1770,6 +1781,31 @@ class WatcherIntegrationTests(unittest.TestCase):
 
             self.assertEqual(result.failed_dates, 1)
             self.assertEqual(result.rate_limited_requests, 1)
+            self.assertEqual(result.schedule_skipped_dates, 2)
+            self.assertEqual(attempted_dates, [dt.date(2026, 8, 26)])
+
+    def test_stops_all_remaining_schedule_requests_after_first_forbidden(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = dataclasses.replace(
+                make_config(Path(temporary)), target_end=dt.date(2026, 8, 28)
+            )
+            logger = logging.getLogger(f"watcher-forbidden-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger, dry_run=True)
+            attempted_dates = []
+
+            def fail_with_forbidden(show_date):
+                attempted_dates.append(show_date)
+                raise FetchError(
+                    "CGV가 자동 조회를 차단했습니다(HTTP 403)."
+                )
+
+            watcher.cgv.fetch_date = fail_with_forbidden
+            result = watcher.run_cycle()
+
+            self.assertEqual(result.failed_dates, 1)
+            self.assertEqual(result.forbidden_requests, 1)
+            self.assertEqual(result.rate_limited_requests, 0)
             self.assertEqual(result.schedule_skipped_dates, 2)
             self.assertEqual(attempted_dates, [dt.date(2026, 8, 26)])
 
