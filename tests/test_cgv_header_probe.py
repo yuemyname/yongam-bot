@@ -1,6 +1,7 @@
 import dataclasses
 import datetime as dt
 import hashlib
+import gzip
 import json
 import logging
 from pathlib import Path
@@ -8,8 +9,11 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 import urllib.parse
+import zlib
 
-from cgv_header_probe import FETCH_METADATA_HEADERS, run_header_probe_once
+from cgv_header_probe import (
+    FETCH_METADATA_HEADERS, SEAT_PUBLIC_HEADERS, _decode_body, run_header_probe_once,
+)
 from test_watcher import make_config
 from watcher import Config, ConfigurationError, StateStore, USER_AGENT, Watcher
 
@@ -57,6 +61,114 @@ class CgvHeaderProbeTests(unittest.TestCase):
     def claim_path(self):
         key = hashlib.sha256(self.config.cgv_header_probe_request_id.encode()).hexdigest()
         return self.config.state_file.parent / "cgv-header-probes" / f"{key}.claim.json"
+
+    def seat_config(self):
+        return dataclasses.replace(
+            self.config, cgv_header_probe_request_id="seat-test-1",
+            cgv_header_probe_date=dt.date(2026, 9, 24),
+            cgv_header_probe_seat_url=(
+                "https://cgv.co.kr/api/v1/booking/searchIfSeatData?"
+                "coCd=A420&siteNo=0013&scnYmd=20260924&scnsNo=018&"
+                "scnSseq=4&seatAreaNo=001&cusgdCd=04&"
+            ),
+        )
+
+    def test_seat_request_uses_exact_anonymous_target_and_public_headers(self):
+        config = self.seat_config()
+        watcher = self.watcher(config)
+        before = config.state_file.read_bytes()
+        with self.assertLogs(self.logger, level="INFO") as logs:
+            self.assertTrue(watcher.run_cycle().cgv_paused)
+        args, kwargs = self.connection.request.call_args
+        parsed = urllib.parse.urlsplit(args[1])
+        self.assertEqual(args[0], "GET")
+        self.assertEqual(parsed.path, "/api/v1/booking/searchIfSeatData")
+        self.assertEqual(dict(urllib.parse.parse_qsl(parsed.query)), {
+            "coCd": "A420", "siteNo": "0013", "scnYmd": "20260924",
+            "scnsNo": "018", "scnSseq": "4", "seatAreaNo": "001", "cusgdCd": "04",
+        })
+        self.assertEqual(kwargs["headers"], {
+            "Accept": "application/json", "Accept-Language": "ko-KR",
+            "Cache-Control": "no-cache", "Pragma": "no-cache",
+            **FETCH_METADATA_HEADERS, **SEAT_PUBLIC_HEADERS,
+        })
+        self.assertFalse({"cookie", "authorization"} & {key.lower() for key in kwargs["headers"]})
+        self.assertEqual(kwargs["headers"]["Referer"], "https://cgv.co.kr/cnm/selectVisitorCnt")
+        self.assertIn("Chrome/153.0.0.0", kwargs["headers"]["User-Agent"])
+        self.assertNotIn("Sec-Fetch-User", kwargs["headers"])
+        self.assertNotIn("Upgrade-Insecure-Requests", kwargs["headers"])
+        output = "\n".join(logs.output)
+        self.assertIn('"probe_kind": "seat"', output)
+        self.assertNotIn('"endpoint": "/api/v1/booking/searchSchByMov"', output)
+        self.assertEqual(config.state_file.read_bytes(), before)
+        self.assertTrue(watcher.run_cycle().cgv_paused)
+        self.assertTrue(self.watcher(config).run_cycle().cgv_paused)
+        self.connection.request.assert_called_once()
+        watcher.cgv.fetch_date.assert_not_called()
+        watcher.cgv.fetch_seat_snapshot.assert_not_called()
+
+    def test_seat_url_rejects_identity_extra_params_duplicates_and_wrong_targets(self):
+        config = self.seat_config()
+        url = config.cgv_header_probe_seat_url.rstrip("&")
+        invalid_urls = (
+            url + "&custNo=123", url + "&custNo=", url + "&token=secret",
+            url + "&scnSseq=5", url.replace("20260924", "20260925"),
+            url.replace("0013", "0014"), url.replace("cgv.co.kr", "example.com"),
+            url.replace("cgv.co.kr", "user:secret@cgv.co.kr"),
+            url.replace("searchIfSeatData", "searchSchByMov"),
+            url.replace("https:", "http:"), url + "#fragment",
+            url.replace("&cusgdCd=04", ""), url.replace("scnSseq=4", "scnSseq=invalid"),
+        )
+        for invalid in invalid_urls:
+            with self.subTest(url=invalid):
+                self.assertTrue(self.watcher(dataclasses.replace(
+                    config, cgv_header_probe_seat_url=invalid
+                )).run_cycle().cgv_paused)
+        self.factory.assert_not_called()
+
+    def test_changing_schedule_probe_to_seat_with_same_id_cannot_rearm(self):
+        self.assertTrue(self.watcher().run_cycle().cgv_paused)
+        config = dataclasses.replace(
+            self.seat_config(), cgv_header_probe_request_id=self.config.cgv_header_probe_request_id
+        )
+        self.assertTrue(self.watcher(config).run_cycle().cgv_paused)
+        self.connection.request.assert_called_once()
+
+    def test_seat_forbidden_response_is_reported_without_retry(self):
+        config = self.seat_config()
+        self.response.status = 403
+        self.response.read.return_value = b"<html>cloudflare</html>"
+        report = run_header_probe_once(config, self.logger, user_agent=USER_AGENT)
+        self.assertEqual(report["http_status"], 403)
+        self.assertTrue(report["block_page_marker"])
+        self.assertFalse(report["api_response_valid"])
+        self.assertNotIn("schedule_response_valid", report)
+        run_header_probe_once(config, self.logger, user_agent=USER_AGENT)
+        self.connection.request.assert_called_once()
+
+    def test_seat_gzip_response_is_decoded_before_json_check(self):
+        self.response.read.return_value = gzip.compress(b'{"statusCode":0,"data":{}}')
+        self.response.getheader.side_effect = lambda key, default="": {
+            "Content-Type": "application/json", "Content-Encoding": "gzip",
+        }.get(key, default)
+        report = run_header_probe_once(self.seat_config(), self.logger, user_agent=USER_AGENT)
+        self.assertTrue(report["api_response_valid"])
+        self.assertEqual(report["probe_kind"], "seat")
+        self.assertEqual(report["content_encoding"], "gzip")
+
+    def test_standard_and_raw_deflate_are_supported(self):
+        body = b'{"statusCode":0,"data":[]}'
+        self.assertEqual(_decode_body(zlib.compress(body), "deflate"), body)
+        raw = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+        self.assertEqual(_decode_body(raw.compress(body) + raw.flush(), "deflate"), body)
+
+    def test_compressed_response_size_limit_is_enforced(self):
+        with patch("cgv_header_probe.MAX_RESPONSE_BYTES", 1000):
+            for encoding, compressor in (("gzip", gzip.compress), ("deflate", zlib.compress)):
+                with self.subTest(encoding=encoding), self.assertRaises(ValueError):
+                    _decode_body(compressor(b"x" * 1001), encoding)
+        with self.assertRaises(ValueError):
+            _decode_body(b"unsupported", "br")
 
     def test_success_has_exact_headers_and_durable_claim_but_never_resumes(self):
         def check_claim(*args, **kwargs):

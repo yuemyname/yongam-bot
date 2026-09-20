@@ -485,6 +485,7 @@ class Config:
     cgv_recovery_pause_seconds: int = CGV_RECOVERY_PAUSE_SECONDS
     cgv_header_probe_request_id: str = ""
     cgv_header_probe_date: dt.date | None = None
+    cgv_header_probe_seat_url: str = ""
 
     @classmethod
     def from_env_file(
@@ -613,6 +614,7 @@ class Config:
             cgv_recovery_request_id=value("CGV_RECOVERY_REQUEST_ID"),
             cgv_header_probe_request_id=header_probe_id,
             cgv_header_probe_date=header_probe_date,
+            cgv_header_probe_seat_url=value("CGV_HEADER_PROBE_SEAT_URL"),
             cgv_recovery_pause_seconds=_parse_int(
                 value("CGV_RECOVERY_PAUSE_SECONDS", str(CGV_RECOVERY_PAUSE_SECONDS)),
                 name="CGV_RECOVERY_PAUSE_SECONDS",

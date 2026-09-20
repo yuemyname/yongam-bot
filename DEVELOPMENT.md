@@ -136,6 +136,16 @@ Railway Variables의 `CGV_RECOVERY_REQUEST_ID`에 새로운 고유 이름(예: `
 `Sec-Fetch-Site: same-origin` 세 헤더만 추가한 일정 요청 1건을 보냅니다.
 개인 회원번호·로그인 쿠키는 사용하지 않으며 재시도·리디렉션 추적도 하지 않습니다.
 
+**좌석 API를 검사할 때는** `CGV_HEADER_PROBE_SEAT_URL`에 인증정보를 제외한
+`https://cgv.co.kr/api/v1/booking/searchIfSeatData?...` URL을 추가로 설정합니다.
+허용 파라미터는 coCd, siteNo, scnYmd, scnsNo, scnSseq, seatAreaNo, cusgdCd뿐이며,
+회원번호·토큰·중복 파라미터와 다른 호스트/경로는 거부합니다. 영화관·날짜는 설정과 같아야 합니다.
+좌석 모드는 Referer를 인원 선택 페이지로, User-Agent와 Sec-CH-UA 계열을 캡처의 Chrome 153으로
+맞추고 Priority와 위 Sec-Fetch 헤더를 보냅니다. Authorization·Cookie·custNo는 보내지 않습니다.
+압축은 표준 라이브러리로 해제 가능한 gzip/deflate만 요청하고, 전송은 HTTP/1.1입니다.
+브라우저 HTTP/2 연결 전체나 인증 세션을 재현하는 기능은 아닙니다.
+로그의 endpoint·probe_kind·query로 **일정과 좌석 검사를 구분**할 수 있습니다.
+
 - **성공해도 자동 조회를 재개하지 않습니다.** 중단 상태는 기존 상태 파일에 유지됩니다.
 - 실행 전 볼륨의 `cgv-header-probes/`에 ID별 실행 기록을 배타적으로 생성하고 디스크에 동기화합니다.
   재시작·중복 배포·응답 전 종료 후에도 같은 ID를 다시 실행하지 않습니다. 기록을 삭제하지 마세요.
@@ -165,6 +175,7 @@ Mac이 잠자기 상태이거나 덮개가 닫혀 있으면 감시가 중단될 
 | `CGV_RECOVERY_PAUSE_SECONDS` | `3600` | 새 재확인 요청의 대기 시간(초). 운영자가 즉시 재확인을 승인한 경우만 0 사용 |
 | `CGV_HEADER_PROBE_REQUEST_ID` | 빈 값 | 운영자 승인 헤더 단일 진단 ID. 성공해도 자동 조회 중단 유지 |
 | `CGV_HEADER_PROBE_DATE` | 빈 값 | 헤더 진단의 명시적 상영일(YYYY-MM-DD) |
+| `CGV_HEADER_PROBE_SEAT_URL` | 빈 값 | 익명 좌석 API 단일 검사 URL. 비어 있으면 일정 API 검사 |
 | `TELEGRAM_COMMAND_POLL_SECONDS` | `2` | CGV 조회 중·대기 중 Telegram 명령 확인 주기 |
 | `CGV_REQUEST_SPACING_SECONDS` | `2` | 연속 CGV 요청 사이의 최소 간격 |
 | `RATE_LIMIT_BACKOFF_INITIAL_SECONDS` | `1800` | HTTP 429 발생 후 첫 대기 시간(30분) |
