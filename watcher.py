@@ -480,6 +480,7 @@ class Config:
     state_file: Path
     log_file: Path
     cgv_recovery_request_id: str = ""
+    cgv_recovery_pause_seconds: int = CGV_RECOVERY_PAUSE_SECONDS
 
     @classmethod
     def from_env_file(
@@ -597,6 +598,12 @@ class Config:
                 maximum=86400,
             ),
             cgv_recovery_request_id=value("CGV_RECOVERY_REQUEST_ID"),
+            cgv_recovery_pause_seconds=_parse_int(
+                value("CGV_RECOVERY_PAUSE_SECONDS", str(CGV_RECOVERY_PAUSE_SECONDS)),
+                name="CGV_RECOVERY_PAUSE_SECONDS",
+                minimum=0,
+                maximum=86400,
+            ),
             telegram_command_poll_seconds=_parse_int(
                 value("TELEGRAM_COMMAND_POLL_SECONDS", "2"),
                 name="TELEGRAM_COMMAND_POLL_SECONDS",
@@ -2787,8 +2794,9 @@ class Watcher:
                 "request_id": request_id,
                 "status": "cooldown",
                 "started_at": now.isoformat(),
+                "pause_seconds": config.cgv_recovery_pause_seconds,
                 "probe_at": (
-                    now + dt.timedelta(seconds=CGV_RECOVERY_PAUSE_SECONDS)
+                    now + dt.timedelta(seconds=config.cgv_recovery_pause_seconds)
                 ).isoformat(),
             })
 
@@ -2810,8 +2818,14 @@ class Watcher:
                 )
             except (KeyError, TypeError, ValueError):
                 return "⏸ CGV 조회 중단: 재확인 시각 오류, 운영자 확인 필요"
+            pause_seconds = record.get("pause_seconds", CGV_RECOVERY_PAUSE_SECONDS)
+            heading = "⏸ CGV 조회 중단 — 단일 재확인 대기"
+            if pause_seconds == 0:
+                heading = "🔎 CGV 즉시 단일 재확인 (운영자 승인)"
+            elif pause_seconds == CGV_RECOVERY_PAUSE_SECONDS:
+                heading = "⏸ CGV 조회 1시간 중단"
             return (
-                "⏸ CGV 조회 1시간 중단\n"
+                f"{heading}\n"
                 f"재확인 예정: {label}\n"
                 "일정 요청 1건만 확인하며, 실패하면 자동 조회를 중단합니다."
             )

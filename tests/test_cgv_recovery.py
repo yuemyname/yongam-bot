@@ -7,7 +7,10 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from watcher import CgvClient, Config, CycleResult, FetchError, Watcher, main
+from watcher import (
+    CgvClient, Config, ConfigurationError, CycleResult, FetchError,
+    StateStore, Watcher, main,
+)
 from test_watcher import make_config, _kst
 
 
@@ -87,6 +90,72 @@ class CgvRecoveryTests(unittest.TestCase):
         )
         self.assertTrue(restarted.run_cycle().cgv_paused)
         restarted.cgv.fetch_date.assert_not_called()
+
+    def test_new_immediate_probe_is_claimed_before_request_and_never_repeated(self):
+        self.watcher._halt_cgv_recovery("HTTP 403")
+        config = dataclasses.replace(
+            self.config, cgv_recovery_request_id="approved-immediate-1",
+            cgv_recovery_pause_seconds=0,
+        )
+        watcher = self.restart(config)
+        self.assertEqual(
+            dt.datetime.fromisoformat(watcher.state.cgv_recovery()["probe_at"]), self.now
+        )
+        self.assertIn("즉시 단일 재확인", watcher.cgv_recovery_status_text())
+
+        def forbidden(show_date, *, single_attempt):
+            saved = StateStore(config.state_file)
+            saved.load()
+            self.assertEqual(saved.cgv_recovery()["status"], "probing")
+            self.assertTrue(single_attempt)
+            raise FetchError("HTTP 403")
+
+        watcher.cgv.fetch_date.side_effect = forbidden
+        self.assertTrue(watcher.run_cycle().cgv_paused)
+        self.assertTrue(watcher.run_cycle().cgv_paused)
+        watcher.cgv.fetch_date.assert_called_once_with(config.target_start, single_attempt=True)
+        restarted = self.restart(config)
+        self.assertTrue(restarted.run_cycle().cgv_paused)
+        restarted.cgv.fetch_date.assert_not_called()
+
+    def test_pause_change_alone_cannot_shorten_deadline_or_lift_halt(self):
+        deadline = self.watcher.state.cgv_recovery()["probe_at"]
+        config = dataclasses.replace(self.config, cgv_recovery_pause_seconds=0)
+        watcher = self.restart(config)
+        self.assertEqual(watcher.state.cgv_recovery()["probe_at"], deadline)
+        self.assertTrue(watcher.run_cycle().cgv_paused)
+        watcher.cgv.fetch_date.assert_not_called()
+        watcher._halt_cgv_recovery("HTTP 403")
+        restarted = self.restart(config)
+        self.assertTrue(restarted.run_cycle().cgv_paused)
+        restarted.cgv.fetch_date.assert_not_called()
+
+    def test_successful_immediate_probe_resumes_without_refetching(self):
+        config = dataclasses.replace(
+            self.config, cgv_recovery_request_id="approved-immediate-success",
+            cgv_recovery_pause_seconds=0,
+        )
+        watcher = self.restart(config)
+        watcher.cgv.fetch_date.return_value = {"statusCode": 0, "data": []}
+        result = watcher.run_cycle()
+        self.assertFalse(result.cgv_paused)
+        self.assertEqual(result.successful_dates, 1)
+        watcher.cgv.fetch_date.assert_called_once_with(config.target_start, single_attempt=True)
+        # Restoring the safe default must not reset a completed request.
+        restarted = self.restart(dataclasses.replace(config, cgv_recovery_pause_seconds=3600))
+        restarted.cgv.fetch_date.return_value = {"statusCode": 0, "data": []}
+        self.assertEqual(restarted.run_cycle().successful_dates, 1)
+        restarted.cgv.fetch_date.assert_called_once_with(config.target_start)
+
+    def test_config_accepts_zero_wait_but_rejects_invalid_wait(self):
+        with patch.dict("os.environ", {"CGV_RECOVERY_PAUSE_SECONDS": "0"}):
+            self.assertEqual(make_config(self.config.project_dir).cgv_recovery_pause_seconds, 0)
+        for invalid in ("-1", "86401", "invalid"):
+            with self.subTest(value=invalid), patch.dict(
+                "os.environ", {"CGV_RECOVERY_PAUSE_SECONDS": invalid}
+            ):
+                with self.assertRaises(ConfigurationError):
+                    make_config(self.config.project_dir)
 
     def test_successful_empty_schedule_is_reused_and_scanning_resumes(self):
         self.due()
