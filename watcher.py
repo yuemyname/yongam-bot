@@ -31,6 +31,8 @@ import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from cgv_header_probe import run_header_probe_once
+
 
 APP_NAME = "CGV Telegram Watcher"
 DEFAULT_API_URL = "https://cgv.co.kr/api/v1/booking/searchSchByMov"
@@ -481,6 +483,8 @@ class Config:
     log_file: Path
     cgv_recovery_request_id: str = ""
     cgv_recovery_pause_seconds: int = CGV_RECOVERY_PAUSE_SECONDS
+    cgv_header_probe_request_id: str = ""
+    cgv_header_probe_date: dt.date | None = None
 
     @classmethod
     def from_env_file(
@@ -573,6 +577,15 @@ class Config:
         )
         log_file = resolved_path(value("LOG_FILE"), log_dir / "watcher.log")
 
+        header_probe_id = value("CGV_HEADER_PROBE_REQUEST_ID")
+        header_probe_date = None
+        if header_probe_id:
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", header_probe_id):
+                raise ConfigurationError("CGV_HEADER_PROBE_REQUEST_ID 형식이 올바르지 않습니다.")
+            header_probe_date = _parse_date(
+                value("CGV_HEADER_PROBE_DATE"), name="CGV_HEADER_PROBE_DATE"
+            )
+
         return cls(
             project_dir=project_dir,
             telegram_bot_token=token,
@@ -598,6 +611,8 @@ class Config:
                 maximum=86400,
             ),
             cgv_recovery_request_id=value("CGV_RECOVERY_REQUEST_ID"),
+            cgv_header_probe_request_id=header_probe_id,
+            cgv_header_probe_date=header_probe_date,
             cgv_recovery_pause_seconds=_parse_int(
                 value("CGV_RECOVERY_PAUSE_SECONDS", str(CGV_RECOVERY_PAUSE_SECONDS)),
                 name="CGV_RECOVERY_PAUSE_SECONDS",
@@ -2782,6 +2797,7 @@ class Watcher:
         self._forwarded_at: dict[str, list[dt.datetime]] = {}
         self._recent_senders: dict[str, str] = {}
         self._recovery_payloads: dict[dt.date, Any] = {}
+        self._header_probe_checked = False
         self.state.load()
         if not self.state.subscribers_initialized:
             self.state.initialize_subscribers(config.telegram_chat_id)
@@ -2869,6 +2885,31 @@ class Watcher:
 
     def _cgv_recovery_blocks_scan(self) -> bool:
         """Persist an at-most-once probe; never repeat an ambiguous attempt."""
+
+        if self.config.cgv_header_probe_request_id:
+            # A diagnostic is NOT a recovery attempt: even HTTP 200 must never
+            # resume scans. Persist the existing halt before doing any I/O.
+            if self.state.cgv_recovery().get("status") != "halted":
+                record = self.state.cgv_recovery()
+                record.update(
+                    status="halted",
+                    reason="헤더 단일 진단 모드: 결과와 관계없이 자동 조회 중단 유지",
+                    finished_at=self.config.local_now().isoformat(),
+                )
+                self._save_cgv_recovery(record)
+            if not self.dry_run and not self._header_probe_checked:
+                self._header_probe_checked = True
+                try:
+                    run_header_probe_once(self.config, self.logger, user_agent=USER_AGENT)
+                except Exception as exc:
+                    # No exception text: URLs, response bodies or credentials
+                    # must not leak into logs. Do not retry after ambiguity.
+                    self.logger.error(
+                        "CGV_HEADER_PROBE_ERROR type=%s; 자동 조회 중단 유지",
+                        type(exc).__name__,
+                    )
+            self._announce_cgv_recovery()
+            return True
 
         record = self.state.cgv_recovery()
         if not record or record.get("status") == "recovered":

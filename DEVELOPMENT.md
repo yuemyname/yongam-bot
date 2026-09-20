@@ -128,6 +128,24 @@ Railway Variables의 `CGV_RECOVERY_REQUEST_ID`에 새로운 고유 이름(예: `
 
 중단 중에는 새 예매 오픈·취소표를 감지할 수 없습니다. 복귀 시 기존 조회 범위를 다시 확인하지만 중단 중 나타났다 사라진 정보까지 복구할 수는 없습니다. 1시간 휴식이 CGV의 차단 해제를 보장하지는 않습니다.
 
+### 자동 조회를 재개하지 않는 헤더 단일 진단
+
+운영자가 진단 1건을 명시적으로 승인한 경우에만 `CGV_HEADER_PROBE_REQUEST_ID`에 고유 ID,
+`CGV_HEADER_PROBE_DATE`에 비교할 날짜(`YYYY-MM-DD`)를 함께 설정해 배포합니다.
+일반 요청과 달리 `Sec-Fetch-Dest: empty`, `Sec-Fetch-Mode: cors`,
+`Sec-Fetch-Site: same-origin` 세 헤더만 추가한 일정 요청 1건을 보냅니다.
+개인 회원번호·로그인 쿠키는 사용하지 않으며 재시도·리디렉션 추적도 하지 않습니다.
+
+- **성공해도 자동 조회를 재개하지 않습니다.** 중단 상태는 기존 상태 파일에 유지됩니다.
+- 실행 전 볼륨의 `cgv-header-probes/`에 ID별 실행 기록을 배타적으로 생성하고 디스크에 동기화합니다.
+  재시작·중복 배포·응답 전 종료 후에도 같은 ID를 다시 실행하지 않습니다. 기록을 삭제하지 마세요.
+- 로그의 CGV_HEADER_PROBE_BEGIN(시작), CGV_HEADER_PROBE_RESULT(결과)로 실행 여부를 확인합니다.
+  응답 본문·쿠키·로그인 토큰은 저장하지 않고 HTTP 상태, JSON 성공 여부, 소요 시간 등만 남깁니다.
+- 구독자·중복 방지·미조회 날짜·알림 대기열은 진단 결과로 변경하지 않습니다.
+  Telegram 명령과 기존 발송 작업자는 계속 동작합니다.
+- 진단 변수를 제거해도 중단은 풀리지 않습니다. 정상 복귀는 별도의 운영자 승인이 필요합니다.
+- 정상 봇 요청의 헤더는 변경하지 않습니다. 단일 성공은 전체 조회나 장시간 운영의 성공을 보장하지 않습니다.
+
 ## Mac에서 직접 실행
 
 1. `setup.command`를 실행해 `.env`를 만듭니다.
@@ -145,6 +163,8 @@ Mac이 잠자기 상태이거나 덮개가 닫혀 있으면 감시가 중단될 
 | `POLL_INTERVAL_SECONDS` | `120` | 정상 조회 주기 및 재확인 모드 미사용 시 HTTP 403 재시도 간격 |
 | `CGV_RECOVERY_REQUEST_ID` | 빈 값 | 운영자 승인 단일 재확인 요청 이름: 1시간 중단 → 1건 확인 → 성공 시 복귀, 실패 시 중단 |
 | `CGV_RECOVERY_PAUSE_SECONDS` | `3600` | 새 재확인 요청의 대기 시간(초). 운영자가 즉시 재확인을 승인한 경우만 0 사용 |
+| `CGV_HEADER_PROBE_REQUEST_ID` | 빈 값 | 운영자 승인 헤더 단일 진단 ID. 성공해도 자동 조회 중단 유지 |
+| `CGV_HEADER_PROBE_DATE` | 빈 값 | 헤더 진단의 명시적 상영일(YYYY-MM-DD) |
 | `TELEGRAM_COMMAND_POLL_SECONDS` | `2` | CGV 조회 중·대기 중 Telegram 명령 확인 주기 |
 | `CGV_REQUEST_SPACING_SECONDS` | `2` | 연속 CGV 요청 사이의 최소 간격 |
 | `RATE_LIMIT_BACKOFF_INITIAL_SECONDS` | `1800` | HTTP 429 발생 후 첫 대기 시간(30분) |
