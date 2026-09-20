@@ -46,6 +46,7 @@ DEFAULT_TELEGRAM_BROADCAST_WORKERS = 16
 DEFAULT_TELEGRAM_BROADCAST_RATE_PER_SECOND = 25
 # Ceiling for the command-poll backoff while Telegram is unreachable.
 TELEGRAM_POLL_BACKOFF_MAX_SECONDS = 60
+CGV_RECOVERY_PAUSE_SECONDS = 3600
 # Printed once per cycle so a long log can be read cycle by cycle.
 CYCLE_SEPARATOR = "─" * 60
 # Telegram descriptions that mean the chat is permanently unreachable.
@@ -478,6 +479,7 @@ class Config:
     error_alert_cooldown_seconds: int
     state_file: Path
     log_file: Path
+    cgv_recovery_request_id: str = ""
 
     @classmethod
     def from_env_file(
@@ -594,6 +596,7 @@ class Config:
                 minimum=30,
                 maximum=86400,
             ),
+            cgv_recovery_request_id=value("CGV_RECOVERY_REQUEST_ID"),
             telegram_command_poll_seconds=_parse_int(
                 value("TELEGRAM_COMMAND_POLL_SECONDS", "2"),
                 name="TELEGRAM_COMMAND_POLL_SECONDS",
@@ -1256,12 +1259,12 @@ class CgvClient:
                 pass
 
     def _request(
-        self, url: str, *, headers: Mapping[str, str]
+        self, url: str, *, headers: Mapping[str, str], attempts: int = 2
     ) -> tuple[int, bytes, str, str]:
         parsed = urllib.parse.urlsplit(url)
         target = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
         last_error: Exception | None = None
-        for attempt in range(2):
+        for attempt in range(attempts):
             connection = self._connection_for(url)
             try:
                 connection.request("GET", target, headers=dict(headers))
@@ -1276,12 +1279,14 @@ class CgvClient:
             except (http.client.HTTPException, TimeoutError, OSError) as exc:
                 last_error = exc
                 self._drop_connection(url)
-                if attempt == 0:
+                if attempt + 1 < attempts:
                     continue
         assert last_error is not None
         raise last_error
 
-    def _get_json(self, url: str, *, referer: str) -> Any:
+    def _get_json(
+        self, url: str, *, referer: str, single_attempt: bool = False
+    ) -> Any:
         headers = {
             "Accept": "application/json",
             "Accept-Language": "ko-KR",
@@ -1295,10 +1300,14 @@ class CgvClient:
         try:
             for redirect_count in range(4):
                 status, body, content_type, location = self._request(
-                    current_url, headers=headers
+                    current_url, headers=headers, attempts=1 if single_attempt else 2
                 )
                 if status not in {301, 302, 303, 307, 308}:
                     break
+                if single_attempt:
+                    raise FetchError(
+                        f"CGV 단일 재확인 응답이 리디렉션입니다(HTTP {status})."
+                    )
                 if redirect_count == 3 or not location:
                     raise FetchError("CGV API 주소 전환이 너무 많습니다.")
                 current_url = urllib.parse.urljoin(current_url, location)
@@ -1333,7 +1342,9 @@ class CgvClient:
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise FetchError("CGV 응답을 JSON으로 해석할 수 없습니다.") from exc
 
-    def fetch_date(self, show_date: dt.date) -> Any:
+    def fetch_date(
+        self, show_date: dt.date, *, single_attempt: bool = False
+    ) -> Any:
         query = urllib.parse.urlencode(
             {
                 "coCd": self.config.company_code,
@@ -1344,7 +1355,9 @@ class CgvClient:
             }
         )
         url = f"{self.config.api_url}?{query}"
-        return self._get_json(url, referer=self.config.booking_url)
+        return self._get_json(
+            url, referer=self.config.booking_url, single_attempt=single_attempt
+        )
 
     def fetch_seat_snapshot(self, session: BookingSession) -> SeatSnapshot:
         if session.remaining_seats is None:
@@ -1519,6 +1532,7 @@ class StateStore:
             "pending_deliveries": {},
             "last_error_fingerprint": "",
             "last_error_notified_at": "",
+            "cgv_recovery": {},
         }
 
     def load(self) -> None:
@@ -1543,6 +1557,8 @@ class StateStore:
                 raise RuntimeError(f"일정 재조회 상태 파일 형식이 올바르지 않습니다: {self.path}")
             if not isinstance(loaded.get("pending_deliveries", {}), dict):
                 raise RuntimeError(f"재전송 상태 파일 형식이 올바르지 않습니다: {self.path}")
+            if not isinstance(loaded.get("cgv_recovery", {}), dict):
+                raise RuntimeError(f"CGV 재확인 상태 파일 형식이 올바르지 않습니다: {self.path}")
             self.data.update(loaded)
             self.data["version"] = STATE_VERSION
             self.data.setdefault("seat_counts", {})
@@ -1554,6 +1570,14 @@ class StateStore:
             self.data.setdefault("deferred", {})
             self.data.setdefault("seat_alerts", {})
             self.data.setdefault("pending_deliveries", {})
+
+    def cgv_recovery(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self.data.get("cgv_recovery", {}))
+
+    def set_cgv_recovery(self, record: Mapping[str, Any]) -> None:
+        with self._lock:
+            self.data["cgv_recovery"] = dict(record)
 
     def was_notified(self, key: str) -> bool:
         with self._lock:
@@ -2635,6 +2659,7 @@ class CycleResult:
     full_scan: bool = True
     suppressed_closed: int = 0
     deferred_rechecks_skipped: int = 0
+    cgv_paused: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2749,11 +2774,144 @@ class Watcher:
         self._notice_draft: tuple[str, dt.datetime] | None = None
         self._forwarded_at: dict[str, list[dt.datetime]] = {}
         self._recent_senders: dict[str, str] = {}
+        self._recovery_payloads: dict[dt.date, Any] = {}
         self.state.load()
         if not self.state.subscribers_initialized:
             self.state.initialize_subscribers(config.telegram_chat_id)
             if not self.dry_run:
                 self.state.save()
+        request_id = config.cgv_recovery_request_id
+        if request_id and self.state.cgv_recovery().get("request_id") != request_id:
+            now = config.local_now()
+            self._save_cgv_recovery({
+                "request_id": request_id,
+                "status": "cooldown",
+                "started_at": now.isoformat(),
+                "probe_at": (
+                    now + dt.timedelta(seconds=CGV_RECOVERY_PAUSE_SECONDS)
+                ).isoformat(),
+            })
+
+    def _save_cgv_recovery(self, record: Mapping[str, Any]) -> None:
+        self.state.set_cgv_recovery(record)
+        if not self.dry_run:
+            self.state.save()
+
+    def cgv_recovery_status_text(self) -> str:
+        record = self.state.cgv_recovery()
+        status = record.get("status")
+        if status == "cooldown":
+            try:
+                probe_at = dt.datetime.fromisoformat(record["probe_at"])
+                if probe_at.tzinfo is None:
+                    raise ValueError("missing timezone")
+                label = probe_at.astimezone(ZoneInfo(self.config.timezone_name)).strftime(
+                    "%Y-%m-%d %H:%M:%S %Z"
+                )
+            except (KeyError, TypeError, ValueError):
+                return "⏸ CGV 조회 중단: 재확인 시각 오류, 운영자 확인 필요"
+            return (
+                "⏸ CGV 조회 1시간 중단\n"
+                f"재확인 예정: {label}\n"
+                "일정 요청 1건만 확인하며, 실패하면 자동 조회를 중단합니다."
+            )
+        if status == "probing":
+            return "🔎 CGV 일정 요청 1건 재확인 중"
+        if status == "halted":
+            return (
+                "⛔ CGV 자동 조회 중단 — 운영자 확인 필요\n"
+                f"원인: {record.get('reason', '재확인 실패')}\n"
+                "자동 재시도하지 않습니다. 현재 새 예매·좌석 알림을 감지할 수 없습니다."
+            )
+        if status == "recovered":
+            return f"✅ CGV 재확인 성공 — {self.config.poll_interval_seconds}초 조회로 복귀"
+        return ""
+
+    def _announce_cgv_recovery(self) -> None:
+        record = self.state.cgv_recovery()
+        status = record.get("status")
+        if self.dry_run or record.get("announced_status") == status:
+            return
+        text = self.cgv_recovery_status_text()
+        if not text:
+            return
+        self.logger.warning("%s", text.replace("\n", " | "))
+        self._broadcast_message(
+            text + "\nTelegram 명령과 기존 발송 대기열은 계속 처리합니다.",
+            category=ALERT_SYSTEM,
+            recipients=self._operator_recipients(),
+        )
+        record["announced_status"] = status
+        self._save_cgv_recovery(record)
+
+    def _halt_cgv_recovery(self, reason: str) -> None:
+        record = self.state.cgv_recovery()
+        record.update(
+            status="halted", reason=reason,
+            finished_at=self.config.local_now().isoformat(),
+        )
+        self._save_cgv_recovery(record)
+        self._announce_cgv_recovery()
+
+    def _cgv_recovery_blocks_scan(self) -> bool:
+        """Persist an at-most-once probe; never repeat an ambiguous attempt."""
+
+        record = self.state.cgv_recovery()
+        if not record or record.get("status") == "recovered":
+            return False
+        status = record.get("status")
+        if status == "halted":
+            self._announce_cgv_recovery()
+            return True
+        if status != "cooldown":
+            # A crash after the claim may have happened before or after sending.
+            self._halt_cgv_recovery("재확인 실행 상태가 불확실하여 추가 요청을 중단했습니다.")
+            return True
+        try:
+            probe_at = dt.datetime.fromisoformat(record["probe_at"])
+            if probe_at.tzinfo is None:
+                raise ValueError("missing timezone")
+        except (KeyError, TypeError, ValueError):
+            self._halt_cgv_recovery("재확인 예정 시각을 읽을 수 없습니다.")
+            return True
+        self._announce_cgv_recovery()
+        if self.dry_run or self.config.local_now() < probe_at:
+            return True
+
+        # Claim and fsync BEFORE making any network request. Restarting must
+        # neither shorten the pause nor give us a second probe.
+        record = self.state.cgv_recovery()
+        record.update(status="probing", probe_started_at=self.config.local_now().isoformat())
+        self._save_cgv_recovery(record)
+        try:
+            plan = self._plan_scan(self.config.local_today())
+            if not plan.dates:
+                raise FetchError("재확인할 상영일이 없습니다.")
+            show_date = plan.dates[0]
+            self.logger.info("CGV 단일 재확인 시작: %s (재시도·리디렉션 없음)", show_date)
+            self._wait_for_cgv_request_slot()
+            try:
+                payload = self.cgv.fetch_date(show_date, single_attempt=True)
+            finally:
+                self._mark_cgv_request_finished()
+            if (
+                not isinstance(payload, dict)
+                or str(payload.get("statusCode")) != "0"
+                or not isinstance(payload.get("data"), (dict, list))
+            ):
+                raise FetchError("CGV 정상 일정 응답(statusCode=0, data)을 확인하지 못했습니다.")
+        except Exception as exc:
+            reason = str(exc) if isinstance(exc, FetchError) else type(exc).__name__
+            self._halt_cgv_recovery(reason)
+            return True
+
+        record.update(status="recovered", finished_at=self.config.local_now().isoformat())
+        self._save_cgv_recovery(record)
+        # Process a successful probe in the normal alert pipeline without
+        # refetching or marking newly opened showings as already notified.
+        self._recovery_payloads[show_date] = payload
+        self._announce_cgv_recovery()
+        return False
 
     def _delivery_worker_running(self) -> bool:
         worker = self._delivery_thread
@@ -3851,6 +4009,9 @@ class Watcher:
                         "🔕 현재 구독 중이 아닙니다. "
                         "알림을 받으려면 /start를 보내주세요."
                     )
+                recovery_status = self.cgv_recovery_status_text()
+                if recovery_status:
+                    reply += f"\n\n{recovery_status}"
             elif command in MODE_COMMANDS:
                 reply, mode_changed = self._handle_mode_command(
                     chat_id, command, argument
@@ -4059,9 +4220,14 @@ class Watcher:
                 break
 
             payload = None
-            self._wait_for_cgv_request_slot()
+            prefetched = show_date in self._recovery_payloads
+            if not prefetched:
+                self._wait_for_cgv_request_slot()
             try:
-                payload = self.cgv.fetch_date(show_date)
+                payload = (
+                    self._recovery_payloads.pop(show_date)
+                    if prefetched else self.cgv.fetch_date(show_date)
+                )
             except FetchError as exc:
                 message = str(exc)
                 errors[show_date] = message
@@ -4094,7 +4260,8 @@ class Watcher:
                         self.state.note_schedule_failure(show_date) or tally.dirty
                     )
             finally:
-                self._mark_cgv_request_finished()
+                if not prefetched:
+                    self._mark_cgv_request_finished()
 
             if payload is None:
                 self._flush_state(tally)
@@ -4569,6 +4736,8 @@ class Watcher:
         self._record_verdicts(tally, sessions, verdicts, session_keys, snapshots)
 
     def run_cycle(self) -> CycleResult:
+        if self._cgv_recovery_blocks_scan():
+            return CycleResult(0, 0, 0, 0, cgv_paused=True)
         # Snapshot before sending anything this cycle. A fresh failure should
         # wait until the next cycle instead of being retried immediately.
         pending_retries = (
@@ -4653,6 +4822,13 @@ class Watcher:
                 tally.seat_detail_error_sample,
             )
 
+        cgv_paused = (
+            tally.forbidden_requests > 0
+            and self.state.cgv_recovery().get("status") == "recovered"
+        )
+        if cgv_paused:
+            self._halt_cgv_recovery("재확인 성공 후 정상 조회에서 HTTP 403이 다시 발생했습니다.")
+
         if errors:
             unique_errors = sorted(set(errors.values()))
             fingerprint_source = "\n".join(unique_errors)
@@ -4669,6 +4845,7 @@ class Watcher:
             )
             if (
                 not self.dry_run
+                and not cgv_paused
                 and self.state.should_notify_error(
                     fingerprint, self.config.error_alert_cooldown_seconds
                 )
@@ -4751,6 +4928,7 @@ class Watcher:
             full_scan=plan.full_scan,
             suppressed_closed=tally.suppressed_closed,
             deferred_rechecks_skipped=tally.deferred_rechecks_skipped,
+            cgv_paused=cgv_paused,
         )
 
 
@@ -5007,7 +5185,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             break
         started = time.monotonic()
         result = watcher.run_cycle()
-        if result.forbidden_requests:
+        if result.cgv_paused:
+            # The durable recovery gate controls whether any CGV request is
+            # allowed. Telegram command/sender threads keep running meanwhile.
+            next_interval = 1
+        elif result.forbidden_requests:
             consecutive_forbidden_cycles += 1
             consecutive_rate_limit_cycles = 0
             next_interval = config.poll_interval_seconds
@@ -5047,7 +5229,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             consecutive_rate_limit_cycles = 0
             next_interval = config.poll_interval_seconds
         elapsed = time.monotonic() - started
-        if result.forbidden_requests or result.rate_limited_requests:
+        if result.cgv_paused or result.forbidden_requests or result.rate_limited_requests:
             # The log promises a cooldown after the block response, not merely
             # a start-to-start interval that includes time already spent.
             sleep_seconds = float(next_interval)
