@@ -500,6 +500,7 @@ class Config:
     cgv_header_probe_date: dt.date | None = None
     cgv_header_probe_seat_url: str = ""
     new_subscriptions_enabled: bool = True
+    open_only_mode: bool = False
 
     @classmethod
     def from_env_file(
@@ -592,7 +593,12 @@ class Config:
         )
         log_file = resolved_path(value("LOG_FILE"), log_dir / "watcher.log")
 
+        open_only_mode = _parse_bool(
+            value("OPEN_ONLY_MODE", "false"), name="OPEN_ONLY_MODE"
+        )
         header_probe_id = value("CGV_HEADER_PROBE_REQUEST_ID")
+        if open_only_mode and header_probe_id and value("CGV_HEADER_PROBE_SEAT_URL"):
+            raise ConfigurationError("신규 오픈 전용 모드에서는 좌석 API 진단을 실행할 수 없습니다.")
         header_probe_date = None
         if header_probe_id:
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", header_probe_id):
@@ -603,6 +609,7 @@ class Config:
 
         return cls(
             project_dir=project_dir,
+            open_only_mode=open_only_mode,
             telegram_bot_token=token,
             telegram_chat_id=chat_id,
             api_url=value("CGV_API_URL", DEFAULT_API_URL),
@@ -1419,6 +1426,8 @@ class CgvClient:
         )
 
     def fetch_seat_snapshot(self, session: BookingSession) -> SeatSnapshot:
+        if self.config.open_only_mode:
+            raise FetchError("신규 오픈 전용 모드에서는 좌석 API를 호출하지 않습니다.")
         if session.remaining_seats is None:
             raise FetchError("상영 일정 응답에 잔여 좌석 수가 없습니다.")
         if not session.screen_no or not session.screen_sequence:
@@ -2400,13 +2409,14 @@ def _seat_ratio(session: BookingSession, *, remaining: int | None = None) -> str
 
 
 def _alert_session_line(
-    session: BookingSession, *, seat_detail_unclassified: bool = False
+    session: BookingSession, *, seat_detail_unclassified: bool = False,
+    open_only_mode: bool = False,
 ) -> str:
     line = f"• 상영 시작시간 {session.start_time} — {_seat_ratio(session)}"
     if session.remaining_seats == 0:
         # Announced anyway, but say so plainly rather than sending someone to
         # a booking page with nothing on it.
-        line += " (매진 · 취소표 나오면 알림)"
+        line += " (매진)" if open_only_mode else " (매진 · 취소표 나오면 알림)"
     if seat_detail_unclassified:
         line += " ⚠️ A열 여부 미확인 · 전체 잔여 수 기준"
     return line
@@ -2670,6 +2680,7 @@ def message_chunks(
                 _alert_session_line(
                     session,
                     seat_detail_unclassified=(key in unclassified_keys),
+                    open_only_mode=config.open_only_mode,
                 )
             ]
             if seat_line := _available_seat_line(seat_snapshots.get(key)):
@@ -3391,6 +3402,11 @@ class Watcher:
         not a subscription at all.
         """
 
+        if self.config.open_only_mode and category in {
+            ALERT_SEATS, ALERT_SEATS_SWEET, ALERT_SEATS_UNCLASSIFIED,
+        }:
+            return 0, 0, 0
+
         subscriber_ids = (
             tuple(recipients)
             if recipients is not None
@@ -3515,6 +3531,11 @@ class Watcher:
         ):
             chat_id = record["chat_id"]
             category = record["category"]
+            if self.config.open_only_mode and category in {
+                ALERT_SEATS, ALERT_SEATS_SWEET, ALERT_SEATS_UNCLASSIFIED,
+            }:
+                changed = self.state.remove_pending_delivery(key) or changed
+                continue
             # ALERT_SYSTEM has no subscribers by design — it is addressed to
             # the operator — so ask the same source the original send used.
             eligible = set(
@@ -3593,6 +3614,8 @@ class Watcher:
         stats = self.state.subscriber_breakdown()
         total = stats["total"]
         lines = ["📊 구독 현황", f"전체 {total}명"]
+        if self.config.open_only_mode:
+            lines.append("운영 모드: 신규 오픈 전용 (아래는 저장된 개인 설정)")
 
         chat_labels = {
             "private": "개인",
@@ -3881,6 +3904,15 @@ class Watcher:
                 return (f"알 수 없는 알림 종류입니다.\n\n{MODE_GUIDE}", False)
 
         current = self.state.alert_mode(chat_id)
+        if self.config.open_only_mode and self.state.is_subscribed(chat_id):
+            if requested not in {ALERT_MODE_OPEN_ONLY}:
+                return (
+                    "🎟️ 현재 봇은 신규 오픈 전용으로 운영 중입니다.\n"
+                    "잔여좌석 조회·취소표 알림은 중단되어 있습니다.\n"
+                    f"저장된 개인 설정: {ALERT_MODE_LABELS[current]}\n"
+                    "신규 오픈 알림 받기: /mode_open",
+                    False,
+                )
         if requested is None:
             if not self.state.is_subscribed(chat_id):
                 return (
@@ -3904,6 +3936,8 @@ class Watcher:
         # Every label ends in a consonant, so "으로" is always the right particle.
         if not changed:
             return (f"🔔 이미 '{label}'으로 설정되어 있습니다.", False)
+        if self.config.open_only_mode:
+            return (f"✅ 알림 종류를 '{label}'으로 변경했습니다.\n상영일 선택: /day", True)
         return (
             f"✅ 알림 종류를 '{label}'으로 변경했습니다.\n\n{MODE_GUIDE}",
             True,
@@ -4176,6 +4210,14 @@ class Watcher:
                     chat_id, command, argument
                 )
                 state_changed = state_changed or mode_changed
+            elif self.config.open_only_mode and command in (
+                SEAT_SELECTION_COMMANDS | MIN_SEATS_COMMANDS
+            ):
+                reply = (
+                    "🎟️ 현재 봇은 신규 오픈 전용으로 운영 중입니다.\n"
+                    "잔여좌석 조회·취소표 알림은 중단되어 좌석·최소 좌석 수 설정은 적용되지 않습니다.\n"
+                    "기존 설정은 그대로 보관합니다. 현재 설정: /status"
+                )
             elif command in SHOW_DAY_COMMANDS:
                 reply, show_day_changed = self._handle_show_day_command(
                     chat_id, command, argument
@@ -4301,6 +4343,9 @@ class Watcher:
             else:
                 reply = "사용 가능한 명령어를 보려면 /help를 보내주세요."
 
+            if self.config.open_only_mode:
+                reply = self._open_only_command_reply(command, chat_id, reply)
+
             if (
                 not self.config.new_subscriptions_enabled
                 and command in {"/help", "/desc", "/description"}
@@ -4327,6 +4372,44 @@ class Watcher:
                 len(self.state.subscriber_ids()),
             )
         return True
+
+    def _open_only_command_reply(self, command: str, chat_id: str, reply: str) -> str:
+        """Describe the effective service without overwriting saved preferences."""
+        note = (
+            "🎟️ 신규 오픈 전용 운영\n"
+            "잔여좌석 조회·취소표 알림은 중단되어 있습니다.\n"
+            "좌석·최소 좌석 수 설정은 적용되지 않으며 상영일 필터는 유지됩니다."
+        )
+        if command in {"/start", "/subscribe", "/status"}:
+            if not self.state.is_subscribed(chat_id):
+                return reply
+            current = self.state.alert_mode(chat_id)
+            effective = (
+                "신규 예매 오픈"
+                if ALERT_OPEN in ALERT_MODES[current]
+                else "없음 (기존 '잔여좌석만' 설정) — 받으려면 /mode_open"
+            )
+            return (
+                "✅ 현재 CGV 용산 IMAX 알림을 구독 중입니다.\n\n"
+                f"{note}\n\n현재 수신 알림: {effective}\n"
+                f"알림 상영일: {SHOW_DAY_LABELS[self.state.show_day_selection(chat_id)]}\n"
+                "설정 확인 /status · 상영일 선택 /day · 설명 /desc · 해지 /stop"
+                + (f"\n\n{status}" if (status := self.cgv_recovery_status_text()) else "")
+            )
+        if command in {"/help", "/desc", "/description"}:
+            return (
+                f"🎬 CGV {self.config.site_name} IMAX 알림 봇\n\n{note}\n\n"
+                f"영화: {self.config.movie_label}\n"
+                "상영 일정에 새 날짜·시작시간이 나타나면 중복 없이 알려드립니다.\n"
+                "매진·좌석 수 미확인 회차도 신규이면 알립니다.\n"
+                "좌석 수는 일정 응답에 포함된 값만 표시하며 좌석 번호는 조회하지 않습니다.\n"
+                "기존 '잔여좌석만' 구독자는 /mode_open으로 바꾸면 신규 알림을 받습니다.\n\n"
+                "/start - 알림 구독\n/stop - 알림 해지\n/status - 현재 구독 및 설정\n"
+                "/mode - 현재 알림 설정\n/mode_open - 신규 예매 오픈 받기\n"
+                "/day - 알림 상영일 선택\n/day_all - 모든 요일\n/day_weekend - 토·일 상영분\n"
+                "/desc - 봇 설명과 사용 방법\n/coffee - 개발자에게 커피 후원\n/help - 명령어 보기"
+            )
+        return reply
 
     def _record_verdicts(
         self,
@@ -4522,6 +4605,10 @@ class Watcher:
         self, sessions: Sequence[BookingSession], tally: "_CycleTally"
     ) -> None:
         """Read seat detail for one date's sessions and send what qualifies."""
+
+        if self.config.open_only_mode:
+            self._alert_new_sessions_only(sessions, tally)
+            return
 
         session_keys = {
             session: session.notification_key(
@@ -4906,6 +4993,37 @@ class Watcher:
                     )
 
         self._record_verdicts(tally, sessions, verdicts, session_keys, snapshots)
+
+    def _alert_new_sessions_only(
+        self, sessions: Sequence[BookingSession], tally: "_CycleTally"
+    ) -> None:
+        """Use only schedule data; never load, compare or refresh seat maps."""
+        new_sessions = [
+            session for session in sessions
+            if not self.state.was_notified(session.notification_key(
+                site_no=self.config.site_no, movie_no=self.config.movie_no,
+            ))
+        ]
+        if self.dry_run:
+            tally.new_sessions += len(new_sessions)
+            self.logger.info("드라이런: 신규 오픈 전용, 새 회차 %d개", len(new_sessions))
+            return
+        for text, chunk_sessions in message_chunks(new_sessions, self.config):
+            delivered, failed, total = self._broadcast_message(
+                text, category=ALERT_OPEN, show_date=chunk_sessions[0].date,
+            )
+            for session in chunk_sessions:
+                self.state.mark_notified(session.notification_key(
+                    site_no=self.config.site_no, movie_no=self.config.movie_no,
+                ), session)
+            tally.new_sessions += len(chunk_sessions)
+            tally.dirty = True
+            # The outbox is saved before these de-duplication records.
+            self._flush_state(tally)
+            self.logger.info(
+                "신규 오픈 전용: 새 회차 %d개, 대상 %d명, 접수/성공 %d명, 실패 %d명 (좌석 API 호출 없음)",
+                len(chunk_sessions), total, delivered, failed,
+            )
 
     def run_cycle(self) -> CycleResult:
         if self._cgv_recovery_blocks_scan():
@@ -5315,6 +5433,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         config.poll_interval_seconds,
     )
     logger.info("CGV 로그인 토큰과 로그인 쿠키는 사용하지 않습니다.")
+    if config.open_only_mode:
+        logger.info("신규 오픈 전용 운영: 일정 API만 조회, 좌석 API·취소표 알림 중단")
     if config.subscriptions_enabled:
         logger.info(
             "Telegram 명령은 CGV 조회와 별도로 %d초 간격으로 확인합니다.",
