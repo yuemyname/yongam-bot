@@ -1297,7 +1297,7 @@ class CgvClient:
 
     def _request(
         self, url: str, *, headers: Mapping[str, str], attempts: int = 2
-    ) -> tuple[int, bytes, str, str]:
+    ) -> tuple[int, bytes, str, str, dict[str, str]]:
         parsed = urllib.parse.urlsplit(url)
         target = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
         last_error: Exception | None = None
@@ -1310,9 +1310,15 @@ class CgvClient:
                 status = response.status
                 content_type = response.getheader("Content-Type", "")
                 location = response.getheader("Location", "")
+                # Only what tells a CGV block from an edge (Cloudflare) block;
+                # no cookies or anything that identifies a session.
+                diagnostics = {
+                    "server": response.getheader("Server", ""),
+                    "cf-ray": response.getheader("CF-RAY", ""),
+                }
                 if response.getheader("Connection", "").lower() == "close":
                     self._drop_connection(url)
-                return status, body, content_type, location
+                return status, body, content_type, location, diagnostics
             except (http.client.HTTPException, TimeoutError, OSError) as exc:
                 last_error = exc
                 self._drop_connection(url)
@@ -1336,7 +1342,7 @@ class CgvClient:
         current_url = url
         try:
             for redirect_count in range(4):
-                status, body, content_type, location = self._request(
+                status, body, content_type, location, diagnostics = self._request(
                     current_url, headers=headers, attempts=1 if single_attempt else 2
                 )
                 if status not in {301, 302, 303, 307, 308}:
@@ -1362,12 +1368,23 @@ class CgvClient:
             raise FetchError("CGV 응답 크기가 안전 제한을 초과했습니다.")
         if status == 403:
             error_body = body[:30_000].decode("utf-8", errors="replace")
-            if (
-                "비정상적으로 CGV에 접속" in error_body
-                or "cloudflare" in error_body.lower()
-            ):
+            # Which side blocked us decides what can help: CGV's own page
+            # means their application rule, a Cloudflare page means the edge
+            # rejected the source network before CGV saw the request.
+            if "비정상적으로 CGV에 접속" in error_body:
+                block_kind = "CGV 자체 차단 페이지"
+            elif "cloudflare" in error_body.lower():
+                block_kind = "Cloudflare 차단 페이지"
+            else:
+                block_kind = ""
+            if block_kind:
+                detail = [block_kind]
+                if diagnostics.get("server"):
+                    detail.append(f"server={diagnostics['server'][:40]}")
+                if diagnostics.get("cf-ray"):
+                    detail.append("cf-ray 있음")
                 raise FetchError(
-                    "CGV가 자동 조회를 차단했습니다(HTTP 403). "
+                    f"CGV가 자동 조회를 차단했습니다(HTTP 403, {', '.join(detail)}). "
                     "잠시 후 다시 시도하거나 네트워크를 바꿔 보세요."
                 )
         if status != 200:

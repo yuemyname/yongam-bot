@@ -5000,6 +5000,54 @@ class CgvClientTests(unittest.TestCase):
             self.assertEqual(created.call_count, 1)
             self.assertEqual(connection.requests, 2)
 
+    def test_a_403_names_which_side_blocked_the_request(self):
+        cases = [
+            (
+                b"<html>\xeb\xb9\x84\xec\xa0\x95\xec\x83\x81\xec\xa0\x81\xec\x9c\xbc\xeb\xa1\x9c CGV\xec\x97\x90 \xec\xa0\x91\xec\x86\x8d</html>",
+                {"Server": "nginx"},
+                ["CGV 자체 차단 페이지", "server=nginx"],
+                ["cf-ray"],
+            ),
+            (
+                b"<html>Attention Required! | Cloudflare</html>",
+                {"Server": "cloudflare", "CF-RAY": "8d1-ICN"},
+                ["Cloudflare 차단 페이지", "server=cloudflare", "cf-ray 있음"],
+                ["8d1-ICN"],  # the ray id itself is not echoed
+            ),
+        ]
+        for body, headers, expected, absent in cases:
+            class FakeResponse:
+                status = 403
+
+                def read(self, _limit):
+                    return body
+
+                def getheader(self, name, default=""):
+                    return headers.get(name, default)
+
+            class FakeConnection:
+                def request(self, *_args, **_kwargs):
+                    return None
+
+                def getresponse(self):
+                    return FakeResponse()
+
+            with self.subTest(expected=expected[0]):
+                with tempfile.TemporaryDirectory() as temporary:
+                    client = CgvClient(make_config(Path(temporary)))
+                    with patch(
+                        "watcher.http.client.HTTPSConnection",
+                        return_value=FakeConnection(),
+                    ):
+                        with self.assertRaises(FetchError) as raised:
+                            client.fetch_date(dt.date(2026, 8, 26))
+                message = str(raised.exception)
+                self.assertIn("HTTP 403", message)
+                for fragment in expected:
+                    self.assertIn(fragment, message)
+                for fragment in absent:
+                    self.assertNotIn(fragment, message)
+
     def test_reconnects_once_when_a_pooled_connection_was_closed(self):
         class FakeResponse:
             status = 200
