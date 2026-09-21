@@ -75,6 +75,7 @@ BotFather의 `/setdescription`에는 저장소에서 제공하는 한글·영문
 TELEGRAM_BOT_TOKEN=BotFather가_준_실제_토큰
 TELEGRAM_CHAT_ID=운영자_chat_id
 SUBSCRIPTIONS_ENABLED=true
+NEW_SUBSCRIPTIONS_ENABLED=true
 ```
 
 `TELEGRAM_CHAT_ID`는 최초 운영자를 기존 알림 구독자로 한 번 등록하고, 이후 `/statss` 응답과 CGV 조회 실패 공지를 받을 대상을 정합니다. 조회 실패 공지는 이 채팅에만 가며 구독자에게는 전달되지 않습니다. 이후 일반 사용자는 자신의 채팅에서 `/start`만 보내면 자동 등록됩니다. `/stop`으로 해지한 운영자는 재배포 후에도 자동으로 다시 등록되지 않습니다.
@@ -86,6 +87,18 @@ CGV 조회와 Telegram 발송은 서로 다른 작업에서 실행됩니다. 조
 구독자 목록과 설정, 처리한 Telegram 명령 위치, 기존 예매 알림 기록과 좌석 수·A열 제외 좌석 위치, 마지막 좌석 알림 시각, 실패한 일정 재조회 목록, 아직 보내지 못한 Telegram 알림은 `/data/notified.json`에 저장됩니다. Railway가 재시작되거나 새 버전을 배포해도 남은 알림부터 복구합니다.
 
 > Telegram에 webhook이 설정된 봇은 `getUpdates` 방식과 동시에 사용할 수 없습니다. 이 프로젝트 전용 봇에는 별도 webhook을 설정하지 마세요.
+
+### 신규 구독만 일시 중단하기
+
+Railway Variables에서 `NEW_SUBSCRIPTIONS_ENABLED=false`로 설정하고 배포합니다.
+`SUBSCRIPTIONS_ENABLED=true`는 유지하세요. 이 값을 false로 바꾸면 `/stop`을 포함한 Telegram 명령 처리가 모두 중단됩니다.
+
+- 신규 사용자의 `/start`, `/subscribe`에는 중단 안내만 보내고 구독자를 추가하지 않습니다. 그룹과 `@봇이름`이 붙은 명령도 동일합니다.
+- 기존 구독자·알림 설정·발송 대기열은 유지합니다. 기존 사용자는 설정 확인·변경·구독 해지가 가능합니다.
+- `/help`, `/desc`, 미구독자의 `/status`에도 신규 구독 중단을 표시합니다.
+- 해지 후 재구독도 제한됩니다. 운영자의 최초 1회 초기 등록 동작은 변경하지 않습니다.
+- 재개하려면 `NEW_SUBSCRIPTIONS_ENABLED=true`로 되돌려 배포하세요. 구독자 상태 파일은 삭제하지 않습니다.
+- 이 설정은 CGV 조회 중단·재개나 알림 발송 여부를 변경하지 않습니다.
 
 ## Railway 로그 확인
 
@@ -184,7 +197,8 @@ Mac이 잠자기 상태이거나 덮개가 닫혀 있으면 감시가 중단될 
 
 | 이름 | 기본값 | 설명 |
 |---|---:|---|
-| `SUBSCRIPTIONS_ENABLED` | `true` | `/start`, `/stop` 자동 구독 기능 |
+| `SUBSCRIPTIONS_ENABLED` | `true` | Telegram 명령 처리 전체 활성화 (`/stop` 포함) |
+| `NEW_SUBSCRIPTIONS_ENABLED` | `true` | 신규 구독 허용. false여도 기존 구독자 명령은 유지 |
 | `POLL_INTERVAL_SECONDS` | `120` | 정상 조회 주기 및 재확인 모드 미사용 시 HTTP 403 재시도 간격 |
 | `CGV_RECOVERY_REQUEST_ID` | 빈 값 | 운영자 승인 단일 재확인 요청 이름: 1시간 중단 → 1건 확인 → 성공 시 복귀, 실패 시 중단 |
 | `CGV_RECOVERY_PAUSE_SECONDS` | `3600` | 새 재확인 요청의 대기 시간(초). 운영자가 즉시 재확인을 승인한 경우만 0 사용 |

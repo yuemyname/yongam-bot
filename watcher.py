@@ -499,6 +499,7 @@ class Config:
     cgv_header_probe_request_id: str = ""
     cgv_header_probe_date: dt.date | None = None
     cgv_header_probe_seat_url: str = ""
+    new_subscriptions_enabled: bool = True
 
     @classmethod
     def from_env_file(
@@ -690,6 +691,10 @@ class Config:
             subscriptions_enabled=_parse_bool(
                 value("SUBSCRIPTIONS_ENABLED", "true"),
                 name="SUBSCRIPTIONS_ENABLED",
+            ),
+            new_subscriptions_enabled=_parse_bool(
+                value("NEW_SUBSCRIPTIONS_ENABLED", "true"),
+                name="NEW_SUBSCRIPTIONS_ENABLED",
             ),
             scan_mode=_parse_scan_mode(value("SCAN_MODE", DEFAULT_SCAN_MODE)),
             booking_close_margin_minutes=_parse_int(
@@ -4074,8 +4079,29 @@ class Watcher:
             )
             chat_type = str(chat.get("type") or "")
             reply = ""
+            signup_notice = "⏸ 현재 신규 구독을 잠시 중단했습니다."
+            subscription_prompt = (
+                "알림을 받으려면 /start를 보내주세요."
+                if self.config.new_subscriptions_enabled
+                else signup_notice
+            )
 
-            if command in {"/start", "/subscribe"}:
+            if (
+                not self.config.new_subscriptions_enabled
+                and not self.state.is_subscribed(chat_id)
+                and command in (
+                    {"/start", "/subscribe"}
+                    | MODE_COMMANDS
+                    | SHOW_DAY_COMMANDS
+                    | SEAT_SELECTION_COMMANDS
+                    | MIN_SEATS_COMMANDS
+                )
+            ):
+                # Keep polling and acknowledging commands, without adding a
+                # subscriber or changing their settings. This also covers
+                # groups, aliases and former subscribers trying to rejoin.
+                reply = signup_notice + "\n신규 구독이 재개된 뒤 /start를 보내주세요."
+            elif command in {"/start", "/subscribe"}:
                 added = self.state.add_subscriber(
                     chat_id, label=label, chat_type=chat_type
                 )
@@ -4108,10 +4134,13 @@ class Watcher:
                 state_changed = state_changed or removed
                 subscribers_changed = subscribers_changed or removed
                 reply = (
-                    "🔕 알림 구독을 해지했습니다. 다시 받으려면 /start를 보내주세요."
+                    "🔕 알림 구독을 해지했습니다."
                     if removed
-                    else "현재 알림을 구독하고 있지 않습니다. 구독하려면 /start를 보내주세요."
+                    else "현재 알림을 구독하고 있지 않습니다."
                 )
+                reply += f"\n{subscription_prompt}"
+                if not self.config.new_subscriptions_enabled:
+                    reply += "\n신규 구독이 재개될 때까지 재구독할 수 없습니다."
             elif command == "/status":
                 if self.state.is_subscribed(chat_id):
                     mode = self.state.alert_mode(chat_id)
@@ -4138,10 +4167,7 @@ class Watcher:
                         "\n예매 가능 최소 좌석 변경: /count"
                     )
                 else:
-                    reply = (
-                        "🔕 현재 구독 중이 아닙니다. "
-                        "알림을 받으려면 /start를 보내주세요."
-                    )
+                    reply = f"🔕 현재 구독 중이 아닙니다.\n{subscription_prompt}"
                 recovery_status = self.cgv_recovery_status_text()
                 if recovery_status:
                     reply += f"\n\n{recovery_status}"
@@ -4274,6 +4300,17 @@ class Watcher:
                 )
             else:
                 reply = "사용 가능한 명령어를 보려면 /help를 보내주세요."
+
+            if (
+                not self.config.new_subscriptions_enabled
+                and command in {"/help", "/desc", "/description"}
+            ):
+                reply = (
+                    f"{signup_notice}\n"
+                    "기존 구독자의 설정 변경·구독 해지는 계속 이용할 수 있습니다.\n"
+                    "해지 후에는 신규 구독이 재개될 때까지 재구독할 수 없습니다.\n\n"
+                    + reply
+                )
 
             try:
                 self.telegram.send_message(reply, chat_id=chat_id)
@@ -5282,6 +5319,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.info(
             "Telegram 명령은 CGV 조회와 별도로 %d초 간격으로 확인합니다.",
             config.telegram_command_poll_seconds,
+        )
+        logger.info(
+            "Telegram 신규 구독: %s (기존 구독자 설정·해지 명령 유지)",
+            "허용" if config.new_subscriptions_enabled else "중단",
         )
 
     if args.once:
