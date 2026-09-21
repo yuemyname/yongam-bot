@@ -8,13 +8,15 @@ import unittest
 from unittest.mock import Mock, patch
 
 from watcher import (
-    CgvClient, Config, ConfigurationError, CycleResult, FetchError,
-    StateStore, Watcher, main,
+    ADMIN_CGV_RESUME_COMMAND, CgvClient, Config, ConfigurationError,
+    CycleResult, FetchError, StateStore, Watcher, main,
 )
 from test_watcher import make_config, _kst
 
 
-class CgvRecoveryTests(unittest.TestCase):
+class RecoveryFixture(unittest.TestCase):
+    """A watcher started with a recovery request id and a frozen clock."""
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -41,6 +43,8 @@ class CgvRecoveryTests(unittest.TestCase):
     def due(self):
         self.now = self.started + dt.timedelta(hours=1)
 
+
+class CgvRecoveryTests(RecoveryFixture):
     def test_no_requests_before_the_full_hour_and_only_operator_is_notified(self):
         self.watcher.state.add_subscriber("123")
         for seconds in (0, 120, 1800, 3599):
@@ -316,6 +320,128 @@ class CgvRecoveryTests(unittest.TestCase):
             thread.return_value.start.assert_called_once()
             factory.return_value.stop_delivery_worker.assert_called_once()
         self.assertEqual(starts, [0.0, 1.0, 2.0, 122.0])
+
+
+class CgvResumeCommandTests(RecoveryFixture):
+    """The operator lifts the halt from Telegram instead of a redeploy."""
+
+    OPERATOR = 987654
+
+    def send(self, watcher, chat_id, text, update_id=1):
+        watcher.telegram.get_updates.return_value = [{
+            "update_id": update_id, "message": {
+                "chat": {"id": chat_id, "type": "private"}, "text": text,
+            },
+        }]
+        self.assertTrue(watcher.sync_subscribers())
+        return watcher.telegram.send_message.call_args.args[0]
+
+    def halt(self):
+        self.watcher._halt_cgv_recovery("HTTP 403")
+        self.watcher.telegram.send_message.reset_mock()
+        self.assertTrue(self.watcher.run_cycle().cgv_paused)
+        self.watcher.cgv.fetch_date.assert_not_called()
+
+    def test_operator_resume_scans_on_the_next_cycle(self):
+        self.halt()
+        self.watcher.cgv.fetch_date.return_value = {"statusCode": 0, "data": []}
+
+        reply = self.send(self.watcher, self.OPERATOR, ADMIN_CGV_RESUME_COMMAND)
+
+        self.assertIn("재개", reply)
+        self.assertIn("HTTP 403", reply)  # the halt reason is echoed back
+        record = self.watcher.state.cgv_recovery()
+        self.assertEqual(record["status"], "resumed")
+        self.assertEqual(record["resumed_from"], "halted")
+        self.assertEqual(record["request_id"], "recovery-test-1")
+        self.assertFalse(self.watcher.run_cycle().cgv_paused)
+        self.watcher.cgv.fetch_date.assert_called()
+        # Back to plain operation: /status no longer shows a halt.
+        self.assertEqual(self.watcher.cgv_recovery_status_text(), "")
+
+    def test_a_403_after_manual_resume_retries_instead_of_halting(self):
+        self.halt()
+        self.send(self.watcher, self.OPERATOR, ADMIN_CGV_RESUME_COMMAND)
+        self.watcher.cgv.fetch_date.side_effect = FetchError("HTTP 403")
+
+        first = self.watcher.run_cycle()
+        second = self.watcher.run_cycle()
+
+        for result in (first, second):
+            self.assertFalse(result.cgv_paused)
+            self.assertEqual(result.forbidden_requests, 1)
+        self.assertEqual(self.watcher.state.cgv_recovery()["status"], "resumed")
+        self.assertEqual(self.watcher.cgv.fetch_date.call_count, 2)
+
+    def test_resume_survives_a_restart_with_the_same_request_id(self):
+        self.halt()
+        self.send(self.watcher, self.OPERATOR, ADMIN_CGV_RESUME_COMMAND)
+
+        restarted = self.restart()
+        restarted.cgv.fetch_date.return_value = {"statusCode": 0, "data": []}
+
+        self.assertEqual(restarted.state.cgv_recovery()["status"], "resumed")
+        self.assertFalse(restarted.run_cycle().cgv_paused)
+        restarted.cgv.fetch_date.assert_called()
+
+    def test_a_new_request_id_after_resume_starts_a_fresh_cooldown(self):
+        self.halt()
+        self.send(self.watcher, self.OPERATOR, ADMIN_CGV_RESUME_COMMAND)
+
+        restarted = self.restart(dataclasses.replace(
+            self.config, cgv_recovery_request_id="recovery-test-2"
+        ))
+
+        self.assertEqual(restarted.state.cgv_recovery()["status"], "cooldown")
+        self.assertTrue(restarted.run_cycle().cgv_paused)
+
+    def test_resume_also_lifts_a_pending_cooldown(self):
+        self.assertEqual(self.watcher.state.cgv_recovery()["status"], "cooldown")
+        self.watcher.cgv.fetch_date.return_value = {"statusCode": 0, "data": []}
+
+        reply = self.send(self.watcher, self.OPERATOR, ADMIN_CGV_RESUME_COMMAND)
+
+        self.assertIn("재개", reply)
+        self.assertEqual(self.watcher.state.cgv_recovery()["resumed_from"], "cooldown")
+        self.assertFalse(self.watcher.run_cycle().cgv_paused)
+
+    def test_resume_when_not_halted_changes_nothing(self):
+        self.due()
+        self.watcher.cgv.fetch_date.return_value = {"statusCode": 0, "data": []}
+        self.assertFalse(self.watcher.run_cycle().cgv_paused)
+        self.assertEqual(self.watcher.state.cgv_recovery()["status"], "recovered")
+
+        reply = self.send(self.watcher, self.OPERATOR, ADMIN_CGV_RESUME_COMMAND)
+
+        self.assertIn("중단된 상태가 아닙니다", reply)
+        self.assertEqual(self.watcher.state.cgv_recovery()["status"], "recovered")
+
+    def test_header_probe_mode_refuses_to_resume(self):
+        self.halt()
+        config = dataclasses.replace(
+            self.config,
+            cgv_header_probe_request_id="probe-1",
+            cgv_header_probe_date=self.config.target_start.isoformat(),
+        )
+        watcher = self.restart(config)
+
+        with patch("watcher.run_header_probe_once"):
+            reply = self.send(watcher, self.OPERATOR, ADMIN_CGV_RESUME_COMMAND)
+            self.assertIn("CGV_HEADER_PROBE_REQUEST_ID", reply)
+            self.assertEqual(watcher.state.cgv_recovery()["status"], "halted")
+            self.assertTrue(watcher.run_cycle().cgv_paused)
+        watcher.cgv.fetch_date.assert_not_called()
+
+    def test_only_the_operator_can_resume(self):
+        self.halt()
+        self.watcher.state.add_subscriber("123")
+
+        reply = self.send(self.watcher, 123, ADMIN_CGV_RESUME_COMMAND)
+
+        self.assertIn("사용 가능한 명령어", reply)
+        self.assertEqual(self.watcher.state.cgv_recovery()["status"], "halted")
+        self.assertTrue(self.watcher.run_cycle().cgv_paused)
+        self.watcher.cgv.fetch_date.assert_not_called()
 
 
 if __name__ == "__main__":

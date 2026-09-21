@@ -25,6 +25,7 @@ from watcher import (
     ALERT_SEATS_UNCLASSIFIED,
     ALERT_NOTICE,
     ALERT_SYSTEM,
+    ADMIN_CGV_RESUME_COMMAND,
     ADMIN_NOTICE_COMMAND,
     ADMIN_NOTICE_SEND_COMMAND,
     ADMIN_STATS_COMMAND,
@@ -5242,9 +5243,13 @@ class DocumentedCommandTests(unittest.TestCase):
         readme = (self.REPO / "README.md").read_text(encoding="utf-8")
         block = development.split("`/setcommands`")[1].split("```")[1]
 
-        # Tied to the constants so a rename cannot quietly publish either
+        # Tied to the constants so a rename cannot quietly publish an
         # operator-only command to every subscriber.
-        for command in (ADMIN_STATS_COMMAND, ADMIN_STATS_SUMMARY_COMMAND):
+        for command in (
+            ADMIN_STATS_COMMAND,
+            ADMIN_STATS_SUMMARY_COMMAND,
+            ADMIN_CGV_RESUME_COMMAND,
+        ):
             self.assertNotIn(command.lstrip("/"), block)
             self.assertNotIn(f"| `{command}` |", readme)
             self.assertNotIn(command, self._botfather_commands())

@@ -191,13 +191,26 @@ ADMIN_NOTICE_COMMAND = "/notice"
 ADMIN_NOTICE_SEND_COMMAND = "/notice_send"
 # Answering one chat, as opposed to the whole list.
 ADMIN_REPLY_COMMAND = "/reply"
+# Lifts the durable CGV halt without a redeploy.  The halt exists to make an
+# operator look before the bot sends another request; this is that look.
+ADMIN_CGV_RESUME_COMMAND = "/cgv_resume"
 ADMIN_COMMANDS = {
     ADMIN_STATS_COMMAND,
     ADMIN_STATS_SUMMARY_COMMAND,
     ADMIN_NOTICE_COMMAND,
     ADMIN_NOTICE_SEND_COMMAND,
     ADMIN_REPLY_COMMAND,
+    ADMIN_CGV_RESUME_COMMAND,
 }
+# Recovery record statuses that let normal scanning run.  "recovered" is the
+# automatic probe's verdict and re-halts on the next 403; "resumed" is the
+# operator's explicit choice and goes back to plain interval retries.
+CGV_RECOVERY_STATUS_RECOVERED = "recovered"
+CGV_RECOVERY_STATUS_RESUMED = "resumed"
+CGV_RECOVERY_SCANNING_STATUSES = frozenset({
+    CGV_RECOVERY_STATUS_RECOVERED,
+    CGV_RECOVERY_STATUS_RESUMED,
+})
 # A draft goes stale rather than waiting around to be sent by accident.
 NOTICE_DRAFT_TTL_MINUTES = 10
 # Plain-text messages are relayed to the operator.  The bot is public, so one
@@ -2855,9 +2868,52 @@ class Watcher:
                 f"원인: {record.get('reason', '재확인 실패')}\n"
                 "자동 재시도하지 않습니다. 현재 새 예매·좌석 알림을 감지할 수 없습니다."
             )
-        if status == "recovered":
+        if status == CGV_RECOVERY_STATUS_RECOVERED:
             return f"✅ CGV 재확인 성공 — {self.config.poll_interval_seconds}초 조회로 복귀"
         return ""
+
+    def _handle_cgv_resume_command(self) -> str:
+        """Clear the durable halt so the next cycle scans again.
+
+        Unlike a successful automatic probe, a manual resume does not re-halt
+        on the next 403: the operator has seen the block and chosen the plain
+        poll-interval retry instead.  The record keeps its request id so a
+        restart with the same ``CGV_RECOVERY_REQUEST_ID`` does not start a
+        fresh cooldown.
+        """
+
+        if self.config.cgv_header_probe_request_id:
+            return (
+                "헤더 단일 진단 모드에서는 재개할 수 없습니다.\n"
+                "Railway Variables 에서 CGV_HEADER_PROBE_REQUEST_ID 를 지우고 "
+                "재배포한 뒤 다시 보내주세요."
+            )
+        record = self.state.cgv_recovery()
+        status = record.get("status")
+        if not record or status in CGV_RECOVERY_SCANNING_STATUSES:
+            return (
+                "CGV 자동 조회가 중단된 상태가 아닙니다. "
+                f"{self.config.poll_interval_seconds}초 간격으로 계속 조회합니다."
+            )
+        previous_reason = record.get("reason", "")
+        record.update(
+            status=CGV_RECOVERY_STATUS_RESUMED,
+            resumed_from=status,
+            resumed_at=self.config.local_now().isoformat(),
+        )
+        self._save_cgv_recovery(record)
+        self.logger.warning(
+            "운영자 명령으로 CGV 자동 조회 재개 (이전 상태: %s, 원인: %s)",
+            status,
+            previous_reason or "-",
+        )
+        detail = f"\n중단 원인: {previous_reason}" if previous_reason else ""
+        return (
+            "▶️ CGV 자동 조회를 재개합니다.\n"
+            f"다음 주기부터 {self.config.poll_interval_seconds}초 간격으로 조회합니다. "
+            "HTTP 403이 다시 나오면 자동 중단하지 않고 같은 간격으로 재시도합니다."
+            f"{detail}"
+        )
 
     def _announce_cgv_recovery(self) -> None:
         record = self.state.cgv_recovery()
@@ -2914,7 +2970,7 @@ class Watcher:
             return True
 
         record = self.state.cgv_recovery()
-        if not record or record.get("status") == "recovered":
+        if not record or record.get("status") in CGV_RECOVERY_SCANNING_STATUSES:
             return False
         status = record.get("status")
         if status == "halted":
@@ -2962,7 +3018,10 @@ class Watcher:
             self._halt_cgv_recovery(reason)
             return True
 
-        record.update(status="recovered", finished_at=self.config.local_now().isoformat())
+        record.update(
+            status=CGV_RECOVERY_STATUS_RECOVERED,
+            finished_at=self.config.local_now().isoformat(),
+        )
         self._save_cgv_recovery(record)
         # Process a successful probe in the normal alert pipeline without
         # refetching or marking newly opened showings as already notified.
@@ -4102,6 +4161,8 @@ class Watcher:
                     )
                 elif command == ADMIN_REPLY_COMMAND:
                     reply = self._handle_reply_command(body)
+                elif command == ADMIN_CGV_RESUME_COMMAND:
+                    reply = self._handle_cgv_resume_command()
                 else:
                     reply, _changed = self._handle_notice_command(command, body)
             elif command == "/help":
@@ -4879,9 +4940,11 @@ class Watcher:
                 tally.seat_detail_error_sample,
             )
 
+        # Only the automatic probe's success is provisional.  After an
+        # operator resume a 403 falls through to the poll-interval retry.
         cgv_paused = (
             tally.forbidden_requests > 0
-            and self.state.cgv_recovery().get("status") == "recovered"
+            and self.state.cgv_recovery().get("status") == CGV_RECOVERY_STATUS_RECOVERED
         )
         if cgv_paused:
             self._halt_cgv_recovery("재확인 성공 후 정상 조회에서 HTTP 403이 다시 발생했습니다.")
