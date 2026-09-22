@@ -2674,7 +2674,6 @@ def seat_change_message(
     config: Config,
     *,
     availability: tuple[SeatSnapshot | None, SeatSnapshot] | None = None,
-    scope_label: str = "A열 제외",
 ) -> str:
     previous_available, current_available = availability or (previous, current)
     ratio = _seat_ratio(session, remaining=current.total)
@@ -2688,9 +2687,11 @@ def seat_change_message(
         f"영화: {config.movie_label} ({config.movie_no})",
         f"극장: {config.site_name} ({config.site_no})",
         "",
-        f"상영 시작시간: {session.start_time}",
-        f"잔여좌석/총좌석: {ratio}",
+        f"상영 시간: {session.start_time}",
     ]
+    if seat_line := _available_seat_line(current_available, label="좌석 번호"):
+        lines.append(seat_line)
+    lines.append(f"잔여 좌석: {ratio}")
     if (
         previous_available is not None
         and previous_available.usable is not None
@@ -2698,15 +2699,11 @@ def seat_change_message(
         and previous_available.usable != current_available.usable
     ):
         lines.append(
-            f"{scope_label} 예매 가능: "
+            "변동 좌석수: "
             f"{previous_available.usable}석 → {current_available.usable}석"
         )
     elif current_available.usable is not None:
-        lines.append(f"{scope_label} 예매 가능: {current_available.usable}석")
-    if seat_line := _available_seat_line(
-        current_available, label=f"{scope_label} 잔여 좌석"
-    ):
-        lines.append(seat_line)
+        lines.append(f"변동 좌석수: {current_available.usable}석")
     if current.uses_unclassified_fallback:
         lines.append("⚠️ A열 여부 미확인 · 전체 잔여 수 기준 알림")
     lines.extend(
@@ -4425,7 +4422,7 @@ class Watcher:
                     "🔔 알려드리는 내용\n"
                     "• 새 IMAX 상영 회차 예매 오픈\n"
                     "• 예매 가능한 A열 제외 좌석 (취소표 포함)\n"
-                    "• 상영일·시작시간·잔여좌석/총좌석·좌석 행/번호·예매 링크\n\n"
+                    "• 상영일·상영 시간·좌석 번호·잔여 좌석·변동 좌석수·예매 링크\n\n"
                     "🚫 좌석 알림 제외\n"
                     "• A열만 남은 경우\n"
                     "• 잔여 좌석이 0석인 경우\n"
@@ -5114,7 +5111,6 @@ class Watcher:
                         current,
                         self.config,
                         availability=sweet_delivery,
-                        scope_label="명당",
                     ),
                     category=ALERT_SEATS_SWEET,
                     seats_available=open_sweet,

@@ -1260,7 +1260,7 @@ class SeatsOnSaleAlertTests(unittest.TestCase):
                 cycles = self._run(watcher, [3, 3, 0, 0, 2])
 
             self.assertEqual([len(cycle) for cycle in cycles], [1, 1, 0, 0, 1])
-            self.assertIn("잔여좌석/총좌석: 2/624석", cycles[4][0])
+            self.assertIn("잔여 좌석: 2/624석", cycles[4][0])
 
     def test_a_repeat_carries_no_previous_count(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1273,8 +1273,8 @@ class SeatsOnSaleAlertTests(unittest.TestCase):
             # The cycle the count moved contrasts with the old value; the
             # cycle after it has nothing to contrast with, so it says only
             # what is on sale.
-            self.assertIn("잔여좌석/총좌석: 4/624석 (이전 5/624석)", cycles[2][0])
-            self.assertIn("잔여좌석/총좌석: 4/624석\n", cycles[3][0])
+            self.assertIn("잔여 좌석: 4/624석 (이전 5/624석)", cycles[2][0])
+            self.assertIn("잔여 좌석: 4/624석\n", cycles[3][0])
             self.assertNotIn("이전", cycles[3][0])
 
     def test_the_repeat_interval_throttles_only_unchanged_showings(self):
@@ -1429,9 +1429,9 @@ class BookingOpenWithoutSeatDetailTests(unittest.TestCase):
             self.assertEqual(sale, ["2매이상", "기본", "명당"])
             self.assertEqual(pair, ["2매이상", "기본", "명당"])
             self.assertEqual(row_a, ["2매이상", "기본", "명당"])
-            self.assertIn("잔여좌석/총좌석: 4/624석 (이전 2/624석)", pair_message)
-            self.assertIn("A열 제외 예매 가능: 2석 → 4석", pair_message)
-            self.assertIn("A열 제외 잔여 좌석: B10 / C11 / J20~21", pair_message)
+            self.assertIn("잔여 좌석: 4/624석 (이전 2/624석)", pair_message)
+            self.assertIn("변동 좌석수: 2석 → 4석", pair_message)
+            self.assertIn("좌석 번호: B10 / C11 / J20~21", pair_message)
 
     def test_a_sold_out_new_showing_is_announced_anyway(self):
         """A date and time never seen before is news even at zero seats.
@@ -1614,7 +1614,7 @@ class ForcedSeatRecheckTests(unittest.TestCase):
 
             self.assertEqual(seat_requests, [8])
             self.assertEqual(len(alerts), 1)
-            self.assertIn("A열 제외 예매 가능: 7석 → 8석", alerts[0])
+            self.assertIn("변동 좌석수: 7석 → 8석", alerts[0])
 
     def test_composition_change_is_missed_without_the_forced_recheck(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1633,7 +1633,7 @@ class ForcedSeatRecheckTests(unittest.TestCase):
             # alert that does go out still carries the stale seat list.
             self.assertEqual(seat_requests, [])
             self.assertEqual(len(alerts), 1)
-            self.assertIn("A열 제외 예매 가능: 7석", alerts[0])
+            self.assertIn("변동 좌석수: 7석", alerts[0])
 
 
 class ConfigTests(unittest.TestCase):
@@ -2219,8 +2219,8 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(third.seat_changes, 1)
             self.assertEqual({chat_id for chat_id, _text in sent}, {"all", "sweet"})
             sweet_text = next(text for chat_id, text in sent if chat_id == "sweet")
-            self.assertIn("명당 예매 가능: 0석 → 1석", sweet_text)
-            self.assertIn("명당 잔여 좌석: K21", sweet_text)
+            self.assertIn("변동 좌석수: 0석 → 1석", sweet_text)
+            self.assertIn("좌석 번호: K21", sweet_text)
             self.assertNotIn("B1", sweet_text)
 
     def test_partial_open_delivery_retries_only_the_failed_subscriber(self):
@@ -4656,12 +4656,12 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(fourth.seat_changes, 0)
             self.assertEqual(len(sent_messages), 3)
             self.assertIn(
-                "잔여좌석/총좌석: 9/200석 (이전 10/200석)", sent_messages[1]
+                "잔여 좌석: 9/200석 (이전 10/200석)", sent_messages[1]
             )
             # The repeat has no previous count to contrast with.
-            self.assertIn("잔여좌석/총좌석: 9/200석\n", sent_messages[2])
+            self.assertIn("잔여 좌석: 9/200석\n", sent_messages[2])
             self.assertIn(
-                "A열 제외 잔여 좌석: B1~7",
+                "좌석 번호: B1~7",
                 sent_messages[1],
             )
             self.assertIn("📅 상영일: 2026-08-26 (수)", sent_messages[1])
