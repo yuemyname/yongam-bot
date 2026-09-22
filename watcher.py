@@ -1655,6 +1655,7 @@ class StateStore:
             "last_error_fingerprint": "",
             "last_error_notified_at": "",
             "cgv_recovery": {},
+            "seat_api_backoff": {},
         }
 
     def load(self) -> None:
@@ -1681,6 +1682,8 @@ class StateStore:
                 raise RuntimeError(f"재전송 상태 파일 형식이 올바르지 않습니다: {self.path}")
             if not isinstance(loaded.get("cgv_recovery", {}), dict):
                 raise RuntimeError(f"CGV 재확인 상태 파일 형식이 올바르지 않습니다: {self.path}")
+            if not isinstance(loaded.get("seat_api_backoff", {}), dict):
+                raise RuntimeError(f"좌석 API 대기 상태 파일 형식이 올바르지 않습니다: {self.path}")
             self.data.update(loaded)
             self.data["version"] = STATE_VERSION
             self.data.setdefault("seat_counts", {})
@@ -1700,6 +1703,14 @@ class StateStore:
     def set_cgv_recovery(self, record: Mapping[str, Any]) -> None:
         with self._lock:
             self.data["cgv_recovery"] = dict(record)
+
+    def seat_api_backoff(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self.data.get("seat_api_backoff", {}))
+
+    def set_seat_api_backoff(self, record: Mapping[str, Any]) -> None:
+        with self._lock:
+            self.data["seat_api_backoff"] = dict(record)
 
     def was_notified(self, key: str) -> bool:
         with self._lock:
@@ -2784,6 +2795,9 @@ class CycleResult:
     suppressed_closed: int = 0
     deferred_rechecks_skipped: int = 0
     cgv_paused: bool = False
+    # Schedule blocks alone control the main loop's whole-cycle backoff.
+    seat_forbidden_requests: int = 0
+    seat_rate_limited_requests: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2820,6 +2834,8 @@ class _CycleTally:
     seat_detail_error_sample: str = ""
     rate_limited_requests: int = 0
     forbidden_requests: int = 0
+    seat_forbidden_requests: int = 0
+    seat_rate_limited_requests: int = 0
     schedule_skipped_dates: int = 0
     seat_detail_skipped: int = 0
     deferred_rechecks_skipped: int = 0
@@ -2922,6 +2938,74 @@ class Watcher:
         self.state.set_cgv_recovery(record)
         if not self.dry_run:
             self.state.save()
+
+    def _seat_lookup_paused(self) -> bool:
+        record = self.state.seat_api_backoff()
+        if not record:
+            return False
+        try:
+            retry_at = dt.datetime.fromisoformat(record["retry_at"])
+            if retry_at.tzinfo is None:
+                raise ValueError("missing timezone")
+            return self.config.local_now() < retry_at
+        except (KeyError, TypeError, ValueError):
+            # A broken seat timer must neither flood CGV nor stop schedules.
+            return True
+
+    def seat_api_status_text(self) -> str:
+        if self.config.open_only_mode or not self._seat_lookup_paused():
+            return ""
+        record = self.state.seat_api_backoff()
+        try:
+            retry_at = dt.datetime.fromisoformat(record["retry_at"])
+            if retry_at.tzinfo is None:
+                raise ValueError("missing timezone")
+            label = retry_at.astimezone(ZoneInfo(self.config.timezone_name)).strftime(
+                "%Y-%m-%d %H:%M:%S %Z"
+            )
+        except (KeyError, TypeError, ValueError):
+            label = "대기 시각 오류 — 운영자 확인 필요"
+        return (
+            f"⏸ 좌석 상세 조회만 대기 중 (HTTP {record.get('status_code', '?')})\n"
+            f"재시도 가능 시각: {label}\n"
+            "신규 오픈 일정 조회는 계속합니다."
+        )
+
+    def _pause_seat_lookup(self, status_code: int) -> None:
+        previous = self.state.seat_api_backoff()
+        failures = 1
+        if previous.get("status_code") == status_code:
+            try:
+                failures += max(0, int(previous.get("failures", 0)))
+            except (ValueError, TypeError):
+                pass
+        seconds = (
+            self.config.forbidden_backoff_seconds if status_code == 403
+            else rate_limit_backoff_seconds(self.config, failures)
+        )
+        now = self.config.local_now()
+        self.state.set_seat_api_backoff({
+            "status_code": status_code,
+            "failures": failures,
+            "blocked_at": now.isoformat(),
+            "retry_at": (now + dt.timedelta(seconds=seconds)).isoformat(),
+        })
+        # Persist before continuing schedules so a restart cannot bypass it.
+        if not self.dry_run:
+            self.state.save()
+        self.logger.warning(
+            "좌석 API HTTP %d: 좌석 조회·새 좌석 알림만 %d초 대기합니다. "
+            "신규 오픈 일정 조회는 계속합니다. (연속 %d회)",
+            status_code, seconds, failures,
+        )
+
+    def _clear_seat_backoff(self) -> None:
+        if not self.state.seat_api_backoff():
+            return
+        self.state.set_seat_api_backoff({})
+        if not self.dry_run:
+            self.state.save()
+        self.logger.info("좌석 API 재조회 성공: 잔여 좌석 조회·알림을 재개합니다.")
 
     def cgv_recovery_status_text(self) -> str:
         record = self.state.cgv_recovery()
@@ -4260,6 +4344,8 @@ class Watcher:
                 recovery_status = self.cgv_recovery_status_text()
                 if recovery_status:
                     reply += f"\n\n{recovery_status}"
+                if seat_status := self.seat_api_status_text():
+                    reply += f"\n\n{seat_status}"
             elif command in MODE_COMMANDS:
                 reply, mode_changed = self._handle_mode_command(
                     chat_id, command, argument
@@ -4665,6 +4751,19 @@ class Watcher:
             self._alert_new_sessions_only(sessions, tally)
             return
 
+        if self._seat_lookup_paused():
+            # No stale seat maps or schedule-total fallback alerts while the
+            # seat endpoint is blocked. Keep the last verified baseline.
+            for session in sessions:
+                key = session.notification_key(
+                    site_no=self.config.site_no, movie_no=self.config.movie_no
+                )
+                if self.state.was_notified(key) and session.remaining_seats != 0:
+                    tally.seat_detail_skipped += 1
+                    tally.deferred_keys.add(key)
+            self._alert_new_sessions_only(sessions, tally)
+            return
+
         session_keys = {
             session: session.notification_key(
                 site_no=self.config.site_no, movie_no=self.config.movie_no
@@ -4681,6 +4780,7 @@ class Watcher:
         today = self.config.local_today()
         verdicts: dict[str, str] = {}
         snapshots: dict[str, SeatSnapshot] = {}
+        freshly_fetched: set[str] = set()
         seat_candidates: list[BookingSession] = []
         for session in sessions:
             key = session_keys[session]
@@ -4752,6 +4852,9 @@ class Watcher:
                 self._wait_for_cgv_request_slot()
                 try:
                     snapshots[key] = self.cgv.fetch_seat_snapshot(session)
+                    if session.screen_no and session.screen_sequence:
+                        freshly_fetched.add(key)
+                        self._clear_seat_backoff()
                 except FetchError as exc:
                     message = str(exc)
                     tally.seat_detail_errors += 1
@@ -4762,24 +4865,24 @@ class Watcher:
                         total=session.remaining_seats or 0
                     )
                     if "HTTP 429" in message or "HTTP 403" in message:
-                        tally.rate_limited = True
                         if "HTTP 429" in message:
-                            tally.rate_limited_requests += 1
-                            status = "429 요청 제한"
+                            tally.seat_rate_limited_requests += 1
+                            status_code = 429
                         else:
-                            tally.forbidden_requests += 1
-                            status = "403 차단"
+                            tally.seat_forbidden_requests += 1
+                            status_code = 403
+                        self._pause_seat_lookup(status_code)
                         remaining_sessions = seat_candidates[index + 1 :]
                         tally.seat_detail_skipped += len(remaining_sessions)
-                        for skipped_session in remaining_sessions:
-                            snapshots[session_keys[skipped_session]] = SeatSnapshot(
-                                total=skipped_session.remaining_seats or 0
-                            )
-                        self.logger.warning(
-                            "CGV HTTP %s 감지: 남은 좌석 상세 조회 %d개를 즉시 생략합니다.",
-                            status,
-                            len(remaining_sessions),
-                        )
+                        # Keep successful responses from earlier in this
+                        # batch, but don't emit cached maps or guesses for
+                        # unverified shows or overwrite their saved baseline.
+                        for existing_key in previously_notified:
+                            if existing_key in freshly_fetched:
+                                continue
+                            snapshots.pop(existing_key, None)
+                            tally.deferred_keys.add(existing_key)
+                            verdicts[existing_key] = "보류·좌석 API 대기"
                         break
                 except Exception as exc:
                     tally.seat_detail_errors += 1
@@ -5161,10 +5264,12 @@ class Watcher:
 
         if tally.seat_detail_errors:
             self.logger.warning(
-                "좌석 상세 조회 오류 %d개: %s "
-                "(6석 이하는 보류, 7석 이상은 전체 잔여 수 기준 알림)",
+                "좌석 상세 조회 오류 %d개: %s (%s)",
                 tally.seat_detail_errors,
                 tally.seat_detail_error_sample,
+                "차단 중에는 새 좌석 알림 보류, 신규 오픈 조회 유지"
+                if self._seat_lookup_paused()
+                else "6석 이하는 보류, 7석 이상은 전체 잔여 수 기준 알림",
             )
 
         # Only the automatic probe's success is provisional.  After an
@@ -5238,7 +5343,8 @@ class Watcher:
             "예매 가능 좌석 %d개, A열만 남아 제외 %d개, "
             "0석 제외 %d개, 예매 마감 제외 %d개, 좌석판별 대기 %d개, "
             "미판별 7석 이상 알림 %d개, "
-            "HTTP 429 %d개, HTTP 403 %d개, 일정 생략 %d일, 좌석상세 생략 %d개, "
+            "일정 HTTP 429 %d개, 일정 HTTP 403 %d개, "
+            "좌석 HTTP 429 %d개, 좌석 HTTP 403 %d개, 일정 생략 %d일, 좌석상세 생략 %d개, "
             "보류 재조회 생략 %d개",
             tally.successful_dates,
             len(errors),
@@ -5252,6 +5358,8 @@ class Watcher:
             tally.unclassified_fallback_alerts,
             tally.rate_limited_requests,
             tally.forbidden_requests,
+            tally.seat_rate_limited_requests,
+            tally.seat_forbidden_requests,
             tally.schedule_skipped_dates,
             tally.seat_detail_skipped,
             tally.deferred_rechecks_skipped,
@@ -5276,6 +5384,8 @@ class Watcher:
             suppressed_closed=tally.suppressed_closed,
             deferred_rechecks_skipped=tally.deferred_rechecks_skipped,
             cgv_paused=cgv_paused,
+            seat_forbidden_requests=tally.seat_forbidden_requests,
+            seat_rate_limited_requests=tally.seat_rate_limited_requests,
         )
 
 
@@ -5490,6 +5600,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     logger.info("CGV 로그인 토큰과 로그인 쿠키는 사용하지 않습니다.")
     if config.open_only_mode:
         logger.info("신규 오픈 전용 운영: 일정 API만 조회, 좌석 API·취소표 알림 중단")
+    else:
+        logger.info("신규 오픈·잔여 좌석 운영: 좌석 API 403·429 대기는 일정 조회와 분리")
     if config.subscriptions_enabled:
         logger.info(
             "Telegram 명령은 CGV 조회와 별도로 %d초 간격으로 확인합니다.",

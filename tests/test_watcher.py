@@ -1924,7 +1924,8 @@ class WatcherIntegrationTests(unittest.TestCase):
             result = watcher.run_cycle()
 
             self.assertEqual(attempted_sessions, ["10:00"])
-            self.assertEqual(result.rate_limited_requests, 1)
+            self.assertEqual(result.rate_limited_requests, 0)
+            self.assertEqual(result.seat_rate_limited_requests, 1)
             self.assertEqual(result.seat_detail_errors, 1)
             self.assertEqual(result.seat_detail_skipped, 2)
 
@@ -4792,7 +4793,7 @@ class WatcherIntegrationTests(unittest.TestCase):
 
             def fetch_seat_snapshot(_session):
                 if not detail_available["value"]:
-                    raise FetchError("CGV 응답 오류: HTTP 429")
+                    raise FetchError("일시적인 좌석 응답 해석 실패")
                 return SeatSnapshot(
                     total=2,
                     usable=2,
@@ -4904,7 +4905,7 @@ class WatcherIntegrationTests(unittest.TestCase):
 
             def fetch_seat_snapshot(session):
                 if session.remaining_seats == 7:
-                    raise FetchError("CGV 응답 오류: HTTP 429")
+                    raise FetchError("일시적인 좌석 응답 해석 실패")
                 return SeatSnapshot(
                     total=8,
                     usable=8,
