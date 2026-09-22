@@ -475,6 +475,7 @@ class Config:
     cgv_request_spacing_seconds: int
     rate_limit_backoff_initial_seconds: int
     rate_limit_backoff_max_seconds: int
+    forbidden_backoff_seconds: int
     request_timeout_seconds: int
     imax_keywords: tuple[str, ...]
     imax_code_values: tuple[str, ...]
@@ -681,6 +682,14 @@ class Config:
             rate_limit_backoff_max_seconds=_parse_int(
                 value("RATE_LIMIT_BACKOFF_MAX_SECONDS", "7200"),
                 name="RATE_LIMIT_BACKOFF_MAX_SECONDS",
+                minimum=60,
+                maximum=86400,
+            ),
+            # A 403 is a verdict on the source, not a rate signal, so knocking
+            # every two minutes only keeps the block warm.  Long, flat wait.
+            forbidden_backoff_seconds=_parse_int(
+                value("FORBIDDEN_BACKOFF_SECONDS", "1800"),
+                name="FORBIDDEN_BACKOFF_SECONDS",
                 minimum=60,
                 maximum=86400,
             ),
@@ -2944,7 +2953,8 @@ class Watcher:
         return (
             "▶️ CGV 자동 조회를 재개합니다.\n"
             f"다음 주기부터 {self.config.poll_interval_seconds}초 간격으로 조회합니다. "
-            "HTTP 403이 다시 나오면 자동 중단하지 않고 같은 간격으로 재시도합니다."
+            "HTTP 403이 다시 나오면 자동 중단하지 않고 "
+            f"{max(1, self.config.forbidden_backoff_seconds // 60)}분 뒤 재시도합니다."
             f"{detail}"
         )
 
@@ -5490,12 +5500,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif result.forbidden_requests:
             consecutive_forbidden_cycles += 1
             consecutive_rate_limit_cycles = 0
-            next_interval = config.poll_interval_seconds
+            next_interval = config.forbidden_backoff_seconds
             logger.warning(
-                "CGV HTTP 403 차단 감지: 다음 조회는 %d초 뒤에 시도합니다. "
-                "(장시간 대기 해제, "
-                "이번 주기 %d개, 연속 %d회)",
-                next_interval,
+                "CGV HTTP 403 차단 감지: 다음 조회는 %d분 뒤에 시도합니다. "
+                "(이번 주기 %d개, 연속 %d회)",
+                max(1, next_interval // 60),
                 result.forbidden_requests,
                 consecutive_forbidden_cycles,
             )
