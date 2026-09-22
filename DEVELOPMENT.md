@@ -196,6 +196,22 @@ Railway Variables의 `CGV_RECOVERY_REQUEST_ID`에 새로운 고유 이름(예: `
 - 진단 변수를 제거해도 중단은 풀리지 않습니다. 정상 복귀는 변수를 제거하고 재배포한 뒤 운영자가 `/cgv_resume`를 보내거나 새 `CGV_RECOVERY_REQUEST_ID`를 설정해야 합니다.
 - 정상 봇 요청의 헤더는 변경하지 않습니다. 단일 성공은 전체 조회나 장시간 운영의 성공을 보장하지 않습니다.
 
+### 정상 일정 요청의 실제 전송 헤더 확인
+
+운영자 승인 후 `CGV_WIRE_TRACE_REQUEST_ID`에 고유 ID를 지정하면 **다음 정상 일정 요청 1건**을
+관찰합니다. 위 단일 진단과 달리 추가 요청이나 헤더 변경이 없고, 중단/재시도 상태도 바꾸지 않습니다.
+조회가 중단된 상태에서는 이 설정만으로 요청이 실행되지 않습니다.
+
+- 로그의 CGV_WIRE_TRACE 중 `headers_sent`는 `http.client`가 직렬화한 헤더를 TLS 전송 함수에 넘기고
+  전송 함수가 정상 반환한 뒤 기록됩니다. 설정 딕셔너리만 출력하는 기능이 아닙니다.
+- 같은 `request_id`의 `response`에 HTTP 상태와 Content-Type, Server, CF-Ray가 기록됩니다.
+- 허용된 공개 헤더만 기록하며 Authorization·Cookie는 유무만, custNo는 존재 여부만 표시합니다.
+  Referer 쿼리/fragment, 알 수 없는 요청 쿼리와 헤더 값, 응답 본문은 기록하지 않습니다.
+- `/data/cgv-wire-traces/`(STATE_FILE 디렉터리 기준)에 실행 기록을 남겨 같은 ID는 재시작해도
+  반복하지 않습니다. 전송 실패도 실행 1회로 취급합니다. 기존 조회의 재시도 정책은 유지됩니다.
+- **클라이언트 전송 증거이지 CGV가 수신한 헤더를 서버에서 직접 확인한 증거는 아닙니다.**
+  진단 후 ID를 비워 다음 배포부터 비활성화할 수 있습니다. 기록 파일은 삭제하지 마세요.
+
 ## Mac에서 직접 실행
 
 1. `setup.command`를 실행해 `.env`를 만듭니다.
@@ -219,6 +235,7 @@ Mac이 잠자기 상태이거나 덮개가 닫혀 있으면 감시가 중단될 
 | `CGV_HEADER_PROBE_REQUEST_ID` | 빈 값 | 운영자 승인 헤더 단일 진단 ID. 성공해도 자동 조회 중단 유지 |
 | `CGV_HEADER_PROBE_DATE` | 빈 값 | 헤더 진단의 명시적 상영일(YYYY-MM-DD) |
 | `CGV_HEADER_PROBE_SEAT_URL` | 빈 값 | 익명 좌석 API 단일 검사 URL. 비어 있으면 일정 API 검사 |
+| `CGV_WIRE_TRACE_REQUEST_ID` | 빈 값 | 기존 일정 요청 1건의 직렬화된 실제 전송 헤더만 관찰하는 진단 ID |
 | `TELEGRAM_COMMAND_POLL_SECONDS` | `2` | CGV 조회 중·대기 중 Telegram 명령 확인 주기 |
 | `CGV_REQUEST_SPACING_SECONDS` | `2` | 연속 CGV 요청 사이의 최소 간격 |
 | `RATE_LIMIT_BACKOFF_INITIAL_SECONDS` | `1800` | HTTP 429 발생 후 첫 대기 시간(30분) |

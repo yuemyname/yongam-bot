@@ -32,6 +32,7 @@ import urllib.request
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from cgv_header_probe import run_header_probe_once
+from cgv_wire_trace import WireHeaderTrace
 
 
 APP_NAME = "CGV Telegram Watcher"
@@ -502,6 +503,7 @@ class Config:
     cgv_header_probe_seat_url: str = ""
     new_subscriptions_enabled: bool = True
     open_only_mode: bool = False
+    cgv_wire_trace_request_id: str = ""
 
     @classmethod
     def from_env_file(
@@ -608,8 +610,13 @@ class Config:
                 value("CGV_HEADER_PROBE_DATE"), name="CGV_HEADER_PROBE_DATE"
             )
 
+        wire_trace_id = value("CGV_WIRE_TRACE_REQUEST_ID")
+        if wire_trace_id and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", wire_trace_id):
+            raise ConfigurationError("CGV_WIRE_TRACE_REQUEST_ID 형식이 올바르지 않습니다.")
+
         return cls(
             project_dir=project_dir,
+            cgv_wire_trace_request_id=wire_trace_id,
             open_only_mode=open_only_mode,
             telegram_bot_token=token,
             telegram_chat_id=chat_id,
@@ -1276,6 +1283,10 @@ class CgvClient:
     def __init__(self, config: Config):
         self.config = config
         self.ssl_context = ssl.create_default_context()
+        self._wire_trace = WireHeaderTrace(
+            config.cgv_wire_trace_request_id, config.state_file.parent,
+            logging.getLogger("cgv_watcher"),
+        )
         self._connections: dict[
             tuple[str, str, int | None], http.client.HTTPConnection
         ] = {}
@@ -1324,6 +1335,7 @@ class CgvClient:
         last_error: Exception | None = None
         for attempt in range(attempts):
             connection = self._connection_for(url)
+            capture = self._wire_trace.begin(connection, url)
             try:
                 connection.request("GET", target, headers=dict(headers))
                 response = connection.getresponse()
@@ -1337,14 +1349,21 @@ class CgvClient:
                     "server": response.getheader("Server", ""),
                     "cf-ray": response.getheader("CF-RAY", ""),
                 }
+                if capture is not None:
+                    capture.response(status, content_type, diagnostics)
                 if response.getheader("Connection", "").lower() == "close":
                     self._drop_connection(url)
                 return status, body, content_type, location, diagnostics
             except (http.client.HTTPException, TimeoutError, OSError) as exc:
+                if capture is not None:
+                    capture.error(exc)
                 last_error = exc
                 self._drop_connection(url)
                 if attempt + 1 < attempts:
                     continue
+            finally:
+                if capture is not None:
+                    capture.close()
         assert last_error is not None
         raise last_error
 
