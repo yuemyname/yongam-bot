@@ -214,6 +214,30 @@ Railway Variables의 `CGV_RECOVERY_REQUEST_ID`에 새로운 고유 이름(예: `
 
 ## Mac에서 직접 실행
 
+### 운영자 승인 공개 헤더 비교
+
+`CGV_PUBLIC_MATRIX_REQUEST_ID`와 `CGV_PUBLIC_MATRIX_BASE_DATE`,
+`CGV_PUBLIC_MATRIX_COMPARE_DATE`(각 YYYY-MM-DD)를 지정하면 정상 실행 시작 시 최대 14건을
+30초 이상 간격으로 비교합니다. 날짜, 압축, Chrome 버전, Priority, Sec-CH 3종, Sec-Fetch 3종의
+개별 변경과 전체 조합, 마지막 기준 재확인을 포함합니다. 대상은 용산 IMAX 오디세이 일정 API뿐입니다.
+Authorization·Cookie·custNo는 어떤 경우에도 추가하지 않으며 HTTP/1.1/TLS 전송 방식을 유지합니다.
+
+- CGV_PUBLIC_MATRIX_RESULT 로그에 HTTP 결과, 압축/JSON 해석 여부, 공개 진단값만 남깁니다.
+  전송 헤더는 CGV_WIRE_TRACE 로그에서 같은 ID와 case로 연결됩니다. 본문·쿠키는 저장하지 않습니다.
+- 압축 헤더는 브라우저와 같은 값을 시험하지만 br/zstd 응답은 해석 미지원으로 표시합니다.
+  지원하지 않는 응답을 정상 JSON으로 간주하지 않습니다.
+- 403은 승인된 비교 범위 내에서만 계속하며, 429·Retry-After·challenge·요청 오류 시 즉시 종료합니다.
+  재시도/리디렉션은 없고 볼륨의 `cgv-public-matrices/` 실행 기록으로 같은 ID의 반복을 막습니다.
+- 진단 동안 정규 CGV 조회는 겹치지 않고 Telegram 명령/발송 작업자는 계속 실행됩니다.
+  진단 결과로 구독자·감지/알림 기록·복구 상태를 변경하지 않습니다.
+- 완료 후 최소 30분(기존 403/초기 429 설정 또는 Retry-After가 더 크면 그 시간) 대기한 뒤 기존 조회 흐름으로
+  돌아갑니다. 원래 중단 상태이면 중단이 유지됩니다. 재시작으로 진단을 다시 실행하지 않습니다.
+- `--dry-run`, `--once`에서는 자동 실행하지 않습니다. 로컬 독립 진단은
+  `python3 cgv_public_matrix.py --request-id <고유ID> --state-dir <진단기록폴더> --base-date YYYY-MM-DD --compare-date YYYY-MM-DD`
+  로 실행합니다. 이 명령은 .env나 Telegram 인증값을 읽지 않습니다.
+
+### 실행 순서
+
 1. `setup.command`를 실행해 `.env`를 만듭니다.
 2. `TELEGRAM_BOT_TOKEN`과 최초 운영자의 `TELEGRAM_CHAT_ID`를 입력합니다.
 3. `test_telegram.command`로 Telegram 전송을 시험합니다.

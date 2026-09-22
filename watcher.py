@@ -33,6 +33,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from cgv_header_probe import run_header_probe_once
 from cgv_wire_trace import WireHeaderTrace
+from cgv_public_matrix import run_matrix_once
 
 
 APP_NAME = "CGV Telegram Watcher"
@@ -504,6 +505,9 @@ class Config:
     new_subscriptions_enabled: bool = True
     open_only_mode: bool = False
     cgv_wire_trace_request_id: str = ""
+    cgv_public_matrix_request_id: str = ""
+    cgv_public_matrix_base_date: dt.date | None = None
+    cgv_public_matrix_compare_date: dt.date | None = None
 
     @classmethod
     def from_env_file(
@@ -614,9 +618,31 @@ class Config:
         if wire_trace_id and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", wire_trace_id):
             raise ConfigurationError("CGV_WIRE_TRACE_REQUEST_ID 형식이 올바르지 않습니다.")
 
+        matrix_id = value("CGV_PUBLIC_MATRIX_REQUEST_ID")
+        matrix_base_date = matrix_compare_date = None
+        if matrix_id:
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", matrix_id):
+                raise ConfigurationError("CGV_PUBLIC_MATRIX_REQUEST_ID 형식이 올바르지 않습니다.")
+            matrix_base_date = _parse_date(value("CGV_PUBLIC_MATRIX_BASE_DATE"), name="CGV_PUBLIC_MATRIX_BASE_DATE")
+            matrix_compare_date = _parse_date(value("CGV_PUBLIC_MATRIX_COMPARE_DATE"), name="CGV_PUBLIC_MATRIX_COMPARE_DATE")
+            if matrix_base_date == matrix_compare_date:
+                raise ConfigurationError("헤더 비교에는 서로 다른 날짜 두 개가 필요합니다.")
+            if header_probe_id or wire_trace_id:
+                raise ConfigurationError("헤더 비교는 다른 진단과 동시에 실행할 수 없습니다.")
+            if (value("CGV_API_URL", DEFAULT_API_URL) != DEFAULT_API_URL
+                    or value("CGV_BOOKING_URL", DEFAULT_BOOKING_URL) != DEFAULT_BOOKING_URL
+                    or value("CGV_COMPANY_CODE", "A420") != "A420"
+                    or value("CGV_SITE_NO", "0013") != "0013"
+                    or value("CGV_MOVIE_NO", "30001323") != "30001323"
+                    or value("CGV_RTCTL_SCOPE_CODE", "08") != "08"):
+                raise ConfigurationError("헤더 비교는 승인된 용산 IMAX 일정 조회 조건만 지원합니다.")
+
         return cls(
             project_dir=project_dir,
             cgv_wire_trace_request_id=wire_trace_id,
+            cgv_public_matrix_request_id=matrix_id,
+            cgv_public_matrix_base_date=matrix_base_date,
+            cgv_public_matrix_compare_date=matrix_compare_date,
             open_only_mode=open_only_mode,
             telegram_bot_token=token,
             telegram_chat_id=chat_id,
@@ -5503,6 +5529,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     consecutive_rate_limit_cycles = 0
     consecutive_forbidden_cycles = 0
+    matrix_checked = False
     while not stop_requested:
         if (
             not config.dynamic_date_window
@@ -5511,6 +5538,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             logger.info("감시 대상 마지막 날짜가 지나 정상 종료합니다.")
             break
         started = time.monotonic()
+        matrix_report = None
+        if config.cgv_public_matrix_request_id and not matrix_checked and not args.dry_run:
+            matrix_checked = True
+            matrix_report = run_matrix_once(
+                config.cgv_public_matrix_request_id, config.state_file.parent,
+                config.cgv_public_matrix_base_date, config.cgv_public_matrix_compare_date,
+                logger, should_stop=lambda: stop_requested,
+            )
+        if matrix_report is not None:
+            # Comparisons never feed detections/notifications or recovery state.
+            # Telegram workers keep running; normal CGV polling cannot overlap.
+            # Use at least the existing 403 cooldown before normal scanning.
+            cooldown = max(1800, config.forbidden_backoff_seconds,
+                           config.rate_limit_backoff_initial_seconds,
+                           *(item.get("retry_after_seconds", 0) for item in matrix_report["cases"]))
+            deadline = time.monotonic() + cooldown
+            logger.info("CGV 헤더 비교 종료: 정상 조회 전 %d초 대기 (기존 복구 상태 유지)", cooldown)
+            while not stop_requested and time.monotonic() < deadline:
+                time.sleep(min(0.5, deadline - time.monotonic()))
+            continue
         result = watcher.run_cycle()
         if result.cgv_paused:
             # The durable recovery gate controls whether any CGV request is
