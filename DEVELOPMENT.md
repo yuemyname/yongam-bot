@@ -64,6 +64,22 @@ BotFather의 `/setdescription`에는 저장소에서 제공하는 한글·영문
 
 ## Railway 배포
 
+### Railway → Mac 전환 시 주의
+
+동일한 봇을 두 곳에서 동시에 실행하면 Telegram 명령 수신 충돌과 중복 발송이 발생할 수 있습니다.
+`BOT_RUNTIME_ROLE=standby`를 Railway에 설정하고 재배포하면 **CGV 조회·Telegram 명령 수신·발송을 모두 중지**하며 상태 파일은 변경하지 않습니다. 기본값 `bot`은 정상 실행입니다. 알 수 없는 값은 실행을 거부합니다.
+
+1. Railway Console → Files에서 `/data/notified.json`을 먼저 백업합니다. 파일 내용이나 환경변수를 로그·채팅·Git에 붙이지 마세요.
+2. `standby` 배포와 이전 배포 종료를 확인한 **뒤** 최종 `notified.json`을 다시 다운로드합니다. 구독자만이 아니라 알림 기록·발송 대기열·Telegram 업데이트 위치를 모두 옮겨야 합니다.
+3. Mac에서 Railway 변수 JSON을 `prepare_mac.py`의 표준 입력으로 전달합니다. 예: `railway variables --json --service yongam-bot --environment production | python3 prepare_mac.py --state /절대경로/notified.json --railway-stopped`
+4. 이 명령은 `~/Library/Application Support/YongamBot`에 현재 Git 커밋의 실행본과 보호된 설정·상태·최종 백업을 준비합니다. 기존 설치가 있으면 덮어쓰지 않습니다. **아직 봇은 시작되지 않습니다.**
+5. `launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.local.cgv-odyssey-telegram-watcher.plist"`로 시작하고 `~/Library/Application Support/YongamBot/logs/watcher.log`를 확인합니다.
+6. 전환 후 Railway는 `standby`를 유지하거나 배포를 중지하고 자동 배포를 비활성화합니다. **Mac에서 바뀐 최신 상태를 복사하지 않고 이전 Railway 상태로 재시작하지 마세요.**
+
+Mac은 로그인 상태이고 인터넷이 연결되어 있어야 합니다. `caffeinate -i`는 유휴 잠자기를 막지만, 덮개를 닫거나 수동 잠자기·로그아웃·전원 종료 시의 실행을 보장하지 않습니다. LaunchAgent는 로그인 후 자동 시작합니다. 같은 설치의 중복 실행은 파일 잠금으로 방지합니다.
+
+신규 오픈 전용·가입 제한·조회 주기 등 운영 설정과 복구 상태는 그대로 보존하며, 일회성 진단 요청만 비웁니다. 앞으로의 Mac 소스 업데이트는 실행본을 새 Git 커밋으로 교체하고 LaunchAgent를 재시작해야 합니다. GitHub에 푸시하는 것만으로 Mac 실행본이 갱신되지는 않습니다.
+
 저장소: [yuemyname/yongam-bot](https://github.com/yuemyname/yongam-bot)
 
 1. Railway에서 **New Project → Deploy from GitHub repo**를 선택합니다.
