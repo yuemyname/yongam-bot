@@ -182,6 +182,33 @@ SHOW_DAY_GUIDE = (
     "알림이 도착한 요일이 아니라 영화 상영일 기준입니다."
 )
 
+# Clock-time preference is deliberately separate from show-day selection:
+# openings bypass it, but every seat alert (including fallback) uses it.
+SEAT_TIME_COMMANDS = {"/time", "/time_all"}
+SEAT_TIME_NOTE = "신규 오픈 알림에는 시간 제한을 적용하지 않습니다. (기존 알림 종류·상영일 설정은 유지)"
+SEAT_TIME_GUIDE = (
+    "잔여좌석 알림을 받을 상영 시작시간을 설정합니다. (한국시간)\n"
+    "/time 18:00 23:59 - 저녁 상영만\n"
+    "/time 22:00 02:00 - 심야 상영만 (자정 통과)\n"
+    "/time_all - 전체 시간 받기 (기본)\n\n"
+    "시작·끝 시각을 모두 포함합니다. 알림 수신 시간이 아닌 영화 시작시간 기준입니다.\n"
+    + SEAT_TIME_NOTE
+)
+
+
+def _clock_minutes(value: Any) -> int | None:
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", value)
+    return int(match[1]) * 60 + int(match[2]) if match else None
+
+
+def _seat_time_label(time_range: tuple[str, str] | None) -> str:
+    if time_range is None:
+        return "전체 시간"
+    start, end = time_range
+    return f"{start}~{end}" + (" (자정 통과)" if start > end else "")
+
 # Operator-only. Deliberately left out of /help and the BotFather command list,
 # and spelled so a subscriber does not land on it by guessing.
 ADMIN_STATS_COMMAND = "/statss"
@@ -1793,6 +1820,7 @@ class StateStore:
                         "subscribed_at": str(stored.get("subscribed_at") or ""),
                         "alert_mode": self.alert_mode(chat_id),
                         "show_day": self.show_day_selection(chat_id),
+                        "seat_time_range": self.seat_time_range(chat_id),
                         "seat_selection": self.seat_selection(chat_id),
                         "min_seats": self.min_seats(chat_id),
                     }
@@ -1892,6 +1920,49 @@ class StateStore:
             if isinstance(selection, str) and selection in SEAT_SELECTIONS:
                 return selection
             return DEFAULT_SEAT_SELECTION
+
+    def seat_time_range(self, chat_id: str) -> tuple[str, str] | None:
+        """Legacy and unset preferences mean all screening times."""
+
+        with self._lock:
+            record = self.data["subscribers"].get(str(chat_id))
+            value = record.get("seat_time_range") if isinstance(record, Mapping) else None
+            if not isinstance(value, (list, tuple)) or len(value) != 2:
+                return None
+            minutes = tuple(_clock_minutes(part) for part in value)
+            if any(part is None for part in minutes):
+                return None
+            return tuple(f"{part // 60:02d}:{part % 60:02d}" for part in minutes)
+
+    def set_seat_time_range(self, chat_id: str, value: tuple[str, str] | None) -> bool:
+        if value is not None:
+            if not isinstance(value, (list, tuple)) or len(value) != 2:
+                raise ValueError("상영 시간 범위는 시작·끝 시각이 필요합니다.")
+            minutes = tuple(_clock_minutes(part) for part in value)
+            if any(part is None for part in minutes):
+                raise ValueError("상영 시간은 00:00~23:59 형식이어야 합니다.")
+            value = tuple(f"{part // 60:02d}:{part % 60:02d}" for part in minutes)
+        with self._lock:
+            record = self.data["subscribers"].get(str(chat_id))
+            if not isinstance(record, Mapping) or self.seat_time_range(chat_id) == value:
+                return False
+            updated = dict(record)
+            updated["seat_time_range"] = list(value) if value else None
+            self.data["subscribers"][str(chat_id)] = updated
+            return True
+
+    def wants_seat_time(self, chat_id: str, show_time: str | None) -> bool:
+        time_range = self.seat_time_range(chat_id)
+        if time_range is None:
+            return True
+        current = _clock_minutes(show_time)
+        if current is None:
+            # Never guess an unknown time for a subscriber who opted in.
+            return False
+        start, end = (_clock_minutes(part) for part in time_range)
+        if start <= end:
+            return start <= current <= end
+        return current >= start or current <= end
 
     def set_seat_selection(self, chat_id: str, selection: str) -> bool:
         """Store a preferred-seat preset; returns False when unchanged."""
@@ -2022,6 +2093,7 @@ class StateStore:
         category: str,
         *,
         show_date: str | None = None,
+        show_time: str | None = None,
         seats_available: int | None = None,
     ) -> bool:
         """Persist one Telegram delivery without duplicating the outbox."""
@@ -2037,6 +2109,7 @@ class StateStore:
                 "text": text,
                 "category": category,
                 "show_date": show_date or "",
+                "show_time": show_time or "",
                 "seats_available": seats_available,
                 "priority": DELIVERY_CATEGORY_PRIORITIES.get(
                     category, DEFAULT_DELIVERY_PRIORITY
@@ -2173,6 +2246,19 @@ class StateStore:
                     show_date = raw.get("show_date")
                     if isinstance(show_date, str) and show_date:
                         copied["show_date"] = show_date
+                    show_time = raw.get("show_time")
+                    if not show_time and category in {
+                        ALERT_SEATS, ALERT_SEATS_SWEET, ALERT_SEATS_UNCLASSIFIED,
+                    }:
+                        # Queued messages from before this release have no
+                        # metadata. Recover only the exact known field label.
+                        match = re.search(
+                            r"^(?:상영 시간|상영 시작시간): ([0-2]?\d:[0-5]\d)$",
+                            text, re.MULTILINE,
+                        )
+                        show_time = match[1] if match else None
+                    if _clock_minutes(show_time) is not None:
+                        copied["show_time"] = show_time
                     seats_available = raw.get("seats_available")
                     if isinstance(seats_available, int):
                         copied["seats_available"] = seats_available
@@ -2216,11 +2302,13 @@ class StateStore:
             show_days = {selection: 0 for selection in SHOW_DAY_SELECTIONS}
             seat_selections = {selection: 0 for selection in SEAT_SELECTIONS}
             min_seats_counts = {minimum: 0 for minimum in MIN_SEATS_CHOICES}
+            seat_times = {"all": 0, "filtered": 0}
             for chat_id, record in self.data["subscribers"].items():
                 modes[self.alert_mode(chat_id)] += 1
                 show_days[self.show_day_selection(chat_id)] += 1
                 seat_selections[self.seat_selection(chat_id)] += 1
                 min_seats_counts[self.min_seats(chat_id)] += 1
+                seat_times["filtered" if self.seat_time_range(chat_id) else "all"] += 1
                 kind = ""
                 if isinstance(record, Mapping):
                     kind = str(record.get("chat_type") or "")
@@ -2231,6 +2319,7 @@ class StateStore:
                 "show_days": show_days,
                 "seat_selections": seat_selections,
                 "min_seats": min_seats_counts,
+                "seat_times": seat_times,
                 "chat_types": chat_types,
             }
 
@@ -2240,6 +2329,7 @@ class StateStore:
         *,
         seats_available: int | None = None,
         show_date: str | None = None,
+        show_time: str | None = None,
     ) -> tuple[str, ...]:
         """Subscribers who opted in to this alert category.
 
@@ -2250,6 +2340,7 @@ class StateStore:
 
         ``show_date`` is the ISO date printed in a movie alert.  Omitting it
         keeps non-show messages such as announcements outside the day filter.
+        ``show_time`` filters seat alerts only; openings ignore the clock.
         """
 
         def wants_this_many(chat_id: str) -> bool:
@@ -2277,6 +2368,7 @@ class StateStore:
                 ALERT_SEATS,
                 seats_available=seats_available,
                 show_date=show_date,
+                show_time=show_time,
             )
         if category in {ALERT_SEATS, ALERT_SEATS_SWEET}:
             selection = (
@@ -2290,6 +2382,7 @@ class StateStore:
                     for chat_id in self.data["subscribers"]
                     if ALERT_SEATS in ALERT_MODES[self.alert_mode(chat_id)]
                     and wants_this_date(chat_id)
+                    and self.wants_seat_time(chat_id, show_time)
                     and self.seat_selection(chat_id) == selection
                     and wants_this_many(chat_id)
                 )
@@ -2314,6 +2407,7 @@ class StateStore:
                 "chat_type": chat_type[:30],
                 "alert_mode": DEFAULT_ALERT_MODE,
                 "show_day": DEFAULT_SHOW_DAY,
+                "seat_time_range": None,
                 "seat_selection": DEFAULT_SEAT_SELECTION,
                 "min_seats": MIN_SEATS_DEFAULT,
             }
@@ -3524,6 +3618,7 @@ class Watcher:
         category: str = ALERT_SYSTEM,
         seats_available: int | None = None,
         show_date: str | None = None,
+        show_time: str | None = None,
         recipients: Sequence[str] | None = None,
     ) -> tuple[int, int, int]:
         """Deliver or durably queue a message for the opted-in subscribers.
@@ -3550,6 +3645,7 @@ class Watcher:
                 category,
                 seats_available=seats_available,
                 show_date=show_date,
+                show_time=show_time,
             )
         )
         if subscriber_ids and self._delivery_worker_running():
@@ -3560,6 +3656,7 @@ class Watcher:
                     text,
                     category,
                     show_date=show_date,
+                    show_time=show_time,
                     seats_available=seats_available,
                 ):
                     added += 1
@@ -3611,6 +3708,7 @@ class Watcher:
                         text,
                         category,
                         show_date=show_date,
+                        show_time=show_time,
                         seats_available=seats_available,
                     )
                     self.logger.error(
@@ -3681,6 +3779,7 @@ class Watcher:
                     category,
                     seats_available=record.get("seats_available"),
                     show_date=record.get("show_date"),
+                    show_time=record.get("show_time"),
                 )
             )
             if chat_id not in eligible:
@@ -3796,6 +3895,12 @@ class Watcher:
                 f"{stats['seat_selections'][selection]}명"
             )
 
+        lines.extend([
+            "", "잔여좌석 상영 시간",
+            f"• 전체 시간 — {stats['seat_times']['all']}명",
+            f"• 시간 범위 설정 — {stats['seat_times']['filtered']}명",
+        ])
+
         lines.append("")
         lines.append("예매 가능 최소 좌석")
         for minimum in MIN_SEATS_CHOICES:
@@ -3831,6 +3936,7 @@ class Watcher:
                         (
                             ALERT_MODE_LABELS[record["alert_mode"]],
                             SHOW_DAY_LABELS[record["show_day"]],
+                            _seat_time_label(record["seat_time_range"]),
                             SEAT_SELECTION_LABELS[record["seat_selection"]],
                             MIN_SEATS_LABELS[record["min_seats"]],
                         )
@@ -4143,6 +4249,36 @@ class Watcher:
             return (f"📅 이미 이렇게 설정되어 있습니다.\n→ {label}", False)
         return (f"✅ 알림 상영일을 변경했습니다.\n→ {label}", True)
 
+    def _handle_seat_time_command(
+        self, chat_id: str, command: str, body: str
+    ) -> tuple[str, bool]:
+        if not self.state.is_subscribed(chat_id):
+            return ("먼저 /start로 구독해주세요.\n\n" + SEAT_TIME_GUIDE, False)
+        if command == "/time" and not body:
+            return (
+                "🕒 현재 잔여좌석 상영 시간: "
+                + _seat_time_label(self.state.seat_time_range(chat_id))
+                + "\n\n" + SEAT_TIME_GUIDE,
+                False,
+            )
+        fields = body.split()
+        if (command == "/time_all" and fields) or (
+            command == "/time"
+            and (len(fields) != 2 or any(_clock_minutes(part) is None for part in fields))
+        ):
+            return ("시간 형식을 확인해주세요. 예: /time 18:00 23:59\n\n" + SEAT_TIME_GUIDE, False)
+        requested = tuple(fields) if command == "/time" else None
+        changed = self.state.set_seat_time_range(chat_id, requested)
+        label = _seat_time_label(self.state.seat_time_range(chat_id))
+        note = ""
+        if ALERT_SEATS not in ALERT_MODES[self.state.alert_mode(chat_id)]:
+            note = "\n참고: 현재 잔여좌석 알림이 꺼져 있습니다. /mode 확인"
+        return (
+            ("✅ 잔여좌석 상영 시간을 변경했습니다." if changed else "🕒 이미 설정된 상영 시간입니다.")
+            + f"\n→ {label} (한국시간)\n{SEAT_TIME_NOTE}{note}\n설정 해제: /time_all",
+            changed,
+        )
+
     def _handle_min_seats_command(
         self, chat_id: str, command: str, argument: str
     ) -> tuple[str, bool]:
@@ -4263,6 +4399,7 @@ class Watcher:
                     {"/start", "/subscribe"}
                     | MODE_COMMANDS
                     | SHOW_DAY_COMMANDS
+                    | SEAT_TIME_COMMANDS
                     | SEAT_SELECTION_COMMANDS
                     | MIN_SEATS_COMMANDS
                 )
@@ -4287,16 +4424,18 @@ class Watcher:
                 reply += (
                     "\n\n🔔 기본 설정"
                     "\n• 신규 예매 오픈 + 예매 가능 좌석 알림"
-                    "\n• 모든 요일 상영분"
+                    "\n• 모든 요일 상영분 · 잔여좌석 전체 시간"
                     "\n• 잔여 좌석은 모든 A열 제외 좌석"
                     "\n• 1석부터 모두 알림"
                     "\n\n필요할 때만 설정을 바꾸세요."
                     "\n• 알림 종류 선택: /mode"
                     "\n• 주말 상영분만 받기: /day_weekend"
+                    "\n• 잔여좌석 상영 시간 선택: /time (예: /time 18:00 23:59)"
                     "\n• 잔여 좌석 대상 선택: /seat"
                     "\n• 명당 좌석만 받기: /seat_sweet"
                     "\n• 2석 이상 남았을 때만 받기: /count_2"
-                    "\n\n※ 신규 예매 오픈은 좌석 설정과 관계없이 항상 알려드립니다."
+                    "\n※ 신규 예매 오픈은 좌석·시간 설정과 관계없이 알려드립니다."
+                    " (기존 알림 종류·상영일 설정은 유지)"
                     "\n현재 설정 /status · 자세한 설명 /desc · 해지 /stop"
                 )
             elif command in {"/stop", "/unsubscribe"}:
@@ -4321,6 +4460,11 @@ class Watcher:
                         "알림 상영일: "
                         f"{SHOW_DAY_LABELS[self.state.show_day_selection(chat_id)]}"
                     )
+                    reply += (
+                        "\n잔여좌석 상영 시간: "
+                        + _seat_time_label(self.state.seat_time_range(chat_id))
+                        + " (한국시간, 신규 오픈에는 미적용)"
+                    )
                     if ALERT_SEATS in ALERT_MODES[mode]:
                         selection_label = SEAT_SELECTION_LABELS[
                             self.state.seat_selection(chat_id)
@@ -4333,6 +4477,7 @@ class Watcher:
                     reply += (
                         "\n\n알림 종류 변경: /mode"
                         "\n알림 상영일 변경: /day"
+                        "\n잔여좌석 상영 시간 변경: /time · 해제: /time_all"
                         "\n잔여 좌석 대상 변경: /seat"
                         "\n예매 가능 최소 좌석 변경: /count"
                     )
@@ -4349,11 +4494,11 @@ class Watcher:
                 )
                 state_changed = state_changed or mode_changed
             elif self.config.open_only_mode and command in (
-                SEAT_SELECTION_COMMANDS | MIN_SEATS_COMMANDS
+                SEAT_SELECTION_COMMANDS | MIN_SEATS_COMMANDS | SEAT_TIME_COMMANDS
             ):
                 reply = (
                     "🎟️ 현재 봇은 신규 오픈 전용으로 운영 중입니다.\n"
-                    "잔여좌석 조회·취소표 알림은 중단되어 좌석·최소 좌석 수 설정은 적용되지 않습니다.\n"
+                    "잔여좌석 조회·취소표 알림은 중단되어 좌석·최소 좌석 수·시간 설정은 적용되지 않습니다.\n"
                     "기존 설정은 그대로 보관합니다. 현재 설정: /status"
                 )
             elif command in SHOW_DAY_COMMANDS:
@@ -4361,6 +4506,11 @@ class Watcher:
                     chat_id, command, argument
                 )
                 state_changed = state_changed or show_day_changed
+            elif command in SEAT_TIME_COMMANDS:
+                reply, seat_time_changed = self._handle_seat_time_command(
+                    chat_id, command, body
+                )
+                state_changed = state_changed or seat_time_changed
             elif command in SEAT_SELECTION_COMMANDS:
                 reply, seat_selection_changed = self._handle_seat_selection_command(
                     chat_id, command, argument
@@ -4401,6 +4551,8 @@ class Watcher:
                     "/day - 알림 상영일 선택\n"
                     "/day_all - 모든 요일 상영분 받기\n"
                     "/day_weekend - 토·일 상영분만 받기\n"
+                    "/time - 잔여좌석 상영 시간 확인·변경\n"
+                    "/time_all - 잔여좌석 전체 시간 받기\n"
                     "/seat - 잔여 좌석 대상 선택\n"
                     "/seat_all - 모든 A열 제외 좌석 받기 (기본)\n"
                     "/seat_sweet - 명당 좌석만 받기\n"
@@ -4410,8 +4562,10 @@ class Watcher:
                     "/desc - 봇 설명과 사용 방법\n"
                     "/coffee - 개발자에게 커피 후원\n"
                     "/help - 전체 명령어 보기\n\n"
-                    "/mode · /day · /seat · /count 는 선택 사항입니다.\n"
-                    "그대로 두시면 모든 알림을 받습니다."
+                    "/mode · /day · /time · /seat · /count 는 선택 사항입니다.\n"
+                    "그대로 두시면 모든 알림을 받습니다.\n"
+                    "시간 설정 예: /time 18:00 23:59\n"
+                    "시간 제한은 잔여좌석 알림에만 적용됩니다."
                 )
             elif command in {"/desc", "/description"}:
                 reply = (
@@ -4431,6 +4585,7 @@ class Watcher:
                     "⚙️ 기본 설정\n"
                     "• 신규 예매 오픈 + 예매 가능 좌석 알림\n"
                     "• 모든 A열 제외 좌석 알림\n"
+                    "• 모든 요일·전체 상영 시간\n"
                     "• 별도 설정 없이 바로 사용 가능\n\n"
                     "🔧 알림 종류 선택\n"
                     "• /mode — 현재 설정과 선택 방법 확인\n"
@@ -4444,6 +4599,13 @@ class Watcher:
                     "• /day — 현재 설정 확인\n"
                     "※ 알림 도착 요일이 아니라 영화 상영일 기준이며, "
                     "오픈·좌석 알림에 모두 적용\n\n"
+                    "🕒 잔여좌석 상영 시간 (선택 사항)\n"
+                    "• /time — 현재 설정과 사용 방법\n"
+                    "• /time 18:00 23:59 — 저녁 상영만\n"
+                    "• /time 22:00 02:00 — 자정을 넘는 심야 상영만\n"
+                    "• /time_all — 전체 시간 받기 (기본)\n"
+                    "※ 한국시간 상영 시작시각 기준, 시작·끝 시각 포함. "
+                    "잔여좌석 알림에만 적용하며 신규 오픈에는 시간 제한 없음\n\n"
                     "💺 잔여 좌석 대상 (선택 사항)\n"
                     "기본값은 모든 A열 제외 좌석입니다.\n"
                     "• /seat_all — 모든 A열 제외 좌석 알림 (기본)\n"
@@ -4452,7 +4614,7 @@ class Watcher:
                     "  Experienced: H13~32, I13~32\n"
                     "  SweetSpot: J11~34, K11~34, L11~34\n"
                     "• /seat — 현재 좌석 대상 확인\n"
-                    "※ 신규 예매 오픈 알림은 좌석 설정과 관계없이 항상 전송\n\n"
+                    "※ 신규 예매 오픈 알림에는 좌석·시간 제한 미적용 (알림 종류·상영일 설정 유지)\n\n"
                     "🎫 예매 가능 최소 좌석 (선택 사항)\n"
                     "기본값은 1석부터 모두 받기입니다.\n"
                     "• /count_1 — 1석부터 모두 받기 (기본)\n"
@@ -5082,12 +5244,14 @@ class Watcher:
                 all_category,
                 seats_available=open_all,
                 show_date=session.date,
+                show_time=session.start_time,
             ):
                 delivered, failed, total = self._broadcast_message(
                     seat_change_message(session, previous, current, self.config),
                     category=all_category,
                     seats_available=open_all,
                     show_date=session.date,
+                    show_time=session.start_time,
                 )
             else:
                 delivered = failed = total = 0
@@ -5102,6 +5266,7 @@ class Watcher:
                     ALERT_SEATS_SWEET,
                     seats_available=open_sweet,
                     show_date=session.date,
+                    show_time=session.start_time,
                 )
             ):
                 sweet_delivered, sweet_failed, sweet_total = self._broadcast_message(
@@ -5115,6 +5280,7 @@ class Watcher:
                     category=ALERT_SEATS_SWEET,
                     seats_available=open_sweet,
                     show_date=session.date,
+                    show_time=session.start_time,
                 )
                 delivered += sweet_delivered
                 failed += sweet_failed

@@ -4284,7 +4284,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             for index in range(4):
                 self.assertIn(str(2000 + index), operator_reply)
             self.assertIn(
-                "신규 오픈만 · 모든 요일 상영분 · 모든 A열 제외 좌석 · "
+                "신규 오픈만 · 모든 요일 상영분 · 전체 시간 · 모든 A열 제외 좌석 · "
                 "1석부터 모두",
                 operator_reply,
             )
@@ -4381,7 +4381,8 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertIn("주말 상영분만 받기: /day_weekend", welcome)
             self.assertIn("잔여 좌석 대상 선택: /seat", welcome)
             self.assertIn("명당 좌석만 받기: /seat_sweet", welcome)
-            self.assertIn("신규 예매 오픈은 좌석 설정과 관계없이 항상", welcome)
+            self.assertIn("신규 예매 오픈은 좌석·시간 설정과 관계없이", welcome)
+            self.assertIn("/time 18:00 23:59", welcome)
             # Listing every setting made a finished subscription look unfinished.
             for command in ("/mode_all", "/mode_open", "/mode_seats", "/seat_all"):
                 self.assertNotIn(command, welcome)
@@ -4439,7 +4440,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             # The verified/unverified split is gone; one seat choice remains.
             self.assertNotIn("/seat_verified", description)
             self.assertNotIn("/seat_default", description)
-            self.assertIn("신규 예매 오픈 알림은 좌석 설정과 관계없이 항상", description)
+            self.assertIn("신규 예매 오픈 알림에는 좌석·시간 제한 미적용", description)
             self.assertIn("/start — 알림 구독", description)
             self.assertIn("명당만 원하면 /seat_sweet", description)
             self.assertIn(
