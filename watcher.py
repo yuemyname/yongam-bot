@@ -68,6 +68,8 @@ PENDING_DELIVERY_TTL_HOURS = 24
 # queue again.  That lets a newly discovered opening jump ahead of an older
 # seat-change backlog even when hundreds of people are subscribed.
 DELIVERY_RETRY_BACKOFF_MAX_SECONDS = 300
+TELEGRAM_FLOOD_WAIT_FALLBACK_SECONDS = 60
+TELEGRAM_FLOOD_WAIT_MARGIN_SECONDS = 1
 
 # Scanning strategy.  "full" requests every date in the window each cycle.
 # "cursor" requests only the already-open range plus a short probe past the
@@ -94,12 +96,15 @@ ALERT_SYSTEM = "system"
 # An announcement the operator typed.  Everyone subscribed gets it, whatever
 # they set /mode to — it is not one of the alerts those settings filter.
 ALERT_NOTICE = "notice"
+# Direct command replies are addressed even to unsubscribed chats.
+ALERT_REPLY = "reply"
 
 # Smaller numbers leave the durable Telegram outbox first.  Booking openings
 # are the reason this bot exists, so they always pre-empt seat changes and
 # operator announcements at the next short sender batch boundary.
 DELIVERY_CATEGORY_PRIORITIES = {
     ALERT_OPEN: 0,
+    ALERT_REPLY: 5,
     ALERT_SEATS: 10,
     ALERT_SEATS_SWEET: 10,
     ALERT_SEATS_UNCLASSIFIED: 10,
@@ -415,10 +420,16 @@ class TelegramError(RuntimeError):
         *,
         status_code: int | None = None,
         description: str = "",
+        retry_after_seconds: int | None = None,
     ):
         super().__init__(message)
         self.status_code = status_code
         self.description = description
+        self.retry_after_seconds = retry_after_seconds
+
+    @property
+    def rate_limited(self) -> bool:
+        return self.status_code == 429
 
     @property
     def recipient_gone(self) -> bool:
@@ -1584,14 +1595,44 @@ class CgvClient:
         )
 
 
+class TelegramDeferred(TelegramError):
+    """No send attempted: preserve the outbox without counting a failure."""
+
+    def __init__(self, retry_at: dt.datetime):
+        super().__init__("Telegram 발송 대기 중 (대기열에 보관)")
+        self.retry_at = retry_at
+
+
+def _telegram_retry_after(parsed: Any) -> int | None:
+    if not isinstance(parsed, Mapping):
+        return None
+    parameters = parsed.get("parameters")
+    value = parameters.get("retry_after") if isinstance(parameters, Mapping) else None
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    # Some proxies omit parameters but retain Telegram's English description.
+    match = re.search(r"\bretry after ([0-9]+)\b", str(parsed.get("description", "")), re.I)
+    return int(match[1]) if match else None
+
+
 class TelegramClient:
     def __init__(self, bot_token: str, chat_id: str, *, timeout: int = 15):
         self.bot_token = bot_token
         self.chat_id = chat_id
         self.timeout = timeout
         self.ssl_context = ssl.create_default_context()
+        self._chat_send_lock = threading.Lock()
+        self._chat_next_send: dict[str, float] = {}
 
     def send_message(self, text: str, *, chat_id: str | None = None) -> None:
+        target = str(chat_id or self.chat_id)
+        with self._chat_send_lock:
+            now = time.monotonic()
+            delay = self._chat_next_send.get(target, 0.0) - now
+            if delay > 0:
+                raise TelegramDeferred(dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=delay))
+            # Respect both per-chat and per-group limits, including replies.
+            self._chat_next_send[target] = now + (3.1 if target.startswith("-") else 1.1)
         endpoint = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         payload = json.dumps(
             {
@@ -1614,6 +1655,7 @@ class TelegramClient:
                 body = response.read(1_000_000)
         except urllib.error.HTTPError as exc:
             detail = ""
+            parsed = {}
             try:
                 parsed = json.loads(exc.read(100_000).decode("utf-8"))
                 detail = str(parsed.get("description", ""))[:180]
@@ -1624,6 +1666,7 @@ class TelegramClient:
                 f"Telegram 응답 오류: HTTP {exc.code}{suffix}",
                 status_code=exc.code,
                 description=detail,
+                retry_after_seconds=_telegram_retry_after(parsed),
             ) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             reason = str(getattr(exc, "reason", None) or exc)
@@ -1637,7 +1680,9 @@ class TelegramClient:
         if not parsed.get("ok"):
             description = str(parsed.get("description", "알 수 없는 오류"))[:180]
             raise TelegramError(
-                f"Telegram 전송 실패: {description}", description=description
+                f"Telegram 전송 실패: {description}", description=description,
+                status_code=parsed.get("error_code"),
+                retry_after_seconds=_telegram_retry_after(parsed),
             )
 
     def get_updates(self, *, offset: int) -> list[Mapping[str, Any]]:
@@ -1733,6 +1778,7 @@ class StateStore:
             "last_error_notified_at": "",
             "cgv_recovery": {},
             "seat_api_backoff": {},
+            "telegram_send_backoff": {},
         }
 
     def load(self) -> None:
@@ -1761,6 +1807,8 @@ class StateStore:
                 raise RuntimeError(f"CGV 재확인 상태 파일 형식이 올바르지 않습니다: {self.path}")
             if not isinstance(loaded.get("seat_api_backoff", {}), dict):
                 raise RuntimeError(f"좌석 API 대기 상태 파일 형식이 올바르지 않습니다: {self.path}")
+            if not isinstance(loaded.get("telegram_send_backoff", {}), dict):
+                raise RuntimeError("Telegram 발송 대기 상태 형식이 올바르지 않습니다.")
             self.data.update(loaded)
             self.data["version"] = STATE_VERSION
             self.data.setdefault("seat_counts", {})
@@ -1792,6 +1840,56 @@ class StateStore:
     def was_notified(self, key: str) -> bool:
         with self._lock:
             return key in self.data["notified"]
+
+    def telegram_send_retry_at(self) -> dt.datetime | None:
+        with self._lock:
+            raw = self.data.get("telegram_send_backoff", {}).get("retry_at")
+            if not raw:
+                return None
+            parsed = dt.datetime.fromisoformat(raw)
+            if parsed.tzinfo is None:
+                raise RuntimeError("Telegram 발송 대기 시각에 시간대가 없습니다.")
+            return parsed.astimezone(dt.timezone.utc)
+
+    @staticmethod
+    def _delivery_expiry(record: Mapping[str, Any]) -> dt.datetime:
+        raw = record.get("expires_at") or record.get("queued_at", "")
+        parsed = dt.datetime.fromisoformat(str(raw))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        if not record.get("expires_at"):
+            parsed += dt.timedelta(hours=PENDING_DELIVERY_TTL_HOURS)
+        return parsed
+
+    def pause_telegram_sends(self, retry_at: dt.datetime, now: dt.datetime) -> bool:
+        """Persist the longest wait; exclude flood-wait time from queue TTL."""
+
+        with self._lock:
+            previous = self.telegram_send_retry_at()
+            blocked_from = max(now, previous) if previous else now
+            if retry_at <= blocked_from:
+                return False
+            extension = retry_at - blocked_from
+            for record in self.data["pending_deliveries"].values():
+                if not isinstance(record, dict):
+                    continue
+                try:
+                    record["expires_at"] = (self._delivery_expiry(record) + extension).isoformat()
+                except (ValueError, TypeError):
+                    continue
+            self.data["telegram_send_backoff"] = {
+                "retry_at": retry_at.isoformat(), "observed_at": now.isoformat(),
+                "reason": "Telegram HTTP 429",
+            }
+            return True
+
+    def defer_pending_delivery(self, key: str, retry_at: dt.datetime) -> bool:
+        with self._lock:
+            record = self.data["pending_deliveries"].get(key)
+            if not isinstance(record, dict):
+                return False
+            record["next_attempt_at"] = retry_at.isoformat()
+            return True
 
     def mark_notified(self, key: str, session: BookingSession) -> None:
         with self._lock:
@@ -2189,6 +2287,10 @@ class StateStore:
             bucket = self.data.setdefault("pending_deliveries", {})
             if key in bucket:
                 return False
+            now = dt.datetime.now(dt.timezone.utc)
+            retry_at = self.telegram_send_retry_at()
+            expires_at = max(now, retry_at) if retry_at else now
+            expires_at += dt.timedelta(hours=PENDING_DELIVERY_TTL_HOURS)
             bucket[key] = {
                 "chat_id": str(chat_id),
                 "text": text,
@@ -2199,10 +2301,12 @@ class StateStore:
                 "priority": DELIVERY_CATEGORY_PRIORITIES.get(
                     category, DEFAULT_DELIVERY_PRIORITY
                 ),
-                "queued_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "queued_at": now.isoformat(),
                 "attempts": 0,
                 "next_attempt_at": "",
             }
+            if retry_at and retry_at > now:
+                bucket[key]["expires_at"] = expires_at.isoformat()
             return True
 
     def drop_pending_for_chat(self, chat_id: str) -> int:
@@ -2252,28 +2356,23 @@ class StateStore:
         could otherwise hold a queue entry indefinitely.
         """
 
-        cutoff = now - dt.timedelta(hours=PENDING_DELIVERY_TTL_HOURS)
         removed = 0
         with self._lock:
             bucket = self.data.setdefault("pending_deliveries", {})
             for key in list(bucket):
                 record = bucket.get(key)
-                queued_at = None
+                expires_at = None
                 if isinstance(record, Mapping):
                     try:
-                        queued_at = dt.datetime.fromisoformat(
-                            str(record.get("queued_at", ""))
-                        )
-                    except ValueError:
-                        queued_at = None
-                if queued_at is None:
+                        expires_at = self._delivery_expiry(record)
+                    except (ValueError, TypeError):
+                        expires_at = None
+                if expires_at is None:
                     # Unreadable timestamp: drop it rather than keep it forever.
                     bucket.pop(key, None)
                     removed += 1
                     continue
-                if queued_at.tzinfo is None:
-                    queued_at = queued_at.replace(tzinfo=dt.timezone.utc)
-                if queued_at < cutoff:
+                if expires_at < now:
                     bucket.pop(key, None)
                     removed += 1
         return removed
@@ -3082,6 +3181,7 @@ class Watcher:
             timeout=config.request_timeout_seconds,
         )
         self.state = StateStore(config.state_file)
+        self._telegram_send_gate = threading.Lock()
         self._last_cgv_request_finished_at: float | None = None
         self._telegram_broadcast_limiter = _BroadcastRateLimiter(
             config.telegram_broadcast_rate_per_second
@@ -3100,6 +3200,8 @@ class Watcher:
         self._recovery_payloads: dict[dt.date, Any] = {}
         self._header_probe_checked = False
         self.state.load()
+        # Validate a persisted wait before any sender can start (fail closed).
+        self.state.telegram_send_retry_at()
         if not self.state.subscribers_initialized:
             self.state.initialize_subscribers(config.telegram_chat_id)
             if not self.dry_run:
@@ -3116,6 +3218,63 @@ class Watcher:
                     now + dt.timedelta(seconds=config.cgv_recovery_pause_seconds)
                 ).isoformat(),
             })
+
+    def _telegram_pause_until(self) -> dt.datetime | None:
+        retry_at = self.state.telegram_send_retry_at()
+        return retry_at if retry_at and retry_at > dt.datetime.now(dt.timezone.utc) else None
+
+    def telegram_send_status_text(self) -> str:
+        retry_at = self._telegram_pause_until()
+        if not retry_at:
+            return ""
+        local = retry_at.astimezone(ZoneInfo(self.config.timezone_name))
+        return (
+            f"⏳ Telegram 발송 제한 대기: {local:%Y-%m-%d %H:%M:%S %Z} 이후 재시도\n"
+            "CGV 조회·설정 변경은 계속하며 알림과 답장은 대기열에 보관합니다."
+        )
+
+    def _send_telegram(self, text: str, *, chat_id: str) -> None:
+        # Do not hold this gate through network I/O. Requests already in flight
+        # may complete, but no new request starts after the shared pause is set.
+        with self._telegram_send_gate:
+            if retry_at := self._telegram_pause_until():
+                raise TelegramDeferred(retry_at)
+        self._telegram_broadcast_limiter.wait()
+        with self._telegram_send_gate:
+            if retry_at := self._telegram_pause_until():
+                raise TelegramDeferred(retry_at)
+        try:
+            self.telegram.send_message(text, chat_id=chat_id)
+        except TelegramError as exc:
+            if not exc.rate_limited:
+                raise
+            seconds = exc.retry_after_seconds
+            if seconds is None:
+                seconds = TELEGRAM_FLOOD_WAIT_FALLBACK_SECONDS
+            now = dt.datetime.now(dt.timezone.utc)
+            retry_at = now + dt.timedelta(seconds=seconds + TELEGRAM_FLOOD_WAIT_MARGIN_SECONDS)
+            with self._telegram_send_gate:
+                changed = self.state.pause_telegram_sends(retry_at, now)
+                retry_at = self.state.telegram_send_retry_at()
+                if changed:
+                    # Durable before other workers or a restart can send again.
+                    self.state.save()
+                    self.logger.warning(
+                        "Telegram HTTP 429: 전체 발송 대기, 재시도 %s (CGV 조회 유지)",
+                        retry_at.astimezone(ZoneInfo(self.config.timezone_name)).isoformat(),
+                    )
+                    self._delivery_wake_event.set()
+            raise TelegramDeferred(retry_at) from exc
+
+    def _send_or_queue_reply(self, text: str, *, chat_id: str) -> bool:
+        try:
+            self._send_telegram(text, chat_id=chat_id)
+        except TelegramDeferred:
+            self.state.queue_pending_delivery(chat_id, text, ALERT_REPLY)
+            self.state.save()
+            self._delivery_wake_event.set()
+            return False
+        return True
 
     def _save_cgv_recovery(self, record: Mapping[str, Any]) -> None:
         self.state.set_cgv_recovery(record)
@@ -3455,7 +3614,20 @@ class Watcher:
     def _delivery_loop(self) -> None:
         """Drain short priority batches while CGV scanning continues."""
 
+        waiting = False
         while not self._delivery_stop_event.is_set():
+            if retry_at := self._telegram_pause_until():
+                if not waiting:
+                    self.logger.info(self.telegram_send_status_text())
+                waiting = True
+                remaining = (retry_at - dt.datetime.now(dt.timezone.utc)).total_seconds()
+                # New queue entries never wake this flood wait early. Shutdown
+                # is interruptible; no worker sleeps for hours on network work.
+                self._delivery_stop_event.wait(min(30.0, max(0.05, remaining)))
+                continue
+            if waiting:
+                self.logger.info("Telegram 발송 대기 종료: 신규 오픈 우선으로 재시도합니다.")
+                waiting = False
             now = dt.datetime.now(dt.timezone.utc)
             pending = self.state.pending_deliveries()
             due = [
@@ -3717,7 +3889,7 @@ class Watcher:
 
         In the long-running service the first value is the number accepted by
         the persistent outbox; without the background worker (tests and
-        ``--once``) it remains the number synchronously delivered.  The total
+        ``--once``) it counts delivered messages plus safely deferred sends. The total
         counts only selected recipients, so state still advances when nobody
         wants this category (total == 0) instead of retrying forever.
 
@@ -3767,12 +3939,12 @@ class Watcher:
 
         delivered = 0
         failed = 0
+        deferred = 0
         broadcast_started = time.monotonic()
 
         def send(chat_id: str) -> tuple[str, TelegramError | None]:
-            self._telegram_broadcast_limiter.wait()
             try:
-                self.telegram.send_message(text, chat_id=chat_id)
+                self._send_telegram(text, chat_id=chat_id)
             except TelegramError as exc:
                 return chat_id, exc
             return chat_id, None
@@ -3789,7 +3961,10 @@ class Watcher:
 
         for chat_id, error in results:
             if error is not None:
-                failed += 1
+                if isinstance(error, TelegramDeferred):
+                    deferred += 1
+                else:
+                    failed += 1
                 if error.recipient_gone:
                     # Blocked or deleted chats never recover, and they cannot
                     # send /stop to remove themselves, so drop them here.
@@ -3803,9 +3978,8 @@ class Watcher:
                         show_time=show_time,
                         seats_available=seats_available,
                     )
-                    self.logger.error(
-                        "전송 실패(다음 주기 재시도): %s", error
-                    )
+                    if not isinstance(error, TelegramDeferred):
+                        self.logger.error("전송 실패(다음 주기 재시도): %s", error)
             else:
                 delivered += 1
         if len(subscriber_ids) > 1:
@@ -3825,7 +3999,7 @@ class Watcher:
                 self.logger.warning(
                     "전송 생략: 등록된 구독자가 없습니다."
                 )
-        return delivered, failed, len(subscriber_ids)
+        return delivered + deferred, failed, len(subscriber_ids)
 
     def _drop_unreachable_subscriber(
         self, chat_id: str, error: TelegramError
@@ -3848,7 +4022,7 @@ class Watcher:
     ) -> None:
         """Retry only recipients who missed an earlier broadcast."""
 
-        if self.dry_run:
+        if self.dry_run or self._telegram_pause_until():
             return
         changed = False
         eligible_records: list[tuple[str, Mapping[str, Any]]] = []
@@ -3864,7 +4038,7 @@ class Watcher:
                 continue
             # ALERT_SYSTEM has no subscribers by design — it is addressed to
             # the operator — so ask the same source the original send used.
-            eligible = set(
+            eligible = {chat_id} if category == ALERT_REPLY else set(
                 self._operator_recipients()
                 if category == ALERT_SYSTEM
                 else self.state.subscriber_ids_for(
@@ -3884,9 +4058,8 @@ class Watcher:
         ) -> tuple[str, str, TelegramError | None]:
             key, record = item
             chat_id = record["chat_id"]
-            self._telegram_broadcast_limiter.wait()
             try:
-                self.telegram.send_message(record["text"], chat_id=chat_id)
+                self._send_telegram(record["text"], chat_id=chat_id)
             except TelegramError as exc:
                 return key, chat_id, exc
             return key, chat_id, None
@@ -3903,6 +4076,9 @@ class Watcher:
 
         for key, chat_id, error in results:
             if error is not None:
+                if isinstance(error, TelegramDeferred):
+                    changed = self.state.defer_pending_delivery(key, error.retry_at) or changed
+                    continue
                 if error.recipient_gone:
                     self._drop_unreachable_subscriber(chat_id, error)
                     changed = True
@@ -3926,12 +4102,15 @@ class Watcher:
         if changed:
             self.state.save()
         if self._delivery_worker_running() and eligible_records:
-            failures = sum(1 for _key, _chat_id, error in results if error is not None)
+            failures = sum(1 for _key, _chat_id, error in results
+                           if error is not None and not isinstance(error, TelegramDeferred))
+            deferred = sum(isinstance(error, TelegramDeferred) for _key, _chat_id, error in results)
             self.logger.info(
-                "Telegram 대기열 발송: 처리 %d건, 성공 %d건, 실패 %d건, 남음 %d건",
+                "Telegram 대기열 발송: 처리 %d건, 성공 %d건, 실패 %d건, 대기 %d건, 남음 %d건",
                 len(results),
-                len(results) - failures,
+                len(results) - failures - deferred,
                 failures,
+                deferred,
                 self.state.pending_delivery_count(),
             )
 
@@ -4098,7 +4277,7 @@ class Watcher:
         # Silence would read as the bot being broken, and the sender has no
         # way to know a person will see this.
         try:
-            self.telegram.send_message(
+            self._send_or_queue_reply(
                 "메시지를 운영자에게 전달했습니다. 답장이 늦을 수 있어요.\n"
                 "사용법은 /help, 설정은 /status 로 확인하실 수 있습니다.",
                 chat_id=chat_id,
@@ -4125,9 +4304,11 @@ class Watcher:
             return "자기 자신에게는 보내지 않습니다."
 
         try:
-            self.telegram.send_message(
+            delivered = self._send_or_queue_reply(
                 f"{REPLY_HEADER}\n\n{message}", chat_id=target
             )
+            if not delivered:
+                return "⏳ Telegram 발송 대기 중입니다. 답장을 대기열에 보관했습니다."
         except TelegramError as exc:
             if exc.recipient_gone:
                 self._drop_unreachable_subscriber(target, exc)
@@ -4627,6 +4808,8 @@ class Watcher:
                     reply += f"\n\n{recovery_status}"
                 if seat_status := self.seat_api_status_text():
                     reply += f"\n\n{seat_status}"
+                if send_status := self.telegram_send_status_text():
+                    reply += f"\n\n{send_status}"
             elif command in MODE_COMMANDS:
                 reply, mode_changed = self._handle_mode_command(
                     chat_id, command, argument
@@ -4812,7 +4995,7 @@ class Watcher:
                 )
 
             try:
-                self.telegram.send_message(reply, chat_id=chat_id)
+                self._send_or_queue_reply(reply, chat_id=chat_id)
             except TelegramError as exc:
                 self.logger.warning("Telegram 구독 명령 답장 실패: %s", exc)
             else:
