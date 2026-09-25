@@ -364,6 +364,14 @@ SEAT_SELECTION_GUIDE = (
     "  F16~29 · G16~29 · H13~32 · I13~32 · J11~34 · K11~34 · L11~34\n\n"
     "신규 예매 오픈 알림은 이 설정과 관계없이 항상 전송됩니다."
 )
+SWEET_ONLY_GUIDE = (
+    "현재 잔여좌석 알림은 모든 구독자에게 명당 좌석만 전송합니다.\n"
+    "F16~29 · G16~29 · H13~32 · I13~32 · J11~34 · K11~34 · L11~34\n"
+    "명당 밖 좌석과 위치를 확인하지 못한 좌석은 알리지 않습니다.\n"
+    "/seat · /seat_sweet — 명당 구역 확인\n"
+    "운영 중에는 /seat_all로 전체 좌석으로 전환할 수 없습니다.\n"
+    "신규 오픈에는 좌석 제한을 적용하지 않습니다. 기존 알림 종류·요일 설정은 유지됩니다."
+)
 
 # How many seats must be on sale before the alert is worth sending.  Someone
 # booking a pair has no use for a showing with one seat left.
@@ -592,6 +600,7 @@ class Config:
     cgv_header_probe_seat_url: str = ""
     new_subscriptions_enabled: bool = True
     open_only_mode: bool = False
+    seat_alert_sweet_only: bool = False
     cgv_wire_trace_request_id: str = ""
     cgv_public_matrix_request_id: str = ""
     cgv_public_matrix_base_date: dt.date | None = None
@@ -832,6 +841,10 @@ class Config:
             new_subscriptions_enabled=_parse_bool(
                 value("NEW_SUBSCRIPTIONS_ENABLED", "true"),
                 name="NEW_SUBSCRIPTIONS_ENABLED",
+            ),
+            seat_alert_sweet_only=_parse_bool(
+                value("SEAT_ALERT_SWEET_ONLY", "false"),
+                name="SEAT_ALERT_SWEET_ONLY",
             ),
             scan_mode=_parse_scan_mode(value("SCAN_MODE", DEFAULT_SCAN_MODE)),
             booking_close_margin_minutes=_parse_int(
@@ -1759,8 +1772,10 @@ def _expired_state_key(key: str, record: Any, cutoff: dt.date) -> bool:
 
 
 class StateStore:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, sweet_only: bool = False):
         self.path = path
+        # An operational restriction, not a destructive subscriber migration.
+        self.sweet_only = sweet_only
         self._lock = threading.RLock()
         self.data: dict[str, Any] = {
             "version": STATE_VERSION,
@@ -2061,6 +2076,8 @@ class StateStore:
     def seat_selection(self, chat_id: str) -> str:
         """Return the subscriber's preferred-seat preset."""
 
+        if self.sweet_only:
+            return SEAT_SELECTION_SWEET
         with self._lock:
             record = self.data["subscribers"].get(str(chat_id))
             if not isinstance(record, Mapping):
@@ -2152,6 +2169,8 @@ class StateStore:
 
         if selection not in SEAT_SELECTIONS:
             raise ValueError(f"알 수 없는 좌석 선택: {selection}")
+        if self.sweet_only:
+            return False
         with self._lock:
             record = self.data["subscribers"].get(str(chat_id))
             if not isinstance(record, Mapping):
@@ -2599,7 +2618,7 @@ class StateStore:
                 "show_day": DEFAULT_SHOW_DAY,
                 "seat_time_range": None,
                 "seat_date_range": None,
-                "seat_selection": DEFAULT_SEAT_SELECTION,
+                "seat_selection": SEAT_SELECTION_SWEET if self.sweet_only else DEFAULT_SEAT_SELECTION,
                 "min_seats": MIN_SEATS_DEFAULT,
             }
             return True
@@ -3180,7 +3199,7 @@ class Watcher:
             config.telegram_chat_id,
             timeout=config.request_timeout_seconds,
         )
-        self.state = StateStore(config.state_file)
+        self.state = StateStore(config.state_file, sweet_only=config.seat_alert_sweet_only)
         self._telegram_send_gate = threading.Lock()
         self._last_cgv_request_finished_at: float | None = None
         self._telegram_broadcast_limiter = _BroadcastRateLimiter(
@@ -3901,6 +3920,8 @@ class Watcher:
             ALERT_SEATS, ALERT_SEATS_SWEET, ALERT_SEATS_UNCLASSIFIED,
         }:
             return 0, 0, 0
+        if self.config.seat_alert_sweet_only and category in {ALERT_SEATS, ALERT_SEATS_UNCLASSIFIED}:
+            return 0, 0, 0
 
         subscriber_ids = (
             tuple(recipients)
@@ -4031,6 +4052,9 @@ class Watcher:
         ):
             chat_id = record["chat_id"]
             category = record["category"]
+            if self.config.seat_alert_sweet_only and category in {ALERT_SEATS, ALERT_SEATS_UNCLASSIFIED}:
+                changed = self.state.remove_pending_delivery(key) or changed
+                continue
             if self.config.open_only_mode and category in {
                 ALERT_SEATS, ALERT_SEATS_SWEET, ALERT_SEATS_UNCLASSIFIED,
             }:
@@ -4467,6 +4491,8 @@ class Watcher:
     ) -> tuple[str, bool]:
         """Return the seat-selection reply and whether its preference changed."""
 
+        if self.config.seat_alert_sweet_only:
+            return SWEET_ONLY_GUIDE, False
         requested = SEAT_SELECTION_COMMAND_TARGETS.get(command)
         if requested is None and argument:
             requested = SEAT_SELECTION_ALIASES.get(argument)
@@ -4741,14 +4767,14 @@ class Watcher:
                     "\n\n🔔 기본 설정"
                     "\n• 신규 예매 오픈 + 예매 가능 좌석 알림"
                     "\n• 모든 요일 상영분 · 잔여좌석 날짜·시간 제한 없음"
-                    "\n• 잔여 좌석은 모든 A열 제외 좌석"
+                    f"\n• 잔여 좌석은 {'명당 좌석만 (운영 정책)' if self.config.seat_alert_sweet_only else '모든 A열 제외 좌석'}"
                     "\n• 1석부터 모두 알림"
                     "\n\n필요할 때만 설정을 바꾸세요."
                     "\n• 알림 종류 선택: /mode"
                     "\n• 주말 상영분만 받기: /day_weekend"
                     "\n• 잔여좌석 날짜 선택: /date · 시간 선택: /time"
-                    "\n• 잔여 좌석 대상 선택: /seat"
-                    "\n• 명당 좌석만 받기: /seat_sweet"
+                    f"\n• 잔여 좌석 대상 {'확인' if self.config.seat_alert_sweet_only else '선택'}: /seat"
+                    f"\n• {'명당 구역 확인' if self.config.seat_alert_sweet_only else '명당 좌석만 받기'}: /seat_sweet"
                     "\n• 2석 이상 남았을 때만 받기: /count_2"
                     "\n※ 신규 예매 오픈은 좌석·날짜·시간 설정과 관계없이 알려드립니다."
                     " (기존 알림 종류·요일 설정은 유지)"
@@ -4882,9 +4908,9 @@ class Watcher:
                     "/date_all - 잔여좌석 날짜 제한 해제\n"
                     "/time - 잔여좌석 상영 시간 확인·변경\n"
                     "/time_all - 잔여좌석 전체 시간 받기\n"
-                    "/seat - 잔여 좌석 대상 선택\n"
-                    "/seat_all - 모든 A열 제외 좌석 받기 (기본)\n"
-                    "/seat_sweet - 명당 좌석만 받기\n"
+                    f"/seat - {'명당 구역 확인' if self.config.seat_alert_sweet_only else '잔여 좌석 대상 선택'}\n"
+                    f"/seat_all - {'명당 전용 안내 (전체 좌석 전환 불가)' if self.config.seat_alert_sweet_only else '모든 A열 제외 좌석 받기 (기본)'}\n"
+                    f"/seat_sweet - {'명당 좌석만 받기 (운영 정책)' if self.config.seat_alert_sweet_only else '명당 좌석만 받기'}\n"
                     "/count - 예매 가능 최소 좌석 선택\n"
                     "/count_1 - 1석부터 모두 받기 (기본)\n"
                     "/count_2 - 2석 이상 남았을 때만 받기\n"
@@ -4892,7 +4918,7 @@ class Watcher:
                     "/coffee - 개발자에게 커피 후원\n"
                     "/help - 전체 명령어 보기\n\n"
                     "/mode · /day · /date · /time · /seat · /count 는 선택 사항입니다.\n"
-                    "그대로 두시면 모든 알림을 받습니다.\n"
+                    f"{'잔여좌석은 명당만, 신규 오픈은 좌석 제한 없이 받습니다.' if self.config.seat_alert_sweet_only else '그대로 두시면 모든 알림을 받습니다.'}\n"
                     "시간 설정 예: /time 18:00 23:59\n"
                     "날짜 설정 예: /date 20261003 (당일 포함 이후)\n"
                     "날짜·시간 제한은 잔여좌석 알림에만 적용됩니다."
@@ -4905,7 +4931,7 @@ class Watcher:
                     "한국시간 기준 오늘부터 28일간의 상영 회차를 감시합니다.\n\n"
                     "🔔 알려드리는 내용\n"
                     "• 새 IMAX 상영 회차 예매 오픈\n"
-                    "• 예매 가능한 A열 제외 좌석 (취소표 포함)\n"
+                    f"• 예매 가능한 {'명당' if self.config.seat_alert_sweet_only else 'A열 제외'} 좌석 (취소표 포함)\n"
                     "• 상영일·상영 시간·좌석 번호·잔여 좌석·변동 좌석수·예매 링크\n\n"
                     "🚫 좌석 알림 제외\n"
                     "• A열만 남은 경우\n"
@@ -4914,7 +4940,7 @@ class Watcher:
                     "※ 신규 회차 오픈 알림은 매진이어도 전송\n\n"
                     "⚙️ 기본 설정\n"
                     "• 신규 예매 오픈 + 예매 가능 좌석 알림\n"
-                    "• 모든 A열 제외 좌석 알림\n"
+                    f"• {'명당 좌석만 알림 (운영 정책)' if self.config.seat_alert_sweet_only else '모든 A열 제외 좌석 알림'}\n"
                     "• 모든 요일·전체 날짜·전체 상영 시간\n"
                     "• 별도 설정 없이 바로 사용 가능\n\n"
                     "🔧 알림 종류 선택\n"
@@ -4943,10 +4969,10 @@ class Watcher:
                     "• /time_all — 전체 시간 받기 (기본)\n"
                     "※ 한국시간 상영 시작시각 기준, 시작·끝 시각 포함. "
                     "잔여좌석 알림에만 적용하며 신규 오픈에는 시간 제한 없음\n\n"
-                    "💺 잔여 좌석 대상 (선택 사항)\n"
-                    "기본값은 모든 A열 제외 좌석입니다.\n"
-                    "• /seat_all — 모든 A열 제외 좌석 알림 (기본)\n"
-                    "• /seat_sweet — 아래 세 구역만 알림\n"
+                    f"💺 잔여 좌석 대상 ({'명당 전용 운영' if self.config.seat_alert_sweet_only else '선택 사항'})\n"
+                    f"{'모든 구독자에게 아래 명당 구역만 알립니다. 위치 미확인 좌석은 제외합니다.' if self.config.seat_alert_sweet_only else '기본값은 모든 A열 제외 좌석입니다.'}\n"
+                    f"• /seat_all — {'명당 전용 운영 중에는 전체 좌석 전환 불가' if self.config.seat_alert_sweet_only else '모든 A열 제외 좌석 알림 (기본)'}\n"
+                    f"• /seat_sweet — 아래 세 구역{' 확인' if self.config.seat_alert_sweet_only else '만 알림'}\n"
                     "  Extremer: F16~29, G16~29\n"
                     "  Experienced: H13~32, I13~32\n"
                     "  SweetSpot: J11~34, K11~34, L11~34\n"
@@ -4960,7 +4986,7 @@ class Watcher:
                     "📌 사용 방법\n"
                     "1. /start — 알림 구독\n"
                     "2. 주말 상영분만 원하면 /day_weekend (선택 사항)\n"
-                    "3. 명당만 원하면 /seat_sweet (선택 사항)\n"
+                    f"3. {'명당 구역 확인: /seat_sweet' if self.config.seat_alert_sweet_only else '명당만 원하면 /seat_sweet (선택 사항)'}\n"
                     "4. 영화·극장·날짜가 선택된 예매 바로가기 링크 열기\n"
                     "5. CGV 화면에서 IMAX 버튼 선택 후 예매\n\n"
                     "📋 기타 명령어\n"
@@ -6097,6 +6123,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         config.poll_interval_seconds,
     )
     logger.info("CGV 로그인 토큰과 로그인 쿠키는 사용하지 않습니다.")
+    if config.seat_alert_sweet_only:
+        logger.info("잔여좌석 명당 전용 운영: 모든 구독자에게 명당만 알림, 신규 오픈 좌석 제한 없음")
     if config.open_only_mode:
         logger.info("신규 오픈 전용 운영: 일정 API만 조회, 좌석 API·취소표 알림 중단")
     else:
