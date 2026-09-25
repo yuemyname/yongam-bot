@@ -5576,7 +5576,7 @@ class Watcher:
                     tally.dirty = True
                 continue
 
-            if current.uses_unclassified_fallback:
+            if current.uses_unclassified_fallback and not self.config.seat_alert_sweet_only:
                 tally.unclassified_fallback_alerts += 1
             # Row A could not be ruled out, so say so on the line that reports
             # the send rather than on one of its own: a line that is not a

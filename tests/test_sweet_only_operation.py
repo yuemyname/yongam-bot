@@ -142,8 +142,9 @@ class SweetOnlyOperationTests(unittest.TestCase):
             watcher.run_cycle()
             watcher.telegram.send_message.reset_mock()
             watcher.cgv.fetch_seat_snapshot = lambda _session: SeatSnapshot(total=10)
-            watcher.run_cycle()
+            result = watcher.run_cycle()
             watcher.telegram.send_message.assert_not_called()
+            self.assertEqual(result.unclassified_fallback_alerts, 0)
 
     def test_minimum_counts_only_sweet_seats_in_real_scan(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(Config, "local_now", return_value=_kst(self.TODAY)):
