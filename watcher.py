@@ -112,6 +112,9 @@ DELIVERY_CATEGORY_PRIORITIES = {
     ALERT_SYSTEM: 20,
 }
 DEFAULT_DELIVERY_PRIORITY = 30
+ROTATING_ALERT_CATEGORIES = frozenset({
+    ALERT_OPEN, ALERT_SEATS, ALERT_SEATS_SWEET, ALERT_SEATS_UNCLASSIFIED, ALERT_NOTICE,
+})
 
 # Per-subscriber alert preference.  Subscribers stored before this feature have
 # no saved mode and fall back to DEFAULT_ALERT_MODE, preserving old behaviour.
@@ -1794,6 +1797,8 @@ class StateStore:
             "cgv_recovery": {},
             "seat_api_backoff": {},
             "telegram_send_backoff": {},
+            "broadcast_rotation": {},
+            "delivery_sequence": 0,
         }
 
     def load(self) -> None:
@@ -1824,6 +1829,15 @@ class StateStore:
                 raise RuntimeError(f"좌석 API 대기 상태 파일 형식이 올바르지 않습니다: {self.path}")
             if not isinstance(loaded.get("telegram_send_backoff", {}), dict):
                 raise RuntimeError("Telegram 발송 대기 상태 형식이 올바르지 않습니다.")
+            rotation = loaded.get("broadcast_rotation", {})
+            if not isinstance(rotation, dict) or not all(
+                isinstance(key, str) and isinstance(value, str)
+                for key, value in rotation.items()
+            ):
+                raise RuntimeError("Telegram 발송 순번 상태 형식이 올바르지 않습니다.")
+            sequence = loaded.get("delivery_sequence", 0)
+            if type(sequence) is not int or sequence < 0:
+                raise RuntimeError("Telegram 대기열 순번 형식이 올바르지 않습니다.")
             self.data.update(loaded)
             self.data["version"] = STATE_VERSION
             self.data.setdefault("seat_counts", {})
@@ -2288,6 +2302,56 @@ class StateStore:
             bucket[key] = {"total": remaining, "skips": skips - 1}
             return True
 
+    def rotate_broadcast_recipients(
+        self, category: str, recipients: Sequence[str], *, advance: bool = True
+    ) -> tuple[str, ...]:
+        """Rotate a stable eligible ring, independently for each alert category.
+
+        Remember the last first recipient, rather than an array offset, so
+        subscriptions and filters can change without resetting to the first ID.
+        Direct replies and operator messages do not consume broadcast turns.
+        """
+
+        with self._lock:
+            unique = tuple(dict.fromkeys(str(chat_id) for chat_id in recipients))
+            if not unique or category not in ROTATING_ALERT_CATEGORIES:
+                return unique
+            ordered = sorted(unique)
+            previous = self.data["broadcast_rotation"].get(category)
+            start = 0
+            if previous is not None:
+                start = next((i for i, chat_id in enumerate(ordered) if chat_id > previous), 0)
+            rotated = tuple(ordered[start:] + ordered[:start])
+            if advance:
+                self.data["broadcast_rotation"][category] = rotated[0]
+            return rotated
+
+    def queue_broadcast_deliveries(
+        self, recipients: Sequence[str], text: str, category: str, *,
+        show_date: str | None = None, show_time: str | None = None,
+        seats_available: int | None = None,
+    ) -> int:
+        """Save the rotated outbox and its cursor together before sending."""
+
+        with self._lock:
+            ordered = self.rotate_broadcast_recipients(category, recipients, advance=False)
+            added = 0
+            first_added = None
+            for chat_id in ordered:
+                if self.queue_pending_delivery(
+                    chat_id, text, category, show_date=show_date,
+                    show_time=show_time, seats_available=seats_available,
+                ):
+                    added += 1
+                    if first_added is None:
+                        first_added = chat_id
+            if added:
+                if category in ROTATING_ALERT_CATEGORIES:
+                    self.data["broadcast_rotation"][category] = first_added
+                # The sender cannot see this batch until this lock is released.
+                self.save()
+            return added
+
     def queue_pending_delivery(
         self,
         chat_id: str,
@@ -2310,6 +2374,7 @@ class StateStore:
             retry_at = self.telegram_send_retry_at()
             expires_at = max(now, retry_at) if retry_at else now
             expires_at += dt.timedelta(hours=PENDING_DELIVERY_TTL_HOURS)
+            self.data["delivery_sequence"] += 1
             bucket[key] = {
                 "chat_id": str(chat_id),
                 "text": text,
@@ -2321,6 +2386,7 @@ class StateStore:
                     category, DEFAULT_DELIVERY_PRIORITY
                 ),
                 "queued_at": now.isoformat(),
+                "queue_sequence": self.data["delivery_sequence"],
                 "attempts": 0,
                 "next_attempt_at": "",
             }
@@ -2472,6 +2538,8 @@ class StateStore:
                         ),
                     )
                     copied["queued_at"] = str(raw.get("queued_at") or "")
+                    sequence = raw.get("queue_sequence", 0)
+                    copied["queue_sequence"] = sequence if type(sequence) is int and sequence >= 0 else 0
                     try:
                         copied["attempts"] = int(raw.get("attempts") or 0)
                     except (TypeError, ValueError):
@@ -3581,7 +3649,7 @@ class Watcher:
         self._delivery_thread.start()
         self.logger.info(
             "Telegram 영속 발송 대기열 시작: 신규 오픈 최우선, "
-            "최대 초당 %d건",
+            "최대 초당 %d건, 알림별 수신자 시작 순번 순환",
             self.config.telegram_broadcast_rate_per_second,
         )
 
@@ -3622,13 +3690,16 @@ class Watcher:
     @staticmethod
     def _delivery_sort_key(
         item: tuple[str, Mapping[str, Any]],
-    ) -> tuple[int, str, str]:
+    ) -> tuple[int, str, int, str]:
         key, record = item
         try:
             priority = int(record.get("priority", DEFAULT_DELIVERY_PRIORITY))
         except (TypeError, ValueError):
             priority = DEFAULT_DELIVERY_PRIORITY
-        return priority, str(record.get("queued_at") or ""), key
+        sequence = record.get("queue_sequence", 0)
+        if type(sequence) is not int or sequence < 0:
+            sequence = 0
+        return priority, str(record.get("queued_at") or ""), sequence, key
 
     def _delivery_loop(self) -> None:
         """Drain short priority batches while CGV scanning continues."""
@@ -3934,20 +4005,10 @@ class Watcher:
             )
         )
         if subscriber_ids and self._delivery_worker_running():
-            added = 0
-            for chat_id in subscriber_ids:
-                if self.state.queue_pending_delivery(
-                    chat_id,
-                    text,
-                    category,
-                    show_date=show_date,
-                    show_time=show_time,
-                    seats_available=seats_available,
-                ):
-                    added += 1
-            # Save before the scan records an alert as handled.  A process
-            # crash can therefore cause a duplicate, but never a missed open.
-            self.state.save()
+            added = self.state.queue_broadcast_deliveries(
+                subscriber_ids, text, category, show_date=show_date,
+                show_time=show_time, seats_available=seats_available,
+            )
             self._delivery_wake_event.set()
             self.logger.info(
                 "Telegram 발송 대기열 등록: 대상 %d명, 신규 %d건, 현재 %d건, 종류 %s",
@@ -3972,6 +4033,9 @@ class Watcher:
 
         results: list[tuple[str, TelegramError | None]] = []
         if subscriber_ids:
+            subscriber_ids = self.state.rotate_broadcast_recipients(category, subscriber_ids)
+            if not self.dry_run:
+                self.state.save()
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=min(
                     self.config.telegram_broadcast_workers, len(subscriber_ids)
@@ -4048,7 +4112,8 @@ class Watcher:
         changed = False
         eligible_records: list[tuple[str, Mapping[str, Any]]] = []
         for key, record in (
-            self.state.pending_deliveries() if pending is None else pending
+            sorted(self.state.pending_deliveries(), key=self._delivery_sort_key)
+            if pending is None else pending
         ):
             chat_id = record["chat_id"]
             category = record["category"]
