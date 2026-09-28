@@ -4980,6 +4980,7 @@ class Watcher:
                     "/count_1 - 1석부터 모두 받기 (기본)\n"
                     "/count_2 - 2석 이상 남았을 때만 받기\n"
                     "/desc - 봇 설명과 사용 방법\n"
+                    "/developer - 개발자 인스타그램 문의\n"
                     "/coffee - 개발자에게 커피 후원\n"
                     "/help - 전체 명령어 보기\n\n"
                     "/mode · /day · /date · /time · /seat · /count 는 선택 사항입니다.\n"
@@ -5058,8 +5059,17 @@ class Watcher:
                     "• /stop — 알림 해지\n"
                     "• /status — 현재 구독 및 설정 확인\n"
                     "• /desc — 봇 설명과 사용 방법\n"
+                    "• /developer — 개발자 인스타그램 문의\n"
                     "• /coffee — 개발자에게 커피 후원\n"
                     "• /help — 전체 명령어 보기"
+                )
+            elif command == "/developer":
+                reply = (
+                    "💬 개발자에게 문의하기\n\n"
+                    "문의·오류 제보·의견은 아래 인스타그램 프로필에서 DM으로 보내주세요.\n"
+                    "인스타그램: silverflowerstar\n"
+                    "https://www.instagram.com/silverflowerstar/\n\n"
+                    "CGV 공식 고객센터가 아닌, 용아맥 알림 봇 개발자의 계정입니다."
                 )
             elif command in {"/coffee", "/donate"}:
                 reply = (
@@ -5135,7 +5145,9 @@ class Watcher:
                 "/start - 알림 구독\n/stop - 알림 해지\n/status - 현재 구독 및 설정\n"
                 "/mode - 현재 알림 설정\n/mode_open - 신규 예매 오픈 받기\n"
                 "/day - 알림 상영일 선택\n/day_all - 모든 요일\n/day_weekend - 토·일 상영분\n"
-                "/desc - 봇 설명과 사용 방법\n/coffee - 개발자에게 커피 후원\n/help - 명령어 보기"
+                "/desc - 봇 설명과 사용 방법\n"
+                "/developer - 개발자 인스타그램 문의\n"
+                "/coffee - 개발자에게 커피 후원\n/help - 명령어 보기"
             )
         return reply
 
