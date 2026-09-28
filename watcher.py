@@ -272,6 +272,8 @@ def _seat_date_label(date_range: tuple[str, str | None] | None) -> str:
 ADMIN_STATS_COMMAND = "/statss"
 # Same aggregate view without the potentially long per-subscriber list.
 ADMIN_STATS_SUMMARY_COMMAND = "/statsss"
+# Read one subscriber's settings; never message or modify that subscriber.
+ADMIN_USER_STATUS_COMMAND = "/user_status"
 # Operator-only broadcast.  Two steps on purpose: a typo here reaches every
 # subscriber at once and cannot be taken back.
 ADMIN_NOTICE_COMMAND = "/notice"
@@ -284,6 +286,7 @@ ADMIN_CGV_RESUME_COMMAND = "/cgv_resume"
 ADMIN_COMMANDS = {
     ADMIN_STATS_COMMAND,
     ADMIN_STATS_SUMMARY_COMMAND,
+    ADMIN_USER_STATUS_COMMAND,
     ADMIN_NOTICE_COMMAND,
     ADMIN_NOTICE_SEND_COMMAND,
     ADMIN_REPLY_COMMAND,
@@ -4315,6 +4318,90 @@ class Watcher:
                 lines.append(f"… 외 {len(records) - listed}명")
         return "\n".join(lines)
 
+    def _status_reply(self, chat_id: str) -> str:
+        """Shared /status rendering for the subscriber and the operator view."""
+
+        if self.state.is_subscribed(chat_id):
+            mode = self.state.alert_mode(chat_id)
+            reply = (
+                "✅ 현재 CGV 용산 IMAX 알림을 구독 중입니다.\n"
+                f"알림 종류: {ALERT_MODE_LABELS[mode]}\n"
+                "알림 상영일: "
+                f"{SHOW_DAY_LABELS[self.state.show_day_selection(chat_id)]}"
+                "\n잔여좌석 상영 날짜: "
+                + _seat_date_label(self.state.seat_date_range(chat_id))
+                + " (신규 오픈에는 미적용)"
+                "\n잔여좌석 상영 시간: "
+                + _seat_time_label(self.state.seat_time_range(chat_id))
+                + " (한국시간, 신규 오픈에는 미적용)"
+            )
+            if ALERT_SEATS in ALERT_MODES[mode]:
+                reply += (
+                    "\n잔여 좌석 대상: "
+                    f"{SEAT_SELECTION_LABELS[self.state.seat_selection(chat_id)]}"
+                    "\n예매 가능 최소 좌석: "
+                    f"{MIN_SEATS_LABELS[self.state.min_seats(chat_id)]}"
+                )
+            reply += (
+                "\n\n알림 종류 변경: /mode"
+                "\n알림 상영일 변경: /day"
+                "\n잔여좌석 날짜 변경: /date · 해제: /date_all"
+                "\n잔여좌석 상영 시간 변경: /time · 해제: /time_all"
+                "\n잔여 좌석 대상 변경: /seat"
+                "\n예매 가능 최소 좌석 변경: /count"
+            )
+        else:
+            prompt = (
+                "알림을 받으려면 /start를 보내주세요."
+                if self.config.new_subscriptions_enabled
+                else "⏸ 현재 신규 구독을 잠시 중단했습니다."
+            )
+            reply = f"🔕 현재 구독 중이 아닙니다.\n{prompt}"
+        if recovery_status := self.cgv_recovery_status_text():
+            reply += f"\n\n{recovery_status}"
+        if seat_status := self.seat_api_status_text():
+            reply += f"\n\n{seat_status}"
+        if send_status := self.telegram_send_status_text():
+            reply += f"\n\n{send_status}"
+        if self.config.open_only_mode:
+            reply = self._open_only_command_reply("/status", chat_id, reply)
+        return reply
+
+    def _handle_user_status_command(self, body: str) -> str:
+        """Look up an exact chat ID locally; authorization happens at dispatch."""
+
+        target = body.strip()
+        if not re.fullmatch(r"-?[1-9][0-9]{0,19}", target):
+            return (
+                "🔎 특정 구독자 상태 조회\n\n"
+                "사용법: /user_status 채팅ID\n"
+                "예: /user_status 123456789\n"
+                "채팅ID는 /statss 구독자 목록이나 전달된 구독자 메시지에서 확인하세요.\n"
+                "이름·@사용자명이 아닌 숫자 ID를 입력하세요. 그룹 ID는 앞의 -도 포함합니다.\n"
+                "조회만 하며 상대방에게 메시지를 보내거나 설정을 바꾸지 않습니다."
+            )
+        record = next(
+            (item for item in self.state.subscriber_details() if item["chat_id"] == target),
+            None,
+        )
+        if record is None:
+            return (
+                f"🔕 현재 구독 목록에 없는 채팅ID입니다: {target}\n"
+                "미가입·구독 해지 여부는 현재 목록만으로 구분할 수 없습니다."
+            )
+        # Labels are user-controlled; keep them short and on a single line.
+        label = " ".join(record["label"].split())[:100] or "미등록"
+        kind = {"private": "개인", "group": "그룹", "supergroup": "그룹", "channel": "채널"}.get(
+            record["chat_type"], "미상"
+        )
+        return (
+            "🔎 구독자 상태 (운영자 전용)\n"
+            f"채팅ID: {target}\n이름: {label}\n채팅 유형: {kind}\n\n"
+            + self._status_reply(target)
+            + "\n\n※ 대상 구독자의 /status 조회 결과입니다. 설정 변경 명령은 실행한 본인에게 적용됩니다."
+            "\n조회만 했으며 상대방에게 메시지는 발송되지 않았습니다."
+        )
+
     def _forward_to_operator(
         self, chat: Mapping[str, Any], chat_id: str, text: str
     ) -> None:
@@ -4858,49 +4945,7 @@ class Watcher:
                 if not self.config.new_subscriptions_enabled:
                     reply += "\n신규 구독이 재개될 때까지 재구독할 수 없습니다."
             elif command == "/status":
-                if self.state.is_subscribed(chat_id):
-                    mode = self.state.alert_mode(chat_id)
-                    mode_label = ALERT_MODE_LABELS[mode]
-                    reply = (
-                        "✅ 현재 CGV 용산 IMAX 알림을 구독 중입니다.\n"
-                        f"알림 종류: {mode_label}\n"
-                        "알림 상영일: "
-                        f"{SHOW_DAY_LABELS[self.state.show_day_selection(chat_id)]}"
-                    )
-                    reply += (
-                        "\n잔여좌석 상영 날짜: "
-                        + _seat_date_label(self.state.seat_date_range(chat_id))
-                        + " (신규 오픈에는 미적용)"
-                        "\n잔여좌석 상영 시간: "
-                        + _seat_time_label(self.state.seat_time_range(chat_id))
-                        + " (한국시간, 신규 오픈에는 미적용)"
-                    )
-                    if ALERT_SEATS in ALERT_MODES[mode]:
-                        selection_label = SEAT_SELECTION_LABELS[
-                            self.state.seat_selection(chat_id)
-                        ]
-                        reply += f"\n잔여 좌석 대상: {selection_label}"
-                        reply += (
-                            "\n예매 가능 최소 좌석: "
-                            f"{MIN_SEATS_LABELS[self.state.min_seats(chat_id)]}"
-                        )
-                    reply += (
-                        "\n\n알림 종류 변경: /mode"
-                        "\n알림 상영일 변경: /day"
-                        "\n잔여좌석 날짜 변경: /date · 해제: /date_all"
-                        "\n잔여좌석 상영 시간 변경: /time · 해제: /time_all"
-                        "\n잔여 좌석 대상 변경: /seat"
-                        "\n예매 가능 최소 좌석 변경: /count"
-                    )
-                else:
-                    reply = f"🔕 현재 구독 중이 아닙니다.\n{subscription_prompt}"
-                recovery_status = self.cgv_recovery_status_text()
-                if recovery_status:
-                    reply += f"\n\n{recovery_status}"
-                if seat_status := self.seat_api_status_text():
-                    reply += f"\n\n{seat_status}"
-                if send_status := self.telegram_send_status_text():
-                    reply += f"\n\n{send_status}"
+                reply = self._status_reply(chat_id)
             elif command in MODE_COMMANDS:
                 reply, mode_changed = self._handle_mode_command(
                     chat_id, command, argument
@@ -4939,6 +4984,20 @@ class Watcher:
                     chat_id, command, argument
                 )
                 state_changed = state_changed or min_seats_changed
+            elif command == ADMIN_USER_STATUS_COMMAND:
+                sender = message.get("from")
+                # Do not expose one subscriber's settings to a group, even if
+                # that group is configured as the operator destination.
+                if (
+                    chat_type == "private"
+                    and chat_id == str(self.config.telegram_chat_id)
+                    and isinstance(sender, Mapping)
+                    and str(sender.get("id")) == chat_id
+                    and sender.get("is_bot") is False
+                ):
+                    reply = self._handle_user_status_command(body)
+                else:
+                    reply = "사용 가능한 명령어를 보려면 /help를 보내주세요."
             elif command in ADMIN_COMMANDS and chat_id == str(
                 self.config.telegram_chat_id
             ):
@@ -5081,7 +5140,7 @@ class Watcher:
             else:
                 reply = "사용 가능한 명령어를 보려면 /help를 보내주세요."
 
-            if self.config.open_only_mode:
+            if self.config.open_only_mode and command != "/status":
                 reply = self._open_only_command_reply(command, chat_id, reply)
 
             if (
