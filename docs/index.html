@@ -132,17 +132,17 @@
 <div class="wrap">
 
 <h1>용아맥 예매 오픈·취소표 알림 봇</h1>
-<p class="card"><strong>운영 안내: 현재 신규 오픈 전용 · 신규 구독 중단</strong><br>
-  잔여좌석 조회와 취소표 알림은 중단했습니다. 아래 좌석 기능은 현재 제공하지 않습니다.
-  기존에 잔여좌석 알림만 선택했다면 <code>/mode_open</code>으로 변경해야 신규 오픈 알림을 받습니다.
-  상영일 필터는 유지됩니다. CGV 일정 조회가 차단되면 신규 오픈도 감지할 수 없습니다.</p>
+<p class="card"><strong>영화별 알림 선택</strong><br>
+  <code>/movies</code>에서 원하는 용산 IMAX 영화를 여러 개 선택할 수 있습니다.
+  새 영화를 발견하면 한 번 안내하지만 자동으로 선택되지는 않습니다.
+  실제 운영 상태는 봇의 <code>/status</code>와 <code>/desc</code>에서 확인해주세요.</p>
 <p class="lead">
   CGV 용산아이파크몰 IMAX의 <strong>예매 오픈</strong>과 <strong>취소표</strong>를
   약 2분마다 확인해 텔레그램으로 알려드립니다. 무료이고, CGV 로그인은 필요 없습니다.
 </p>
 
 <p><a class="cta" href="https://t.me/yongambot">텔레그램에서 열기 → @yongambot</a></p>
-<p class="note">봇을 연 뒤 <code>/start</code> 한 번이면 끝입니다. 따로 설정할 것은 없습니다.</p>
+<p class="note"><code>/start</code>로 구독한 뒤 <code>/movies</code>에서 원하는 영화를 선택하세요. 기존 구독자의 오디세이 설정은 유지됩니다.</p>
 
 <h2>매진된 회차, 계속 새로고침하고 계신가요</h2>
 <p>
@@ -181,6 +181,8 @@ A열 제외 잔여 좌석: H20~21 / J7</code></pre>
 <p>기본값 그대로 두셔도 됩니다. 줄이고 싶을 때만 아래 명령을 쓰세요.</p>
 <table>
   <tr><th>명령어</th><th>기능</th></tr>
+  <tr><td><code>/movies</code></td><td>알림 받을 영화 추가·해제 (복수 선택)</td></tr>
+  <tr><td><code>/language</code></td><td>한국어 / English 선택 및 저장</td></tr>
   <tr><td><code>/mode_open</code></td><td>새 회차 오픈 알림만 받기</td></tr>
   <tr><td><code>/day_weekend</code></td><td>토·일 상영분만 받기 (상영일 기준)</td></tr>
   <tr><td><code>/seat_sweet</code></td><td>중앙 명당 구역에 자리가 있을 때만 받기</td></tr>
@@ -201,7 +203,7 @@ A열 제외 잔여 좌석: H20~21 / J7</code></pre>
 <p>아니요. 자동 예매나 좌석 선점 기능은 <strong>없습니다.</strong> 알림만 보내드리고, 예매는 직접 하셔야 합니다.</p>
 
 <h3>어떤 정보를 저장하나요?</h3>
-<p>알림을 보내는 데 필요한 텔레그램 채팅 ID와 알림 설정만 저장합니다. <code>/stop</code>을 보내면 바로 삭제됩니다.</p>
+<p>텔레그램 채팅 ID, 구독 정보와 알림 설정을 저장합니다. <code>/stop</code>은 구독을 해지하고 남은 대기 알림은 발송 대상에서 제외합니다. 선택한 언어는 다음 이용을 위해 별도로 유지하며, 운영 로그와 백업은 즉시 삭제되지 않습니다.</p>
 
 <h3>공식 CGV 서비스인가요?</h3>
 <p>아닙니다. 개인이 만든 비공식 알림 봇입니다. CGV가 예매 정보 제공 방식을 바꾸면 조회가 일시적으로 실패할 수 있습니다.</p>

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import copy
 import dataclasses
 import datetime as dt
 import getpass
@@ -34,6 +35,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from cgv_header_probe import run_header_probe_once
 from cgv_wire_trace import WireHeaderTrace
 from cgv_public_matrix import run_matrix_once
+from movie_features import MovieStateMixin, MovieWatcherMixin, localize_alert
 
 
 APP_NAME = "CGV Telegram Watcher"
@@ -43,7 +45,7 @@ DEFAULT_BOOKING_URL = "https://cgv.co.kr/cnm/movieBook/movie"
 DEFAULT_SEAT_PAGE_URL = "https://cgv.co.kr/cnm/selectVisitorCnt"
 DEFAULT_SITE_NAME = "용산아이파크몰"
 UNCLASSIFIED_ALERT_MIN_SEATS = 7
-STATE_VERSION = 15
+STATE_VERSION = 16
 DEFAULT_TELEGRAM_BROADCAST_WORKERS = 16
 # Telegram documents a free broadcast ceiling of about 30 messages/second.
 # Leave headroom for command replies and transient timing differences.
@@ -103,8 +105,10 @@ ALERT_REPLY = "reply"
 # are the reason this bot exists, so they always pre-empt seat changes and
 # operator announcements at the next short sender batch boundary.
 DELIVERY_CATEGORY_PRIORITIES = {
+    "movie": 0,
     ALERT_OPEN: 0,
     ALERT_REPLY: 5,
+    "movie_summary": 5,
     ALERT_SEATS: 10,
     ALERT_SEATS_SWEET: 10,
     ALERT_SEATS_UNCLASSIFIED: 10,
@@ -113,6 +117,7 @@ DELIVERY_CATEGORY_PRIORITIES = {
 }
 DEFAULT_DELIVERY_PRIORITY = 30
 ROTATING_ALERT_CATEGORIES = frozenset({
+    "movie",
     ALERT_OPEN, ALERT_SEATS, ALERT_SEATS_SWEET, ALERT_SEATS_UNCLASSIFIED, ALERT_NOTICE,
 })
 
@@ -209,6 +214,12 @@ def _clock_minutes(value: Any) -> int | None:
         return None
     match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", value)
     return int(match[1]) * 60 + int(match[2]) if match else None
+
+
+def _show_clock_minutes(value: Any) -> int | None:
+    """CGV's 25:00 is next-day 01:00, while the show date stays unchanged."""
+    match = re.fullmatch(r"([0-3]?\d|4[0-7]):([0-5]\d)", str(value or ""))
+    return (int(match[1]) % 24) * 60 + int(match[2]) if match else None
 
 
 def _seat_time_label(time_range: tuple[str, str] | None) -> str:
@@ -611,6 +622,7 @@ class Config:
     cgv_public_matrix_request_id: str = ""
     cgv_public_matrix_base_date: dt.date | None = None
     cgv_public_matrix_compare_date: dt.date | None = None
+    multi_movie_enabled: bool = False
 
     @classmethod
     def from_env_file(
@@ -757,6 +769,7 @@ class Config:
             site_name=value("CGV_SITE_NAME", DEFAULT_SITE_NAME),
             movie_no=value("CGV_MOVIE_NO", "30001323"),
             movie_label=value("MOVIE_LABEL", "오디세이"),
+            multi_movie_enabled=_parse_bool(value("MULTI_MOVIE_ENABLED", "false"), name="MULTI_MOVIE_ENABLED"),
             rtctl_scope_code=value("CGV_RTCTL_SCOPE_CODE", "08"),
             dynamic_date_window=dynamic_date_window,
             target_window_days=target_window_days,
@@ -953,10 +966,12 @@ class BookingSession:
     screen_sequence: str = ""
     remaining_seats: int | None = None
     total_seats: int | None = None
+    movie_no: str = ""
+    movie_label: str = ""
 
     def notification_key(self, *, site_no: str, movie_no: str) -> str:
         # The user-visible uniqueness requirement is a show date and start time.
-        return f"{site_no}:{movie_no}:{self.date}:{self.start_time}"
+        return f"{site_no}:{self.movie_no or movie_no}:{self.date}:{self.start_time}"
 
     def start_datetime(self, timezone_name: str) -> dt.datetime | None:
         """Local start time, or None when the schedule had no usable time."""
@@ -964,14 +979,16 @@ class BookingSession:
         try:
             day = dt.date.fromisoformat(self.date)
             hour, minute = (int(part) for part in self.start_time.split(":", 1))
+            if not 0 <= hour < 48 or not 0 <= minute < 60:
+                return None
             return dt.datetime(
                 day.year,
                 day.month,
                 day.day,
-                hour,
-                minute,
+                0,
+                0,
                 tzinfo=ZoneInfo(timezone_name),
-            )
+            ) + dt.timedelta(hours=hour, minutes=minute)
         except (TypeError, ValueError, ZoneInfoNotFoundError):
             return None
 
@@ -1139,10 +1156,10 @@ def _normalize_date(value: Any, fallback: dt.date) -> str:
 
 def _normalize_time(value: Any) -> str:
     text = str(value or "").strip()
-    colon_match = re.search(r"(?<!\d)([01]?\d|2[0-3]):([0-5]\d)(?!\d)", text)
+    colon_match = re.search(r"(?<!\d)([0-3]?\d|4[0-7]):([0-5]\d)(?!\d)", text)
     if colon_match:
         return f"{int(colon_match.group(1)):02d}:{colon_match.group(2)}"
-    compact_match = re.fullmatch(r"([01]\d|2[0-3])([0-5]\d)(?:[0-5]\d)?", text)
+    compact_match = re.fullmatch(r"([0-3]\d|4[0-7])([0-5]\d)(?:[0-5]\d)?", text)
     if compact_match:
         return f"{compact_match.group(1)}:{compact_match.group(2)}"
     embedded_match = re.search(r"(?:T|\s)([01]\d|2[0-3])([0-5]\d)(?:[0-5]\d)?", text)
@@ -1187,9 +1204,11 @@ def extract_sessions(
     keywords: Sequence[str] = ("IMAX", "아이맥스"),
     code_values: Sequence[str] = ("08",),
     strict_imax_match: bool = True,
+    expected_site: str | None = None,
+    require_movie: bool = False,
 ) -> list[BookingSession]:
     """Extract showtimes defensively from CGV's nested JSON response."""
-    sessions: dict[tuple[str, str], BookingSession] = {}
+    sessions: dict[tuple[str, str, str], BookingSession] = {}
 
     def completeness(session: BookingSession) -> int:
         text_fields = (
@@ -1205,13 +1224,22 @@ def extract_sessions(
         ) + (1 if session.total_seats is not None else 0)
 
     for mapping, context in _walk_mappings(payload):
+        if expected_site and _context_value(mapping, context, ("siteno",)) != expected_site:
+            continue
+        movie_no = _context_value(mapping, context, ("movno",))
+        movie_label = _context_value(mapping, context, ("movnm",))
+        if require_movie and (not re.fullmatch(r"[0-9]{1,20}", movie_no) or not movie_label):
+            continue
         raw_start = _direct_value(mapping, START_TIME_KEYS)
         start_time = _normalize_time(raw_start)
         if not start_time:
             continue
 
+        # A movie title can contain "IMAX" even in an ordinary auditorium.
+        # Theater-wide discovery must rely on the screen's own properties.
+        imax_context = tuple((k, v) for k, v in context if _normalized_key(k) in SCREEN_NAME_KEYS | FORMAT_NAME_KEYS | IMAX_CODE_KEYS) if require_movie else context
         is_imax, matched_format = _imax_match(
-            context, keywords=keywords, code_values=code_values
+            imax_context, keywords=keywords, code_values=code_values
         )
         if strict_imax_match and not is_imax:
             continue
@@ -1242,10 +1270,12 @@ def extract_sessions(
             screen_sequence=screen_sequence,
             remaining_seats=remaining_seats,
             total_seats=total_seats,
+            movie_no=movie_no,
+            movie_label=movie_label,
         )
         # Yongsan has one IMAX screen.  Date + start time avoids duplicate
         # alerts when the same session appears in multiple response branches.
-        identity = (session.date, session.start_time)
+        identity = (session.date, session.start_time, session.movie_no)
         existing = sessions.get(identity)
         if existing is None or completeness(session) > completeness(existing):
             sessions[identity] = session
@@ -1572,6 +1602,32 @@ class CgvClient:
     def fetch_date(
         self, show_date: dt.date, *, single_attempt: bool = False
     ) -> Any:
+        if self.config.multi_movie_enabled:
+            query = urllib.parse.urlencode({
+                "coCd": self.config.company_code, "siteNo": self.config.site_no,
+                "scnYmd": show_date.strftime("%Y%m%d"),
+                "rtctlScopCd": self.config.rtctl_scope_code,
+            })
+            payload = self._get_json(
+                f"https://cgv.co.kr/api/v1/booking/searchMovScnInfo?{query}",
+                referer="https://cgv.co.kr/cnm/movieBook/cinema",
+                single_attempt=single_attempt,
+            )
+            if (not isinstance(payload, dict) or payload.get("statusCode") != 0
+                    or not isinstance(payload.get("data"), list)):
+                raise FetchError("극장별 일정 응답 형식/상태 오류 (빈 일정으로 처리하지 않음)")
+            for row in payload["data"]:
+                if not isinstance(row, dict) or not row.get("siteNo"):
+                    raise FetchError("극장별 일정 극장 코드 누락")
+                # CGV includes the neighboring CINE de CHEF (P013). The
+                # extractor excludes it; it is not a malformed response.
+                if str(row["siteNo"]) != self.config.site_no:
+                    continue
+                if (str(row.get("scnYmd", "")) != show_date.strftime("%Y%m%d")
+                        or not re.fullmatch(r"[0-9]{1,20}", str(row.get("movNo", "")))
+                        or not row.get("movNm") or not _normalize_time(row.get("scnsrtTm"))):
+                    raise FetchError("극장별 일정 필수 항목 오류 (목록 초기화/빈 일정 처리 안 함)")
+            return payload
         query = urllib.parse.urlencode(
             {
                 "coCd": self.config.company_code,
@@ -1643,7 +1699,7 @@ class TelegramClient:
         self._chat_send_lock = threading.Lock()
         self._chat_next_send: dict[str, float] = {}
 
-    def send_message(self, text: str, *, chat_id: str | None = None) -> None:
+    def send_message(self, text: str, *, chat_id: str | None = None, reply_markup: dict | None = None) -> None:
         target = str(chat_id or self.chat_id)
         with self._chat_send_lock:
             now = time.monotonic()
@@ -1658,6 +1714,7 @@ class TelegramClient:
                 "chat_id": chat_id or self.chat_id,
                 "text": text,
                 "disable_web_page_preview": True,
+                **({"reply_markup": reply_markup} if reply_markup else {}),
             },
             ensure_ascii=False,
         ).encode("utf-8")
@@ -1704,13 +1761,27 @@ class TelegramClient:
                 retry_after_seconds=_telegram_retry_after(parsed),
             )
 
+    def answer_callback(self, callback_id: str, text: str = "") -> None:
+        """Acknowledge buttons immediately; this does not send a chat message."""
+        endpoint = f"https://api.telegram.org/bot{self.bot_token}/answerCallbackQuery"
+        request = urllib.request.Request(endpoint,
+            data=json.dumps({"callback_query_id": callback_id, "text": text[:200]}).encode(),
+            method="POST", headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout, context=self.ssl_context) as response:
+                parsed = json.loads(response.read(100_000))
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            raise TelegramError("Telegram 버튼 확인 응답 실패") from exc
+        if not parsed.get("ok"):
+            raise TelegramError("Telegram 버튼 확인 응답 거절")
+
     def get_updates(self, *, offset: int) -> list[Mapping[str, Any]]:
         endpoint = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
         payload = json.dumps(
             {
                 "offset": offset,
                 "timeout": 0,
-                "allowed_updates": ["message"],
+                "allowed_updates": ["message", "callback_query"],
             }
         ).encode("utf-8")
         request = urllib.request.Request(
@@ -1777,7 +1848,7 @@ def _expired_state_key(key: str, record: Any, cutoff: dt.date) -> bool:
     return show_date is not None and show_date < cutoff
 
 
-class StateStore:
+class StateStore(MovieStateMixin):
     def __init__(self, path: Path, *, sweet_only: bool = False):
         self.path = path
         # An operational restriction, not a destructive subscriber migration.
@@ -2138,7 +2209,7 @@ class StateStore:
         time_range = self.seat_time_range(chat_id)
         if time_range is None:
             return True
-        current = _clock_minutes(show_time)
+        current = _show_clock_minutes(show_time)
         if current is None:
             # Never guess an unknown time for a subscriber who opted in.
             return False
@@ -2333,6 +2404,7 @@ class StateStore:
         self, recipients: Sequence[str], text: str, category: str, *,
         show_date: str | None = None, show_time: str | None = None,
         seats_available: int | None = None,
+        movie_no: str | None = None, reply_markup: dict | None = None,
     ) -> int:
         """Save the rotated outbox and its cursor together before sending."""
 
@@ -2344,6 +2416,7 @@ class StateStore:
                 if self.queue_pending_delivery(
                     chat_id, text, category, show_date=show_date,
                     show_time=show_time, seats_available=seats_available,
+                    movie_no=movie_no, reply_markup=reply_markup,
                 ):
                     added += 1
                     if first_added is None:
@@ -2364,10 +2437,12 @@ class StateStore:
         show_date: str | None = None,
         show_time: str | None = None,
         seats_available: int | None = None,
+        movie_no: str | None = None,
+        reply_markup: dict | None = None,
     ) -> bool:
         """Persist one Telegram delivery without duplicating the outbox."""
 
-        key_source = f"{chat_id}\0{category}\0{show_date or ''}\0{text}"
+        key_source = f"{chat_id}\0{category}\0{show_date or ''}\0{movie_no or ''}\0{text}\0{json.dumps(reply_markup, sort_keys=True)}"
         key = hashlib.sha256(key_source.encode("utf-8")).hexdigest()
         with self._lock:
             bucket = self.data.setdefault("pending_deliveries", {})
@@ -2385,6 +2460,8 @@ class StateStore:
                 "show_date": show_date or "",
                 "show_time": show_time or "",
                 "seats_available": seats_available,
+                "movie_no": movie_no or "",
+                "reply_markup": reply_markup,
                 "priority": DELIVERY_CATEGORY_PRIORITIES.get(
                     category, DEFAULT_DELIVERY_PRIORITY
                 ),
@@ -2514,6 +2591,8 @@ class StateStore:
                         "chat_id": chat_id,
                         "text": text,
                         "category": category,
+                        "movie_no": str(raw.get("movie_no") or ""),
+                        "reply_markup": copy.deepcopy(raw.get("reply_markup")) if isinstance(raw.get("reply_markup"), dict) else None,
                     }
                     show_date = raw.get("show_date")
                     if isinstance(show_date, str) and show_date:
@@ -2529,7 +2608,7 @@ class StateStore:
                             text, re.MULTILINE,
                         )
                         show_time = match[1] if match else None
-                    if _clock_minutes(show_time) is not None:
+                    if _show_clock_minutes(show_time) is not None:
                         copied["show_time"] = show_time
                     seats_available = raw.get("seats_available")
                     if isinstance(seats_available, int):
@@ -2607,6 +2686,7 @@ class StateStore:
         seats_available: int | None = None,
         show_date: str | None = None,
         show_time: str | None = None,
+        movie_no: str | None = None,
     ) -> tuple[str, ...]:
         """Subscribers who opted in to this alert category.
 
@@ -2632,9 +2712,10 @@ class StateStore:
             return minimum <= seats_available
 
         def wants_this_date(chat_id: str) -> bool:
-            return self.wants_show_date(chat_id, show_date)
+            return (self.wants_movie(chat_id, movie_no)
+                    and self.wants_show_date(chat_id, show_date))
 
-        if category == ALERT_NOTICE:
+        if category in {ALERT_NOTICE, "movie"}:
             return self.subscriber_ids()
         if category == ALERT_SYSTEM:
             # Routed by the caller, which knows who the operator is.
@@ -2648,6 +2729,7 @@ class StateStore:
                 seats_available=seats_available,
                 show_date=show_date,
                 show_time=show_time,
+                movie_no=movie_no,
             )
         if category in {ALERT_SEATS, ALERT_SEATS_SWEET}:
             selection = (
@@ -2887,7 +2969,7 @@ def booking_url_for_session(session: BookingSession, config: Config) -> str:
             "coCd": config.company_code,
             "siteNo": config.site_no,
             "siteNm": config.site_name,
-            "movNo": config.movie_no,
+            "movNo": session.movie_no or config.movie_no,
             "scnYmd": session.date.replace("-", ""),
         }
     )
@@ -3059,7 +3141,7 @@ def seat_change_message(
     lines = [
         "💺 CGV 예매 가능 좌석",
         _alert_date_banner(session.date),
-        f"영화: {config.movie_label} ({config.movie_no})",
+        f"영화: {session.movie_label or config.movie_label} ({session.movie_no or config.movie_no})",
         f"극장: {config.site_name} ({config.site_no})",
         "",
         f"상영 시간: {session.start_time}",
@@ -3102,9 +3184,9 @@ def message_chunks(
     chunks: list[tuple[str, list[BookingSession]]] = []
     unclassified_keys = unclassified_keys or set()
     seat_snapshots = seat_snapshots or {}
-    sessions_by_date: dict[str, list[BookingSession]] = {}
+    sessions_by_date: dict[tuple[str, str], list[BookingSession]] = {}
     for session in sessions:
-        sessions_by_date.setdefault(session.date, []).append(session)
+        sessions_by_date.setdefault((session.date, session.movie_no), []).append(session)
 
     def render(date_sessions: Sequence[BookingSession]) -> str:
         show_date = date_sessions[0].date
@@ -3127,7 +3209,7 @@ def message_chunks(
             "🎟️ CGV 예매 오픈 감지\n"
             + _alert_date_banner(show_date)
             + "\n"
-            + f"영화: {config.movie_label} ({config.movie_no})\n"
+            + f"영화: {date_sessions[0].movie_label or config.movie_label} ({date_sessions[0].movie_no or config.movie_no})\n"
             + f"극장: {config.site_name} ({config.site_no})\n\n"
             + "\n".join(lines)
             + _booking_footer(date_sessions, config)
@@ -3253,7 +3335,11 @@ class _BroadcastRateLimiter:
             self._sleeper(delay)
 
 
-class Watcher:
+class Watcher(MovieWatcherMixin):
+    _telegram_error = TelegramError
+    _session_class = BookingSession
+    _booking_url = staticmethod(booking_url_for_session)
+
     def __init__(
         self,
         config: Config,
@@ -3290,6 +3376,7 @@ class Watcher:
         self._recovery_payloads: dict[dt.date, Any] = {}
         self._header_probe_checked = False
         self.state.load()
+        self.state.configure_movies(config.movie_no, config.movie_label)
         # Validate a persisted wait before any sender can start (fail closed).
         self.state.telegram_send_retry_at()
         if not self.state.subscribers_initialized:
@@ -3323,7 +3410,7 @@ class Watcher:
             "CGV 조회·설정 변경은 계속하며 알림과 답장은 대기열에 보관합니다."
         )
 
-    def _send_telegram(self, text: str, *, chat_id: str) -> None:
+    def _send_telegram(self, text: str, *, chat_id: str, reply_markup: dict | None = None) -> None:
         # Do not hold this gate through network I/O. Requests already in flight
         # may complete, but no new request starts after the shared pause is set.
         with self._telegram_send_gate:
@@ -3334,7 +3421,7 @@ class Watcher:
             if retry_at := self._telegram_pause_until():
                 raise TelegramDeferred(retry_at)
         try:
-            self.telegram.send_message(text, chat_id=chat_id)
+            self.telegram.send_message(text, chat_id=chat_id, **({"reply_markup": reply_markup} if reply_markup else {}))
         except TelegramError as exc:
             if not exc.rate_limited:
                 raise
@@ -3356,11 +3443,11 @@ class Watcher:
                     self._delivery_wake_event.set()
             raise TelegramDeferred(retry_at) from exc
 
-    def _send_or_queue_reply(self, text: str, *, chat_id: str) -> bool:
+    def _send_or_queue_reply(self, text: str, *, chat_id: str, reply_markup: dict | None = None) -> bool:
         try:
-            self._send_telegram(text, chat_id=chat_id)
+            self._send_telegram(text, chat_id=chat_id, **({"reply_markup": reply_markup} if reply_markup else {}))
         except TelegramDeferred:
-            self.state.queue_pending_delivery(chat_id, text, ALERT_REPLY)
+            self.state.queue_pending_delivery(chat_id, text, ALERT_REPLY, reply_markup=reply_markup)
             self.state.save()
             self._delivery_wake_event.set()
             return False
@@ -3893,17 +3980,19 @@ class Watcher:
 
     def _extract_sessions(
         self, payloads: Mapping[dt.date, Any]
-    ) -> dict[tuple[str, str], BookingSession]:
-        session_map: dict[tuple[str, str], BookingSession] = {}
+    ) -> dict[tuple[str, str, str], BookingSession]:
+        session_map: dict[tuple[str, str, str], BookingSession] = {}
         for show_date, payload in payloads.items():
             for session in extract_sessions(
                 payload,
                 requested_date=show_date,
                 keywords=self.config.imax_keywords,
                 code_values=self.config.imax_code_values,
-                strict_imax_match=self.config.strict_imax_match,
+                strict_imax_match=True if self.config.multi_movie_enabled else self.config.strict_imax_match,
+                expected_site=self.config.site_no if self.config.multi_movie_enabled else None,
+                require_movie=self.config.multi_movie_enabled,
             ):
-                session_map[(session.date, session.start_time)] = session
+                session_map[(session.date, session.start_time, session.movie_no)] = session
         return session_map
 
     def _split_closed_sessions(
@@ -3931,11 +4020,11 @@ class Watcher:
         return bookable, closed
 
     def _advance_frontier(
-        self, session_map: Mapping[tuple[str, str], BookingSession]
+        self, session_map: Mapping[tuple[str, str, str], BookingSession]
     ) -> bool:
         if not session_map:
             return False
-        latest = max(date_text for date_text, _ in session_map)
+        latest = max(session.date for session in session_map.values())
         try:
             observed = dt.date.fromisoformat(latest)
         except ValueError:
@@ -3977,6 +4066,7 @@ class Watcher:
         show_date: str | None = None,
         show_time: str | None = None,
         recipients: Sequence[str] | None = None,
+        movie_no: str | None = None,
     ) -> tuple[int, int, int]:
         """Deliver or durably queue a message for the opted-in subscribers.
 
@@ -4005,12 +4095,14 @@ class Watcher:
                 seats_available=seats_available,
                 show_date=show_date,
                 show_time=show_time,
+                movie_no=movie_no,
             )
         )
         if subscriber_ids and self._delivery_worker_running():
             added = self.state.queue_broadcast_deliveries(
                 subscriber_ids, text, category, show_date=show_date,
                 show_time=show_time, seats_available=seats_available,
+                movie_no=movie_no,
             )
             self._delivery_wake_event.set()
             self.logger.info(
@@ -4029,7 +4121,8 @@ class Watcher:
 
         def send(chat_id: str) -> tuple[str, TelegramError | None]:
             try:
-                self._send_telegram(text, chat_id=chat_id)
+                rendered = localize_alert(text, self.state.language(chat_id)) if category in {ALERT_OPEN, ALERT_SEATS, ALERT_SEATS_SWEET, ALERT_SEATS_UNCLASSIFIED} else text
+                self._send_telegram(rendered, chat_id=chat_id)
             except TelegramError as exc:
                 return chat_id, exc
             return chat_id, None
@@ -4065,6 +4158,7 @@ class Watcher:
                         show_date=show_date,
                         show_time=show_time,
                         seats_available=seats_available,
+                        movie_no=movie_no,
                     )
                     if not isinstance(error, TelegramDeferred):
                         self.logger.error("전송 실패(다음 주기 재시도): %s", error)
@@ -4138,8 +4232,11 @@ class Watcher:
                     seats_available=record.get("seats_available"),
                     show_date=record.get("show_date"),
                     show_time=record.get("show_time"),
+                    movie_no=record.get("movie_no") or (self.config.movie_no if category in {ALERT_OPEN, ALERT_SEATS, ALERT_SEATS_SWEET, ALERT_SEATS_UNCLASSIFIED} else None),
                 )
             )
+            if category == "movie_summary":
+                eligible = {chat_id} if self.state.is_subscribed(chat_id) and self.state.wants_movie(chat_id, record.get("movie_no")) else set()
             if chat_id not in eligible:
                 changed = self.state.remove_pending_delivery(key) or changed
                 continue
@@ -4150,8 +4247,15 @@ class Watcher:
         ) -> tuple[str, str, TelegramError | None]:
             key, record = item
             chat_id = record["chat_id"]
+            # A command can cancel a queued film after this batch was copied.
+            if record["category"] in {ALERT_OPEN, ALERT_SEATS, ALERT_SEATS_SWEET, ALERT_SEATS_UNCLASSIFIED, "movie_summary"}:
+                with self.state._lock:
+                    if (key not in self.state.data["pending_deliveries"]
+                            or not self.state.wants_movie(chat_id, record.get("movie_no") or self.config.movie_no)):
+                        return key, chat_id, None
             try:
-                self._send_telegram(record["text"], chat_id=chat_id)
+                rendered = localize_alert(record["text"], self.state.language(chat_id)) if record["category"] in {ALERT_OPEN, ALERT_SEATS, ALERT_SEATS_SWEET, ALERT_SEATS_UNCLASSIFIED} else record["text"]
+                self._send_telegram(rendered, chat_id=chat_id, **({"reply_markup": record["reply_markup"]} if record.get("reply_markup") else {}))
             except TelegramError as exc:
                 return key, chat_id, exc
             return key, chat_id, None
@@ -4365,7 +4469,7 @@ class Watcher:
             reply += f"\n\n{send_status}"
         if self.config.open_only_mode:
             reply = self._open_only_command_reply("/status", chat_id, reply)
-        return reply
+        return self._public_reply("/status", chat_id, reply)
 
     def _handle_user_status_command(self, body: str) -> str:
         """Look up an exact chat ID locally; authorization happens at dispatch."""
@@ -4851,6 +4955,9 @@ class Watcher:
                     state_changed = True
 
             message = update.get("message")
+            if isinstance(update.get("callback_query"), Mapping):
+                self._handle_movie_callback(update["callback_query"])
+                continue
             if not isinstance(message, Mapping):
                 continue
             chat = message.get("chat")
@@ -4877,6 +4984,9 @@ class Watcher:
                 or ""
             )
             chat_type = str(chat.get("type") or "")
+            if command in {"/movies", "/language"}:
+                self._handle_movie_command(chat_id, chat_type, command, argument)
+                continue
             reply = ""
             signup_notice = "⏸ 현재 신규 구독을 잠시 중단했습니다."
             subscription_prompt = (
@@ -5021,6 +5131,8 @@ class Watcher:
                     "/start - 알림 구독\n"
                     "/stop - 알림 해지\n"
                     "/status - 현재 구독 및 설정 확인\n"
+                    "/movies - 알림 받을 영화 선택\n"
+                    "/language - 한국어 또는 English 선택\n"
                     "/mode - 알림 종류 선택\n"
                     "/mode_all - 신규 오픈과 잔여 좌석 모두 받기\n"
                     "/mode_open - 신규 예매 오픈만 받기\n"
@@ -5155,6 +5267,7 @@ class Watcher:
                 )
 
             try:
+                reply = self._public_reply(command, chat_id, reply)
                 self._send_or_queue_reply(reply, chat_id=chat_id)
             except TelegramError as exc:
                 self.logger.warning("Telegram 구독 명령 답장 실패: %s", exc)
@@ -5325,7 +5438,8 @@ class Watcher:
             tally.successful_dates += 1
 
             session_map = self._extract_sessions({show_date: payload})
-            for date_text, _start_time in session_map:
+            for observed_session in session_map.values():
+                date_text = observed_session.date
                 if date_text > tally.latest_session_date:
                     tally.latest_session_date = date_text
 
@@ -5351,6 +5465,16 @@ class Watcher:
                     len(closed_sessions),
                 )
             tally.matching_sessions += len(sessions)
+            if self.config.multi_movie_enabled and not self.dry_run:
+                self._observe_movies(show_date, sessions)
+                watched = []
+                for session in sessions:
+                    if self.state.anyone_wants_movie(session.movie_no):
+                        watched.append(session)
+                    else:
+                        self.state.mark_notified(session.notification_key(site_no=self.config.site_no, movie_no=self.config.movie_no), session)
+                        tally.dirty = True
+                sessions = watched
             if sessions:
                 new_sessions = [
                     session
@@ -5613,6 +5737,7 @@ class Watcher:
                         text,
                         category=ALERT_OPEN,
                         show_date=chunk_sessions[0].date,
+                        movie_no=chunk_sessions[0].movie_no or self.config.movie_no,
                     )
                     for session in chunk_sessions:
                         self.state.mark_notified(session_keys[session], session)
@@ -5748,6 +5873,7 @@ class Watcher:
                 delivered, failed, total = self._broadcast_message(
                     seat_change_message(session, previous, current, self.config),
                     category=all_category,
+                    movie_no=session.movie_no or self.config.movie_no,
                     seats_available=open_all,
                     show_date=session.date,
                     show_time=session.start_time,
@@ -5777,6 +5903,7 @@ class Watcher:
                         availability=sweet_delivery,
                     ),
                     category=ALERT_SEATS_SWEET,
+                    movie_no=session.movie_no or self.config.movie_no,
                     seats_available=open_sweet,
                     show_date=session.date,
                     show_time=session.start_time,
@@ -5830,6 +5957,7 @@ class Watcher:
         for text, chunk_sessions in message_chunks(new_sessions, self.config):
             delivered, failed, total = self._broadcast_message(
                 text, category=ALERT_OPEN, show_date=chunk_sessions[0].date,
+                movie_no=chunk_sessions[0].movie_no or self.config.movie_no,
             )
             for session in chunk_sessions:
                 self.state.mark_notified(session.notification_key(
@@ -5856,6 +5984,8 @@ class Watcher:
         )
         today = self.config.local_today()
         plan = self._plan_scan(today)
+        if self.config.multi_movie_enabled and not self.state.movie_catalog_ready():
+            plan = ScanPlan(dates=tuple(self.config.target_dates(today=today)), full_scan=True)
         dates = list(plan.dates)
         tally = _CycleTally()
         pruned_records = 0 if self.dry_run else self.state.prune_expired(today)
@@ -5922,6 +6052,11 @@ class Watcher:
                 self.logger.info("예매 오픈 관측 최대 상영일: %s", observed.isoformat())
                 tally.dirty = tally.dirty or not self.dry_run
         self._cycle_index += 1
+        if (self.config.multi_movie_enabled and not self.dry_run
+                and not self.state.movie_catalog_ready() and plan.full_scan
+                and not errors and tally.successful_dates == len(dates)):
+            self.state.finish_movie_baseline()
+            self.logger.info("영화 목록 초기 수집 완료: IMAX 영화 %d개, 기존 영화 발견 알림 생략", len(self.state.data["movie_catalog"]))
 
         if tally.seat_detail_errors:
             self.logger.warning(
@@ -6259,6 +6394,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         config.poll_interval_seconds,
     )
     logger.info("CGV 로그인 토큰과 로그인 쿠키는 사용하지 않습니다.")
+    if config.multi_movie_enabled:
+        logger.info("다중 영화 운영: 극장별 일정 조회, IMAX만 추출, /movies 영화 선택 활성화 (최초 목록 %s)",
+                    "완료" if watcher.state.movie_catalog_ready() else "수집 중")
     if config.seat_alert_sweet_only:
         logger.info("잔여좌석 명당 전용 운영: 모든 구독자에게 명당만 알림, 신규 오픈 좌석 제한 없음")
     if config.open_only_mode:
