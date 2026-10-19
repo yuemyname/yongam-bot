@@ -2657,7 +2657,15 @@ class StateStore(MovieStateMixin):
             min_seats_counts = {minimum: 0 for minimum in MIN_SEATS_CHOICES}
             seat_times = {"all": 0, "filtered": 0}
             seat_dates = {"all": 0, "filtered": 0}
+            catalog = self.movie_catalog()
+            movie_counts = {number: 0 for number in catalog}
+            no_movie_selected = 0
             for chat_id, record in self.data["subscribers"].items():
+                selected = set(self.selected_movies(chat_id))
+                if not selected:
+                    no_movie_selected += 1
+                for number in selected:
+                    movie_counts[number] = movie_counts.get(number, 0) + 1
                 modes[self.alert_mode(chat_id)] += 1
                 show_days[self.show_day_selection(chat_id)] += 1
                 seat_selections[self.seat_selection(chat_id)] += 1
@@ -2677,6 +2685,12 @@ class StateStore(MovieStateMixin):
                 "seat_times": seat_times,
                 "seat_dates": seat_dates,
                 "chat_types": chat_types,
+                "movies": sorted(
+                    ({"movie_no": number, "title": catalog.get(number, {}).get("title") or f"영화 {number}", "count": count}
+                     for number, count in movie_counts.items()),
+                    key=lambda movie: (-movie["count"], movie["title"], movie["movie_no"]),
+                ),
+                "no_movie_selected": no_movie_selected,
             }
 
     def subscriber_ids_for(
@@ -4341,6 +4355,16 @@ class Watcher(MovieWatcherMixin):
                 )
             )
 
+        lines.extend(["", "🎬 영화별 선택 인원"])
+        for movie in stats["movies"]:
+            # Keep externally supplied titles on one line, without changing
+            # the catalog or subscriber preferences.
+            title = " ".join(str(movie["title"]).split())
+            lines.append(f"• {title} ({movie['movie_no']}) — {movie['count']}명")
+        lines.append(f"• 선택한 영화 없음 — {stats['no_movie_selected']}명")
+        lines.append("※ 복수 선택은 영화마다 집계되어 합계가 전체 구독자 수보다 클 수 있습니다.")
+        lines.append("※ 그룹·채널은 구성원 수가 아닌 구독 채팅 1개로 집계합니다.")
+
         lines.append("")
         lines.append("알림 종류")
         for mode in (ALERT_MODE_ALL, ALERT_MODE_OPEN_ONLY, ALERT_MODE_SEATS_ONLY):
@@ -4421,6 +4445,37 @@ class Watcher(MovieWatcherMixin):
             if listed < len(records):
                 lines.append(f"… 외 {len(records) - listed}명")
         return "\n".join(lines)
+
+    @staticmethod
+    def _stats_reply_chunks(text: str) -> list[str]:
+        """Keep every movie count, splitting long replies at line boundaries.
+
+        Use UTF-16 units conservatively so emoji-rich titles also fit within
+        Telegram's limit. Only an oversized individual line is split mid-line.
+        """
+        chunks: list[str] = []
+        chunk = ""
+        used = 0
+        limit = STATS_MAX_CHARS - 48  # Room for numbered continuation headings.
+        for line in text.splitlines(keepends=True):
+            line_units = len(line.encode("utf-16-le")) // 2
+            if chunk and used + line_units > limit:
+                chunks.append(chunk)
+                chunk, used = "", 0
+            for character in line:
+                units = 2 if ord(character) > 0xFFFF else 1
+                if used + units > limit:
+                    chunks.append(chunk)
+                    chunk, used = "", 0
+                chunk += character
+                used += units
+        if chunk:
+            chunks.append(chunk)
+        if len(chunks) > 1:
+            # Unique part numbers also prevent outbox deduplication from
+            # collapsing two identical pieces of an unusually long title.
+            return [f"📊 통계 {index}/{len(chunks)}\n{part}" for index, part in enumerate(chunks, 1)]
+        return chunks
 
     def _status_reply(self, chat_id: str) -> str:
         """Shared /status rendering for the subscriber and the operator view."""
@@ -5266,13 +5321,19 @@ class Watcher(MovieWatcherMixin):
                     + reply
                 )
 
-            try:
-                reply = self._public_reply(command, chat_id, reply)
-                self._send_or_queue_reply(reply, chat_id=chat_id)
-            except TelegramError as exc:
-                self.logger.warning("Telegram 구독 명령 답장 실패: %s", exc)
-            else:
-                self.logger.debug("Telegram 명령 처리: %s", command)
+            reply = self._public_reply(command, chat_id, reply)
+            replies = (
+                self._stats_reply_chunks(reply)
+                if command in {ADMIN_STATS_COMMAND, ADMIN_STATS_SUMMARY_COMMAND}
+                else [reply]
+            )
+            for part in replies:
+                try:
+                    self._send_or_queue_reply(part, chat_id=chat_id)
+                except TelegramError as exc:
+                    self.logger.warning("Telegram 구독 명령 답장 실패: %s", exc)
+                else:
+                    self.logger.debug("Telegram 명령 처리: %s", command)
 
         if state_changed:
             self.state.save()
