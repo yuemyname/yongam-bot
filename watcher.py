@@ -624,6 +624,9 @@ class Config:
     cgv_public_matrix_base_date: dt.date | None = None
     cgv_public_matrix_compare_date: dt.date | None = None
     multi_movie_enabled: bool = False
+    # Zero retains legacy combined scans. Positive values enable schedule-first
+    # polling and a separate minimum interval for each showing's seat work.
+    seat_poll_interval_seconds: int = 0
 
     @classmethod
     def from_env_file(
@@ -822,6 +825,12 @@ class Config:
                 name="CGV_REQUEST_SPACING_SECONDS",
                 minimum=0,
                 maximum=60,
+            ),
+            seat_poll_interval_seconds=_parse_int(
+                value("SEAT_POLL_INTERVAL_SECONDS", "0"),
+                name="SEAT_POLL_INTERVAL_SECONDS",
+                minimum=0,
+                maximum=86400,
             ),
             rate_limit_backoff_initial_seconds=_parse_int(
                 value("RATE_LIMIT_BACKOFF_INITIAL_SECONDS", "1800"),
@@ -1684,7 +1693,10 @@ class CgvClient:
             }
         )
         payload = self._get_json(
-            f"{self.config.seat_api_url}?{query}", referer=DEFAULT_SEAT_PAGE_URL
+            f"{self.config.seat_api_url}?{query}", referer=DEFAULT_SEAT_PAGE_URL,
+            # Split polling budgets one request before the next schedule scan;
+            # transport retries/redirects must not silently double that budget.
+            single_attempt=bool(self.config.seat_poll_interval_seconds),
         )
         return extract_seat_snapshot(
             payload, scheduled_remaining=session.remaining_seats
@@ -3402,6 +3414,14 @@ class Watcher(MovieWatcherMixin):
         self._delivery_thread: threading.Thread | None = None
         # Cycle 0 always sweeps the full window; a cursor scan runs in between.
         self._cycle_index = 0
+        # Only the CGV polling thread owns these. Pending jobs keep their FIFO
+        # position while their session data is refreshed by each schedule scan.
+        # After restart, jobs are rebuilt from schedules + durable seat baselines.
+        self._seat_pending: dict[str, BookingSession] = {}
+        self._seat_next_due: dict[str, float] = {}
+        self._seat_fresh: dict[str, BookingSession] = {}
+        self._seat_epoch: float | None = None
+        self._last_seat_request_started_at: float | None = None
         self._command_poll_failures = 0
         # Drafted announcement awaiting confirmation; in memory only, so a
         # restart drops it rather than sending something the operator forgot.
@@ -5456,13 +5476,11 @@ class Watcher(MovieWatcherMixin):
         errors: dict[dt.date, str],
         tally: "_CycleTally",
     ) -> None:
-        """Finish each date completely before moving to the next.
+        """Detect openings per date, optionally deferring seat work.
 
-        Probe dates just beyond the booking frontier are still requested first,
-        so a new opening is discovered before anything else runs. After that,
-        each date is closed out where it is read — schedule, seat detail, alert,
-        save — because a cancellation ticket is worth little by the time the
-        rest of the window has been swept.
+        Split polling never reads seat maps here: all dates' openings must be
+        discovered before slower seat work. Legacy combined scans still finish
+        each date's schedule, seat detail, alerts and save before moving on.
         """
 
         for index, show_date in enumerate(dates):
@@ -5582,13 +5600,96 @@ class Watcher(MovieWatcherMixin):
                     session for session in sessions if session not in new_sessions
                 ]
                 if new_sessions:
-                    self._alert_for_sessions(new_sessions, tally)
+                    if self.config.seat_poll_interval_seconds:
+                        self._alert_new_sessions_only(new_sessions, tally)
+                    else:
+                        self._alert_for_sessions(new_sessions, tally)
                     # Persist open alerts before spending time on cancellation
                     # tickets, both for priority and crash-safe de-duplication.
                     self._flush_state(tally)
                 if existing_sessions:
-                    self._alert_for_sessions(existing_sessions, tally)
+                    if self.config.seat_poll_interval_seconds:
+                        if not self.config.open_only_mode:
+                            self._queue_seat_checks(existing_sessions)
+                    else:
+                        self._alert_for_sessions(existing_sessions, tally)
             self._flush_state(tally)
+
+    def _queue_seat_checks(self, sessions: Sequence[BookingSession]) -> None:
+        for session in sessions:
+            key = session.notification_key(site_no=self.config.site_no, movie_no=self.config.movie_no)
+            self._seat_fresh[key] = session
+            if key in self._seat_pending:
+                # Assigning an existing dict key preserves its FIFO position.
+                self._seat_pending[key] = session
+
+    def _run_due_seat_checks(
+        self, dates: Sequence[dt.date], errors: Mapping[dt.date, str],
+        tally: "_CycleTally", *, deadline: float,
+    ) -> int:
+        """Use time left before the next schedule scan, retaining unfinished jobs.
+
+        This is cooperative, not a second HTTP worker: both APIs retain the
+        same request-spacing guard and can never create parallel CGV bursts.
+        Failed-date jobs wait for a fresh successful schedule before processing.
+        """
+        requested = {day.isoformat() for day in dates}
+        failed = {day.isoformat() for day in errors}
+        for key in list(self._seat_next_due):
+            day = key.split(":")[2]
+            if day not in requested or (day not in failed and key not in self._seat_fresh):
+                self._seat_next_due.pop(key, None)
+        for key, session in list(self._seat_pending.items()):
+            if session.date not in requested or (session.date not in failed and key not in self._seat_fresh):
+                self._seat_pending.pop(key, None)
+
+        processed = 0
+        # Leave room for a complete request timeout, the shared pacing delay,
+        # and local persistence. Do not start a seat request at the minute edge.
+        reserve = self.config.request_timeout_seconds + self.config.cgv_request_spacing_seconds + 1
+        for key, session in self._seat_fresh.items():
+            if key not in self._seat_pending and self._seat_next_due.get(key, 0.0) + reserve < deadline:
+                self._seat_pending[key] = session
+        now = time.monotonic()
+        # Ready jobs retain FIFO order. A job due a few seconds later may use
+        # this cycle's idle time instead of slipping to a third-minute scan.
+        jobs = sorted(self._seat_pending.items(),
+                      key=lambda item: max(now, self._seat_next_due.get(item[0], 0.0)))
+        for key, session in jobs:
+            if tally.rate_limited or self._seat_lookup_paused():
+                break
+            if key not in self._seat_fresh:
+                continue
+            due = self._seat_next_due.get(key, 0.0)
+            started = max(time.monotonic(), due)
+            if started + reserve >= deadline:
+                break
+            if due > time.monotonic():
+                time.sleep(max(0.0, due - time.monotonic()))
+            if (self.config.multi_movie_enabled and not self.state.anyone_wants_movie(session.movie_no)):
+                self._seat_pending.pop(key, None)
+                continue
+            current, _closed = self._split_closed_sessions([session])
+            if not current:
+                self._seat_pending.pop(key, None)
+                self._seat_next_due.pop(key, None)
+                continue
+            started = time.monotonic()
+            if started + reserve >= deadline:
+                break
+            self._last_seat_request_started_at = None
+            self._alert_for_sessions([session], tally)
+            self._flush_state(tally)
+            self._seat_pending.pop(key, None)
+            # Count from the actual HTTP attempt, after the shared pacing wait.
+            # Using the job's earlier start could make the next request too soon
+            # when that next schedule scan happens to finish faster.
+            checked_at = self._last_seat_request_started_at
+            self._seat_next_due[key] = (
+                started if checked_at is None else checked_at
+            ) + self.config.seat_poll_interval_seconds
+            processed += 1
+        return processed
 
     def _forces_seat_recheck(self, show_date: dt.date, today: dt.date) -> bool:
         """Whether this date's seats are re-read even with an unchanged total.
@@ -5613,7 +5714,13 @@ class Watcher(MovieWatcherMixin):
             cycles = self.config.seat_recheck_rotate_cycles
             # Slotting by the date keeps a showing in the same slot across
             # restarts, so no date can be starved by an unlucky ordering.
-            return show_date.toordinal() % cycles == self._cycle_index % cycles
+            if self.config.seat_poll_interval_seconds and self._seat_epoch is not None:
+                # A 60-second schedule cycle must not double the previous
+                # 120-second rotation rate for unchanged seat counts.
+                slot = int((time.monotonic() - self._seat_epoch) // self.config.seat_poll_interval_seconds)
+            else:
+                slot = self._cycle_index
+            return show_date.toordinal() % cycles == slot % cycles
         return False
 
     def _alert_for_sessions(
@@ -5724,6 +5831,7 @@ class Watcher(MovieWatcherMixin):
             for index, session in enumerate(seat_candidates):
                 key = session_keys[session]
                 self._wait_for_cgv_request_slot()
+                self._last_seat_request_started_at = time.monotonic()
                 try:
                     snapshots[key] = self.cgv.fetch_seat_snapshot(session)
                     if session.screen_no and session.screen_sequence:
@@ -6067,6 +6175,10 @@ class Watcher(MovieWatcherMixin):
     def run_cycle(self) -> CycleResult:
         if self._cgv_recovery_blocks_scan():
             return CycleResult(0, 0, 0, 0, cgv_paused=True)
+        cycle_started = time.monotonic()
+        self._seat_fresh.clear()
+        if self._seat_epoch is None:
+            self._seat_epoch = cycle_started
         # Snapshot before sending anything this cycle. A fresh failure should
         # wait until the next cycle instead of being retried immediately.
         pending_retries = (
@@ -6137,6 +6249,20 @@ class Watcher(MovieWatcherMixin):
             self._scan_and_alert(open_dates, errors, tally)
         else:
             self._scan_and_alert(dates, errors, tally)
+
+        if self.config.seat_poll_interval_seconds and not self.config.open_only_mode:
+            self.logger.info(
+                "신규 일정 확인 완료: %.1f초, 신규 %d개, 이전 주기 이월 좌석 작업 %d개",
+                time.monotonic() - cycle_started, tally.new_sessions, len(self._seat_pending),
+            )
+            processed = self._run_due_seat_checks(
+                dates, errors, tally,
+                deadline=cycle_started + self.config.poll_interval_seconds,
+            )
+            self.logger.info(
+                "잔여좌석 확인: %d회차 처리, %d회차 다음 주기로 이월 (회차별 최소 %d초 간격)",
+                processed, len(self._seat_pending), self.config.seat_poll_interval_seconds,
+            )
 
         if tally.latest_session_date:
             try:
@@ -6489,6 +6615,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         config.poll_interval_seconds,
     )
     logger.info("CGV 로그인 토큰과 로그인 쿠키는 사용하지 않습니다.")
+    if config.seat_poll_interval_seconds:
+        logger.info(
+            "조회 주기 분리: 신규 일정 %d초, 잔여좌석 회차별 최소 %d초; 신규 일정 우선, 미처리 좌석은 이월",
+            config.poll_interval_seconds, config.seat_poll_interval_seconds,
+        )
     if config.multi_movie_enabled:
         logger.info("다중 영화 운영: 극장별 일정 조회, IMAX만 추출, /movies 영화 선택 활성화 (최초 목록 %s)",
                     "완료" if watcher.state.movie_catalog_ready() else "수집 중")

@@ -318,6 +318,10 @@ def public_guide(lang, config):
         f"🎬 용산 IMAX 영화 알림 봇 (비공식)\n\n조회 범위: {config.scan_range_label()}\n범위 안에서 새 영화를 발견하면 한 번 알려드립니다. /movies 버튼으로 원하는 영화를 선택하면 해당 영화의 신규 오픈·좌석 알림을 받습니다. 기존 구독자는 오디세이 선택을 유지합니다. 새 영화는 자동 구독되지 않습니다.\n\n신규 오픈은 선택 영화·알림 종류·요일을 적용합니다. 날짜·시간·좌석 제한은 잔여좌석에만 적용합니다. 매진된 신규 회차도 안내합니다.\n\n",
         f"🎬 Yongsan IMAX movie alerts (unofficial)\n\nScan range: {config.scan_range_label('en')}\nWe announce newly discovered movies within that range once. Use /movies buttons to select films for opening/seat alerts. Existing subscribers keep Odyssey selected; new films are not selected automatically.\n\nOpenings respect movie, mode and weekday preferences, even if sold out. Date/time/seat restrictions apply only to seat alerts.\n\n")
     policy = choose(lang, "\n잔여좌석은 명당 구역만 알려드립니다. /seat_all로 전체 좌석 전환은 불가합니다.\n", "\nSeat alerts are sweet spots only. /seat_all cannot override this policy.\n") if config.seat_alert_sweet_only else ""
+    if config.seat_poll_interval_seconds:
+        policy += choose(lang,
+            f"신규 일정 확인: 약 {config.poll_interval_seconds}초 간격. 잔여좌석 확인: 회차별 최소 {config.seat_poll_interval_seconds}초 간격. 신규 일정 우선이며 남은 좌석 작업은 다음 주기로 이월됩니다.\n",
+            f"Schedule checks: about every {config.poll_interval_seconds}s. Seat checks: at least {config.seat_poll_interval_seconds}s apart per showing. Schedules take priority; unfinished seat work carries forward.\n")
     if config.open_only_mode:
         policy += choose(lang, "⚠️ 현재 신규 오픈 전용 운영 중: 잔여좌석 알림 중단.\n", "⚠️ Openings-only operation: seat alerts disabled.\n")
     if not config.new_subscriptions_enabled:
