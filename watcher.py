@@ -78,7 +78,8 @@ TELEGRAM_FLOOD_WAIT_MARGIN_SECONDS = 1
 # frontier, which is where a new booking opening can first appear.
 SCAN_MODE_FULL = "full"
 SCAN_MODE_CURSOR = "cursor"
-SCAN_MODES = (SCAN_MODE_FULL, SCAN_MODE_CURSOR)
+SCAN_MODE_FRONTIER = "frontier"
+SCAN_MODES = (SCAN_MODE_FULL, SCAN_MODE_CURSOR, SCAN_MODE_FRONTIER)
 DEFAULT_SCAN_MODE = SCAN_MODE_CURSOR
 
 # Alert categories a broadcast can belong to.  "system" messages (fetch error
@@ -237,7 +238,7 @@ SEAT_DATE_GUIDE = (
     "/date 20261003 20261005 - 10월 3~5일 (양 끝 포함)\n"
     "/date_all - 날짜 제한 해제 (기본)\n\n"
     "날짜는 하이픈 없이 YYYYMMDD로 입력하세요. 알림 도착일이 아닌 CGV 상영일 기준입니다.\n"
-    "조회 범위는 기존처럼 오늘부터 28일이며, 기간이 지나도 설정은 자동 해제되지 않습니다.\n"
+    "운영 중인 조회 범위 안에서만 적용되며, 기간이 지나도 설정은 자동 해제되지 않습니다.\n"
     + SEAT_DATE_NOTE
 )
 
@@ -942,16 +943,36 @@ class Config:
     def local_today(self) -> dt.date:
         return self.local_now().date()
 
-    def target_range(self, *, today: dt.date | None = None) -> tuple[dt.date, dt.date]:
+    def target_range(
+        self, *, today: dt.date | None = None, frontier: dt.date | None = None
+    ) -> tuple[dt.date, dt.date]:
+        start = (today or self.local_today()) if self.dynamic_date_window else self.target_start
+        if self.scan_mode == SCAN_MODE_FRONTIER:
+            # No future frontier: bootstrap from today, never fall back to a
+            # 28-day sweep. Freeze this boundary for the whole scan cycle.
+            end = max(frontier or start, start) + dt.timedelta(days=self.cursor_probe_days)
+            return start, end if self.dynamic_date_window else min(end, self.target_end)
         if not self.dynamic_date_window:
-            return self.target_start, self.target_end
-        start = today or self.local_today()
+            return start, self.target_end
         return start, start + dt.timedelta(days=self.target_window_days - 1)
 
-    def target_dates(self, *, today: dt.date | None = None) -> list[dt.date]:
-        start, end = self.target_range(today=today)
+    def target_dates(
+        self, *, today: dt.date | None = None, frontier: dt.date | None = None
+    ) -> list[dt.date]:
+        start, end = self.target_range(today=today, frontier=frontier)
         count = (end - start).days + 1
         return [start + dt.timedelta(days=offset) for offset in range(count)]
+
+    def scan_range_label(self, language: str = "ko") -> str:
+        if self.scan_mode == SCAN_MODE_FRONTIER:
+            days = self.cursor_probe_days
+            return (
+                f"From today through {days} days after the latest observed IMAX show date"
+                if language == "en" else
+                f"오늘부터 마지막으로 예매 오픈을 확인한 IMAX 상영일의 {days}일 뒤까지"
+            )
+        return (f"Within {self.target_window_days} days from today" if language == "en"
+                else f"오늘부터 {self.target_window_days}일")
 
 
 @dataclasses.dataclass(frozen=True, order=True)
@@ -3871,7 +3892,8 @@ class Watcher(MovieWatcherMixin):
         changes; a periodic full scan appends the rest of the window.
         """
 
-        window = self.config.target_dates(today=today)
+        frontier = self.state.frontier_date
+        window = self.config.target_dates(today=today, frontier=frontier)
         if not window:
             return ScanPlan(dates=tuple(window), full_scan=True)
 
@@ -3888,7 +3910,6 @@ class Watcher(MovieWatcherMixin):
                         ordered.append(date)
             return tuple(ordered)
 
-        frontier = self.state.frontier_date
         # No frontier yet (first run, or a wiped volume) means there is nothing
         # to probe past, so the window has to be swept once to establish one.
         if frontier is None:
@@ -3909,6 +3930,15 @@ class Watcher(MovieWatcherMixin):
         # that are closest to starting.
         open_dates = [date for date in window if date <= open_end]
         remaining_dates = [date for date in window if date > probe_end]
+        if self.config.scan_mode == SCAN_MODE_FRONTIER:
+            # Every cycle covers this bounded window. In particular periodic
+            # sweeps, persisted failed dates and discovery cannot widen it.
+            # A hit advances the boundary on the NEXT cycle; no forward walk.
+            return ScanPlan(
+                dates=ordered_unique(probe_dates, retry_dates, remaining_dates, open_dates),
+                full_scan=True,
+                probe_end=probe_end,
+            )
         full_scan = (
             self.config.scan_mode == SCAN_MODE_FULL
             or self._cycle_index % self.config.full_scan_every_cycles == 0
@@ -4902,7 +4932,8 @@ class Watcher(MovieWatcherMixin):
             return (
                 "📅 현재 잔여좌석 상영 날짜: "
                 + _seat_date_label(self.state.seat_date_range(chat_id))
-                + "\n\n" + SEAT_DATE_GUIDE,
+                + "\n\n" + SEAT_DATE_GUIDE
+                + f"\n조회 범위: {self.config.scan_range_label()}",
                 False,
             )
         fields = body.split()
@@ -4927,7 +4958,7 @@ class Watcher(MovieWatcherMixin):
         return (
             ("✅ 잔여좌석 상영 날짜를 변경했습니다." if changed else "📅 이미 설정된 상영 날짜입니다.")
             + f"\n→ {label}\n{SEAT_DATE_NOTE}{note}"
-            + "\n오늘부터 28일 조회 범위 안에서 적용됩니다. 설정 해제: /date_all",
+            + f"\n조회 범위: {self.config.scan_range_label()}. 설정 해제: /date_all",
             changed,
         )
 
@@ -5220,7 +5251,7 @@ class Watcher(MovieWatcherMixin):
                     "🎬 용아맥 오디세이 알림 봇\n\n"
                     "CGV 용산아이파크몰 IMAX의 오디세이 예매 오픈과 "
                     "예매 가능한 좌석을 확인해 알려주는 비공식 봇입니다.\n"
-                    "한국시간 기준 오늘부터 28일간의 상영 회차를 감시합니다.\n\n"
+                    f"한국시간 기준 {self.config.scan_range_label()}의 상영 회차를 감시합니다.\n\n"
                     "🔔 알려드리는 내용\n"
                     "• 새 IMAX 상영 회차 예매 오픈\n"
                     f"• 예매 가능한 {'명당' if self.config.seat_alert_sweet_only else 'A열 제외'} 좌석 (취소표 포함)\n"
@@ -5252,7 +5283,7 @@ class Watcher(MovieWatcherMixin):
                     "• /date 20261003 — 10월 3일 포함 이후\n"
                     "• /date 20261003 20261005 — 10월 3~5일 (양 끝 포함)\n"
                     "• /date_all — 날짜 제한 해제 (기본)\n"
-                    "※ 하이픈 없이 YYYYMMDD 입력. CGV 상영일 기준이며 오늘부터 28일 조회 범위 안에서 적용. "
+                    "※ 하이픈 없이 YYYYMMDD 입력. CGV 상영일 기준이며 운영 중인 조회 범위 안에서 적용. "
                     "기간이 지나도 자동 해제되지 않으며 신규 오픈에는 날짜 제한 없음\n\n"
                     "🕒 잔여좌석 상영 시간 (선택 사항)\n"
                     "• /time — 현재 설정과 사용 방법\n"
@@ -6046,7 +6077,8 @@ class Watcher(MovieWatcherMixin):
         today = self.config.local_today()
         plan = self._plan_scan(today)
         if self.config.multi_movie_enabled and not self.state.movie_catalog_ready():
-            plan = ScanPlan(dates=tuple(self.config.target_dates(today=today)), full_scan=True)
+            plan = ScanPlan(dates=tuple(self.config.target_dates(
+                today=today, frontier=self.state.frontier_date)), full_scan=True)
         dates = list(plan.dates)
         tally = _CycleTally()
         pruned_records = 0 if self.dry_run else self.state.prune_expired(today)
@@ -6076,7 +6108,9 @@ class Watcher(MovieWatcherMixin):
             # in steady state it never moves, so it was invisible exactly when
             # someone wants to know how far booking currently reaches.
             "조회 시작: %s 모드, %d일 (%s~%s), 예매 열린 마지막 날 %s",
-            "전체" if plan.full_scan else "커서",
+            (f"오픈일+{self.config.cursor_probe_days}일 제한"
+             if self.config.scan_mode == SCAN_MODE_FRONTIER
+             else "전체" if plan.full_scan else "커서"),
             len(dates),
             min(dates).isoformat() if dates else "-",
             max(dates).isoformat() if dates else "-",
@@ -6438,9 +6472,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.error("%s", exc)
         return 2
 
-    range_start, range_end = config.target_range()
+    range_start, range_end = config.target_range(frontier=watcher.state.frontier_date)
     range_label = (
-        f"오늘부터 {config.target_window_days}일(매일 자동 갱신)"
+        f"{config.scan_range_label()}(자동 갱신)"
         if config.dynamic_date_window
         else f"{range_start}~{range_end}"
     )
