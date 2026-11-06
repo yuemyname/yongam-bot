@@ -262,8 +262,12 @@ class MovieWatcherMixin:
             if paused:
                 text += choose(lang, "\n⚠️ 조회 또는 발송에 대기/중단 상태가 있습니다. 운영자에게 문의해주세요.", "\n⚠️ Lookups or delivery are paused/delayed. Contact the operator.")
             return text
-        if command in {"/help", "/desc", "/description"} and (self.config.multi_movie_enabled or lang == "en"):
-            return public_guide(lang, self.config)
+        if command in {"/help", "/desc", "/description"} and (
+            self.config.multi_movie_enabled or self.config.open_only_mode or lang == "en"
+        ):
+            # Help is a command index; description is a separate, detailed guide.
+            renderer = public_help if command == "/help" else public_guide
+            return renderer(lang, self.config)
         if lang != "en":
             return original
         if command in {"/stop", "/unsubscribe"}:
@@ -298,7 +302,21 @@ EN_SETTINGS = (
 )
 
 
-def public_guide(lang, config):
+def _public_service_notes(lang, config):
+    notes = []
+    if config.open_only_mode:
+        notes.append(choose(lang,
+            "⚠️ 현재 신규 오픈 전용 운영 중입니다. 잔여좌석 조회·알림은 중단되어 있습니다. 기존 '잔여좌석만' 구독자는 /mode_open으로 변경해주세요.",
+            "⚠️ Openings-only operation: seat lookups/alerts are disabled. If you selected seats only, use /mode_open to receive opening alerts."))
+    if not config.new_subscriptions_enabled:
+        notes.append(choose(lang,
+            "⏸ 신규 구독을 잠시 중단했습니다. 기존 구독자는 계속 이용할 수 있지만, 해지 후에는 재개될 때까지 재구독할 수 없습니다.",
+            "⏸ New subscriptions are closed. Existing subscribers can continue, but cannot rejoin after unsubscribing until signups reopen."))
+    return "\n\n".join(notes)
+
+
+def public_help(lang, config):
+    """A compact command index, not the detailed /desc walkthrough."""
     commands = [
         ("start", "알림 구독", "Subscribe"), ("stop", "알림 해지", "Unsubscribe"),
         ("status", "현재 구독 및 설정", "Current settings"), ("movies", "알림 받을 영화 선택 (복수 선택)", "Choose movies (multiple)"),
@@ -314,24 +332,95 @@ def public_guide(lang, config):
         ("count", "최소 좌석 수", "Minimum seats"), ("count_1", "1석 이상", "At least 1"), ("count_2", "2석 이상", "At least 2"),
         ("desc", "봇 설명과 사용법", "About and usage"), ("developer", "개발자 인스타그램 문의", "Contact developer"),
         ("coffee", "개발자 커피 후원", "Support developer"), ("help", "전체 명령어", "All commands")]
-    intro = choose(lang,
-        f"🎬 용산 IMAX 영화 알림 봇 (비공식)\n\n조회 범위: {config.scan_range_label()}\n범위 안에서 새 영화를 발견하면 한 번 알려드립니다. /movies 버튼으로 원하는 영화를 선택하면 해당 영화의 신규 오픈·좌석 알림을 받습니다. 기존 구독자는 오디세이 선택을 유지합니다. 새 영화는 자동 구독되지 않습니다.\n\n신규 오픈은 선택 영화·알림 종류·요일을 적용합니다. 날짜·시간·좌석 제한은 잔여좌석에만 적용합니다. 매진된 신규 회차도 안내합니다.\n\n",
-        f"🎬 Yongsan IMAX movie alerts (unofficial)\n\nScan range: {config.scan_range_label('en')}\nWe announce newly discovered movies within that range once. Use /movies buttons to select films for opening/seat alerts. Existing subscribers keep Odyssey selected; new films are not selected automatically.\n\nOpenings respect movie, mode and weekday preferences, even if sold out. Date/time/seat restrictions apply only to seat alerts.\n\n")
-    policy = choose(lang, "\n잔여좌석은 명당 구역만 알려드립니다. /seat_all로 전체 좌석 전환은 불가합니다.\n", "\nSeat alerts are sweet spots only. /seat_all cannot override this policy.\n") if config.seat_alert_sweet_only else ""
-    if config.seat_poll_interval_seconds:
-        policy += choose(lang,
-            f"신규 일정 확인: 약 {config.poll_interval_seconds}초 간격. 잔여좌석 확인: 회차별 최소 {config.seat_poll_interval_seconds}초 간격. 신규 일정 우선이며 남은 좌석 작업은 다음 주기로 이월됩니다.\n",
-            f"Schedule checks: about every {config.poll_interval_seconds}s. Seat checks: at least {config.seat_poll_interval_seconds}s apart per showing. Schedules take priority; unfinished seat work carries forward.\n")
+    if not config.multi_movie_enabled:
+        commands = [entry for entry in commands if entry[0] != "movies"]
     if config.open_only_mode:
-        policy += choose(lang, "⚠️ 현재 신규 오픈 전용 운영 중: 잔여좌석 알림 중단.\n", "⚠️ Openings-only operation: seat alerts disabled.\n")
-    if not config.new_subscriptions_enabled:
-        policy += choose(lang, "⏸ 현재 신규 구독 중단 중. 기존 구독자만 이용 가능합니다.\n", "⏸ New subscriptions are closed; existing subscribers can continue.\n")
-    examples = choose(lang,
-        "\n예: /date 20261020 (당일 포함 이후)\n/date 20261020 20261025 (양 끝 포함)\n/time 18:00 23:59 · /time 22:00 02:00 (자정 통과)\n모든 날짜·시간은 한국시간 상영일 기준입니다.\n",
-        "\nExamples: /date 20261020 (from Oct 20)\n/date 20261020 20261025 (inclusive)\n/time 18:00 23:59 · /time 22:00 02:00 (overnight)\nDates and times are CGV show dates in Korea time.\n")
-    zones = "\nSweetSpot: J11–34, K11–34, L11–34\nExperienced: H13–32, I13–32\nExtremer: F16–29, G16–29\n"
-    footer = choose(lang, "\n예매 링크를 열어 CGV에서 IMAX·회차를 확인하고 직접 예매해주세요. 조회/발송 지연이나 CGV 차단으로 알림이 늦거나 누락될 수 있습니다.", "\nOpen the booking link, verify IMAX and the showtime in CGV, then book yourself. Network/delivery delays or CGV blocks can delay or prevent alerts.")
-    return intro + "\n".join(f"/{c} — {choose(lang,k,e)}" for c,k,e in commands) + policy + examples + zones + footer
+        inactive = {"mode_all", "mode_seats", "date", "date_all", "time", "time_all",
+                    "seat", "seat_all", "seat_sweet", "count", "count_1", "count_2"}
+        commands = [entry for entry in commands if entry[0] not in inactive]
+    parts = [choose(lang, "📋 용아맥 봇 전체 명령어", "📋 Yongsan IMAX bot commands"),
+             "\n".join(f"/{c} — {choose(lang, k, e)}" for c, k, e in commands)]
+    if config.seat_alert_sweet_only and not config.open_only_mode:
+        parts.append(choose(lang,
+            "잔여좌석은 명당만 알리며, 신규 오픈에는 좌석 제한이 없습니다.",
+            "Seat alerts are sweet spots only; opening alerts have no seat restriction."))
+    if notes := _public_service_notes(lang, config):
+        parts.append(notes)
+    parts.append(choose(lang,
+        "봇 소개·알림 기준·설정 예시·예매 방법은 /desc에서 자세히 확인하세요.",
+        "Use /desc for a detailed explanation of alerts, filters and booking."))
+    return "\n\n".join(parts)
+
+
+def public_guide(lang, config):
+    """Detailed /desc content, using effective settings rather than old defaults."""
+    today = config.local_today()
+    date_start = today.strftime("%Y%m%d")
+    date_end = (today + dt.timedelta(days=2)).strftime("%Y%m%d")
+    parts = [choose(lang,
+        f"🎬 용아맥 봇 소개와 사용 방법\n\nCGV {config.site_name} IMAX의 예매 오픈과 예매 가능한 좌석을 알려주는 비공식 봇입니다. 자동 예매·결제는 하지 않습니다.",
+        f"🎬 About the Yongsan IMAX bot\n\nAn unofficial bot for booking openings and available seats at CGV {config.site_name} IMAX. It does not reserve seats or pay for tickets.")]
+    if notes := _public_service_notes(lang, config):
+        parts.append(notes)
+
+    cadence = choose(lang,
+        f"신규 일정 확인: 약 {config.poll_interval_seconds}초 간격.",
+        f"Schedule checks: about every {config.poll_interval_seconds}s.")
+    if config.seat_poll_interval_seconds and not config.open_only_mode:
+        cadence += choose(lang,
+            f" 잔여좌석 확인: 회차별 최소 {config.seat_poll_interval_seconds}초 간격. 신규 일정이 우선이며 남은 좌석 작업은 다음 주기로 이월됩니다.",
+            f" Seat checks: at least {config.seat_poll_interval_seconds}s apart per showing. Schedules take priority; unfinished seat work carries forward.")
+    parts.append(choose(lang,
+        f"🔎 조회 범위와 주기\n{config.scan_range_label()} (한국시간 기준).\n{cadence}\n조회 범위 밖의 회차는 감지하지 못할 수 있습니다.",
+        f"🔎 Coverage and timing\n{config.scan_range_label('en')} (Korea time).\n{cadence}\nShowings outside this range may not be detected."))
+
+    movies = choose(lang,
+        "2. 봇과의 개인 채팅에서 /movies로 원하는 영화를 눌러 선택합니다. ✅ 표시가 선택된 영화이며 여러 편을 고를 수 있습니다. 다시 누르면 해제됩니다.\n새 영화 발견 안내는 구독자에게 한 번 보내지만, 그 영화가 자동 선택되지는 않습니다. 영화 선택 시 최근 조회한 예정 회차를 안내하며 실시간 좌석을 보장하지 않습니다.",
+        "2. In a private chat, use /movies and tap films to select them. ✅ means selected; tap again to remove. Multiple films are allowed.\nNew-film announcements do not automatically select the film. Selecting one shows cached upcoming showings, not guaranteed live availability.") if config.multi_movie_enabled else choose(lang,
+        f"2. 현재 알림 영화: {config.movie_label}", f"2. Current film: {config.movie_label}")
+    parts.append(choose(lang,
+        "📌 시작하기\n1. /start — 알림 구독\n", "📌 Getting started\n1. /start — Subscribe\n") + movies + choose(lang,
+        "\n3. /status로 선택 영화와 설정을 확인합니다. /language에서 한국어·English를 선택할 수 있습니다.",
+        "\n3. Check /status for your settings. Use /language to choose Korean or English."))
+
+    parts.append(choose(lang,
+        "🔔 신규 오픈 알림\n처음 발견한 상영 회차를 한 번 알립니다. 매진·좌석 수 미확인 회차도 안내하며, 선택 영화·알림 종류·상영 요일만 적용합니다. /mode로 확인하고 /mode_open으로 받을 수 있습니다. 좌석 번호는 조회하지 않습니다.",
+        "🔔 Opening alerts\nEach newly seen showing is announced once, including sold-out or unknown-count showings. Movie, mode and show-day settings apply. Check /mode; use /mode_open to receive openings. Seat numbers are not queried.") if config.open_only_mode else choose(lang,
+        "🔔 두 가지 알림\n• 신규 오픈: 처음 발견한 상영 회차를 한 번 알립니다. 매진이거나 좌석 수를 몰라도 신규 회차이면 안내합니다. 선택 영화·알림 종류·상영 요일만 적용하며 날짜·시간·좌석·최소 좌석 제한은 적용하지 않습니다.\n• 잔여좌석: 조건에 맞는 예매 가능 좌석(취소표 포함)을 알립니다. 좌석이 계속 남아 있으면 수가 같아도 다시 알릴 수 있습니다.\n/mode에서 종류 확인·선택: /mode_all 둘 다 · /mode_open 신규만 · /mode_seats 좌석만",
+        "🔔 Two alert types\n• Openings: each newly seen showing is announced once, even if sold out or its seat count is unknown. Movie, mode and show-day settings apply; date/time/seat/minimum-count filters do not.\n• Seats: available seats, including cancellations, matching your filters. Alerts can repeat while seats remain, even if the count is unchanged.\n/mode: /mode_all both · /mode_open openings · /mode_seats seats"))
+
+    parts.append(choose(lang,
+        "📅 상영 요일\n/day_all 모든 요일 · /day_weekend 토·일 상영분. 영화 상영일 기준이며 알림 도착 요일과는 무관합니다. /day로 확인하세요. 잔여좌석 날짜·시간·좌석·최소 좌석 설정은 현재 적용되지 않습니다.",
+        "📅 Show weekdays\n/day_all every day · /day_weekend Sat/Sun showings, based on the show day, not the delivery day. Check /day. Seat date/time/scope/minimum-count settings do not apply in openings-only operation.") if config.open_only_mode else choose(lang,
+        "📅 요일·날짜·시간 설정\n/day_all 모든 요일 · /day_weekend 토·일 상영분. 알림이 도착하는 요일이 아니라 영화 상영일 기준이며 신규·좌석 알림에 모두 적용합니다. /day로 확인하세요.\n"
+        f"/date {date_start} — 입력한 날짜 포함 이후\n/date {date_start} {date_end} — 양 끝 날짜 포함\n"
+        "날짜는 하이픈 없이 YYYYMMDD로 입력합니다. 기간이 지나도 자동 해제되지 않으며 /date_all로 해제합니다.\n"
+        "/time 18:00 23:59 — 저녁 상영\n/time 22:00 02:00 — 자정을 넘는 심야 상영\n"
+        "한국시간 상영 시작시각 기준, 양 끝 포함. /time_all로 해제합니다. 날짜·시간은 잔여좌석에만 적용하며 조회 범위를 늘리지는 않습니다.",
+        "📅 Day, date and time filters\n/day_all every day · /day_weekend Sat/Sun showings. This is the film's show day, not the day you receive the alert; it applies to both alert types. Check with /day.\n"
+        f"/date {date_start} — from this date, inclusive\n/date {date_start} {date_end} — inclusive range\n"
+        "Enter YYYYMMDD without hyphens. Expired filters stay active; clear with /date_all.\n"
+        "/time 18:00 23:59 — evening\n/time 22:00 02:00 — overnight\n"
+        "Korea-time show starts, both endpoints included. Clear with /time_all. Date/time filters affect seats only and do not extend the scan range."))
+
+    policy = choose(lang,
+        "현재 모든 구독자에게 명당만 알립니다. 위치 미확인 좌석은 제외합니다. /seat_all로 전체 좌석 전환은 불가합니다.",
+        "All subscribers receive sweet-spot seats only. Unverified locations are excluded; /seat_all cannot override this.") if config.seat_alert_sweet_only else choose(lang,
+        "/seat_all은 A열 제외 전체, /seat_sweet은 아래 명당만 선택합니다.",
+        "/seat_all selects all except row A; /seat_sweet selects the zones below.")
+    if not config.open_only_mode:
+        parts.append(choose(lang, "💺 명당과 최소 좌석\n", "💺 Sweet spots and minimum seats\n") + policy + "\n"
+            "SweetSpot: J11~34, K11~34, L11~34\nExperienced: H13~32, I13~32\nExtremer: F16~29, G16~29\n" + choose(lang,
+            "/seat · /seat_sweet으로 구역을 확인하세요. /count_1은 1석 이상, /count_2는 대상 좌석이 2석 이상일 때 알립니다. 2석이 서로 붙어 있다는 뜻은 아닙니다. /count로 확인하세요.\nA열만 남은 경우·0석·이미 시작한 회차는 좌석 알림에서 제외합니다. 명당 설정은 명당이 없으면 제외합니다.",
+            "Check with /seat or /seat_sweet. /count_1 needs at least 1 qualifying seat; /count_2 needs 2, not necessarily adjacent. Check with /count.\nNo seat alerts for row-A-only availability, zero seats or started showings; sweet mode also requires a sweet-spot seat."))
+
+        parts.append(choose(lang,
+            "✉️ 좌석 알림 읽기\n상영 시간 → 좌석 번호 → 잔여 좌석 → 변동 좌석수 순서입니다.\n'잔여 좌석'은 전체 잔여/총좌석, '변동 좌석수'는 알림 대상 구역의 이전→현재 수입니다. 이전 수를 모르거나 같으면 현재 수만 표시합니다.",
+            "✉️ Reading seat alerts\nShowtime → seat numbers → remaining seats → available-seat count.\nRemaining seats means the auditorium total available/total capacity; available-seat count compares qualifying seats, previous → current. If unchanged or previously unknown, only the current count is shown."))
+    parts.append(choose(lang,
+        "🎟️ 예매와 주의사항\n링크에는 영화·극장·날짜가 선택되어 있습니다. CGV에서 IMAX·상영시간·좌석을 확인한 뒤 직접 예매·결제해주세요. 알림 후 좌석이 매진될 수 있으며, 통신 지연·CGV 차단·발송 대기로 알림이 늦거나 누락될 수 있습니다.\n\n/stop — 알림 해지 · /help — 전체 명령어\n/developer — 개발자 인스타그램 문의\n/coffee — 개발자 커피 후원 (후원 여부와 기능은 무관)",
+        "🎟️ Booking and limitations\nLinks preselect movie, cinema and date. Confirm IMAX, showtime and seats in CGV, then book/pay yourself. Seats may sell out; network delays, CGV blocks or delivery queues can delay or prevent alerts.\n\n/stop — Unsubscribe · /help — All commands\n/developer — Contact developer on Instagram\n/coffee — Support developer; donations do not change features."))
+    return "\n\n".join(parts)
 
 
 def localize_alert(text, language):

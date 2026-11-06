@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlsplit
 from watcher import (BookingSession, CgvClient, Config, FetchError, StateStore,
                      TelegramDeferred, Watcher, extract_sessions, message_chunks,
                      booking_url_for_session, seat_change_message, SeatSnapshot)
-from movie_features import localize_alert, public_guide
+from movie_features import localize_alert, public_help
 from test_watcher import make_config, _kst
 
 DAY = dt.date(2026, 8, 26)
@@ -227,7 +227,7 @@ class MovieTests(unittest.TestCase):
 
     def test_all_public_help_commands_present_in_both_languages(self):
         for lang in ("ko", "en"):
-            text = public_guide(lang, self.config)
+            text = public_help(lang, dataclasses.replace(self.config, open_only_mode=False))
             self.assertLess(len(text), 4096)
             for command in ("/movies", "/language", "/start", "/stop", "/mode_all", "/mode_open", "/mode_seats", "/day_weekend", "/date_all", "/time_all", "/seat_all", "/seat_sweet", "/count_1", "/count_2", "/developer", "/coffee", "/help", "/desc"):
                 self.assertIn(command, text)
