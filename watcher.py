@@ -2960,14 +2960,26 @@ class StateStore(MovieStateMixin):
             return True
 
 
-def _session_line(session: BookingSession) -> str:
+def _session_movie_log_label(session: BookingSession, config: Config | None = None) -> str:
+    """Identify movies in logs without altering titles in outgoing messages."""
+    movie_no = session.movie_no or (config.movie_no if config else "")
+    title = session.movie_label
+    if not title and config and movie_no == config.movie_no:
+        title = config.movie_label
+    # API-supplied titles must not insert line breaks/control characters in logs.
+    title = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", title).split()) or "영화명 미확인"
+    movie_no = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", movie_no).split()) or "코드 미확인"
+    return f"[{title} ({movie_no})]"
+
+
+def _session_line(session: BookingSession, config: Config | None = None) -> str:
     details: list[str] = []
     if session.screen_name:
         details.append(session.screen_name)
     if session.remaining_seats is not None or session.total_seats is not None:
         details.append(f"좌석 {_seat_ratio(session)}")
     suffix = f" — {' / '.join(details)}" if details else ""
-    return f"• {session.date} {session.start_time}{suffix}"
+    return f"• {_session_movie_log_label(session, config)} {session.date} {session.start_time}{suffix}"
 
 
 def _seat_ratio(session: BookingSession, *, remaining: int | None = None) -> str:
@@ -5452,6 +5464,7 @@ class Watcher(MovieWatcherMixin):
             snapshot = snapshots.get(key)
             remaining = snapshot.total if snapshot else session.remaining_seats
             tally.verdicts.append(
+                f"{_session_movie_log_label(session, self.config)} "
                 f"{session.date[5:]} {session.start_time} "
                 f"{remaining if remaining is not None else '?'}"
                 f"/{session.total_seats or '?'} "
@@ -5841,7 +5854,8 @@ class Watcher(MovieWatcherMixin):
                     message = str(exc)
                     tally.seat_detail_errors += 1
                     tally.seat_detail_error_sample = (
-                        tally.seat_detail_error_sample or message
+                        tally.seat_detail_error_sample
+                        or f"{_session_line(session, self.config)}: {message}"
                     )
                     snapshots[key] = SeatSnapshot(
                         total=session.remaining_seats or 0
@@ -5870,7 +5884,7 @@ class Watcher(MovieWatcherMixin):
                     tally.seat_detail_errors += 1
                     tally.seat_detail_error_sample = (
                         tally.seat_detail_error_sample
-                        or f"예상하지 못한 좌석 조회 오류: {type(exc).__name__}"
+                        or f"{_session_line(session, self.config)}: 예상하지 못한 좌석 조회 오류: {type(exc).__name__}"
                     )
                     snapshots[key] = SeatSnapshot(
                         total=session.remaining_seats or 0
@@ -5925,7 +5939,7 @@ class Watcher(MovieWatcherMixin):
             if self.dry_run:
                 self.logger.info("드라이런: 새 회차 %d개(메시지/상태 저장 생략)", len(new_sessions))
                 for session in new_sessions:
-                    self.logger.info("드라이런 회차: %s", _session_line(session))
+                    self.logger.info("드라이런 회차: %s", _session_line(session, self.config))
                 tally.new_sessions += len(new_sessions)
             else:
                 for text, chunk_sessions in message_chunks(
@@ -5993,7 +6007,7 @@ class Watcher(MovieWatcherMixin):
                 if changed:
                     self.logger.info(
                         "제외: %s 잔여 좌석이 0석입니다.",
-                        _session_line(session),
+                        _session_line(session, self.config),
                     )
                 if not self.dry_run:
                     self.state.set_seat_snapshot(key, current)
@@ -6006,7 +6020,7 @@ class Watcher(MovieWatcherMixin):
                 if changed:
                     self.logger.info(
                         "제외: %s %s",
-                        _session_line(session),
+                        _session_line(session, self.config),
                         current.suppression_reason,
                     )
                 if not self.dry_run:
@@ -6020,7 +6034,7 @@ class Watcher(MovieWatcherMixin):
                 if changed:
                     self.logger.info(
                         "보류: %s A열 여부 판별 실패 후 잔여 6석 이하입니다.",
-                        _session_line(session),
+                        _session_line(session, self.config),
                     )
                 continue
 
@@ -6050,7 +6064,7 @@ class Watcher(MovieWatcherMixin):
             if self.dry_run:
                 self.logger.info(
                     "드라이런 예매 가능 좌석: %s (%d석)%s",
-                    _session_line(session),
+                    _session_line(session, self.config),
                     current.total,
                     unclassified,
                 )
@@ -6123,7 +6137,7 @@ class Watcher(MovieWatcherMixin):
                 if self._delivery_worker_running():
                     self.logger.info(
                         "좌석 대기열: %s (%d석)%s, 대상 %d명",
-                        _session_line(session),
+                        _session_line(session, self.config),
                         current.total,
                         unclassified,
                         total,
@@ -6131,7 +6145,7 @@ class Watcher(MovieWatcherMixin):
                 else:
                     self.logger.info(
                         "전송: 예매 가능 좌석 %s (%d석)%s, 성공 %d명, 실패 %d명",
-                        _session_line(session),
+                        _session_line(session, self.config),
                         current.total,
                         unclassified,
                         delivered,
