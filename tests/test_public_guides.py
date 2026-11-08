@@ -98,10 +98,26 @@ class PublicGuideTests(unittest.TestCase):
                 self.assertNotEqual(help_text, description)
                 for text in (help_text, description):
                     self.assertLessEqual(len(text.encode("utf-16-le")) // 2, 4096)
+                    # Korean suffixes must not be joined to command tokens.
+                    self.assertNotRegex(text, r"/[A-Za-z0-9_]+[가-힣ㄱ-ㅎㅏ-ㅣ]")
+                    self.assertNotIn("`", text)
+                    self.assertNotIn("<code>", text)
+                    self.assertNotIn("<pre>", text)
                     self.assertIn("/developer", text)
                     self.assertNotIn("/statss", text)
                     if not signups:
                         self.assertIn("New subscriptions are closed" if english else "신규 구독을 잠시 중단", text)
+
+    def test_korean_description_uses_standalone_commands_in_getting_started(self):
+        for command in ("/desc", "/description", "/desc@YongamBot"):
+            with self.subTest(command=command):
+                text = self.command(command)
+                self.assertIn("2. /movies — 봇과의 개인 채팅에서 원하는 영화를", text)
+                self.assertIn("3. /status — 선택 영화와 설정 확인", text)
+                self.assertIn("/language — 한국어·English 선택", text)
+                self.assertIn("/date 20261106 20261108", text)
+                self.assertIn("/time 22:00 02:00", text)
+        self.assertTrue(self.command("/help").endswith("자세히 보기: /desc"))
 
     def test_guide_explains_current_policy_not_old_odyssey_defaults(self):
         text = self.command("/desc")
