@@ -69,6 +69,23 @@ class PublicGuideTests(unittest.TestCase):
             for command in ("/description", "/desc@YongamBot", "/description@YongamBot"):
                 self.assertEqual(self.command(command), expected)
 
+    def test_donation_commands_use_buy_me_a_coffee_in_both_languages(self):
+        chat = self.config.telegram_chat_id
+        for language in ("ko", "en"):
+            self.watcher.state.set_language(chat, language)
+            subscribers = copy.deepcopy(self.watcher.state.data["subscribers"])
+            for command in ("/coffee", "/donate", "/coffee@YongamBot", "/donate@YongamBot"):
+                with self.subTest(language=language, command=command):
+                    text = self.command(command)
+                    self.assertIn("https://buymeacoffee.com/yuemyname", text)
+                    self.assertIn("Buy Me a Coffee", text)
+                    self.assertNotIn("ko-fi", text.lower())
+                    self.assertIn("모든 알림 기능은 동일" if language == "ko"
+                                  else "All alerts are available regardless of donations", text)
+                    self.assertEqual(self.watcher.state.language(chat), language)
+                    self.assertEqual(self.watcher.state.data["subscribers"], subscribers)
+        self.assertEqual(self.watcher.cgv.mock_calls, [])
+
     def test_both_replies_fit_telegram_and_stay_distinct_in_all_modes(self):
         for multi, open_only, sweet, signups, english in itertools.product((False, True), repeat=5):
             with self.subTest(multi=multi, open_only=open_only, sweet=sweet, signups=signups, en=english):

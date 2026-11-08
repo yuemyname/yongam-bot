@@ -4453,7 +4453,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertIn("/help — 전체 명령어 보기", description)
             self.assertLess(len(description), 4096)
 
-    def test_coffee_command_shows_kofi_donation_link(self):
+    def test_coffee_command_shows_buy_me_a_coffee_donation_link(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = dataclasses.replace(
                 make_config(Path(temporary)), subscriptions_enabled=True
@@ -4483,7 +4483,8 @@ class WatcherIntegrationTests(unittest.TestCase):
 
             self.assertEqual(replies[0][0], "111222")
             self.assertIn("커피 한 잔 후원", replies[0][1])
-            self.assertIn("https://ko-fi.com/yuemyname", replies[0][1])
+            self.assertIn("https://buymeacoffee.com/yuemyname", replies[0][1])
+            self.assertIn("Buy Me a Coffee", replies[0][1])
             self.assertIn("모든 알림 기능은 동일", replies[0][1])
 
     def test_telegram_commands_are_polled_while_cgv_scan_is_blocked(self):

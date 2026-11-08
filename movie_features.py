@@ -273,7 +273,7 @@ class MovieWatcherMixin:
         if command in {"/stop", "/unsubscribe"}:
             return "🔕 Unsubscribed. /start to subscribe again.\n/language — Language" + ("\nNew subscriptions are currently closed." if not self.config.new_subscriptions_enabled else "")
         if command in {"/developer", "/coffee", "/donate"}:
-            return ("💬 Developer contact (not CGV support)\nhttps://www.instagram.com/silverflowerstar/" if command == "/developer" else "☕ Support the developer\nhttps://ko-fi.com/yuemyname\nAll alerts are available regardless of donations.")
+            return ("💬 Developer contact (not CGV support)\nhttps://www.instagram.com/silverflowerstar/" if command == "/developer" else "☕ Support the developer on Buy Me a Coffee\nhttps://buymeacoffee.com/yuemyname\nAll alerts are available regardless of donations.")
         if re.fullmatch(r"/(mode.*|alert|day.*|date.*|time.*|seat.*|count.*)", command):
             if not self.state.is_subscribed(chat_id):
                 return "Please subscribe with /start first."

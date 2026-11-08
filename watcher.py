@@ -5363,8 +5363,8 @@ class Watcher(MovieWatcherMixin):
             elif command in {"/coffee", "/donate"}:
                 reply = (
                     "☕ 개발자에게 커피 한 잔 후원하기\n\n"
-                    "용아맥 알림 봇이 도움이 되었다면 Ko-fi에서 후원할 수 있어요.\n"
-                    "https://ko-fi.com/yuemyname\n\n"
+                    "용아맥 알림 봇이 도움이 되었다면 Buy Me a Coffee에서 후원할 수 있어요.\n"
+                    "https://buymeacoffee.com/yuemyname\n\n"
                     "후원 여부와 관계없이 모든 알림 기능은 동일하게 제공됩니다."
                 )
             else:
