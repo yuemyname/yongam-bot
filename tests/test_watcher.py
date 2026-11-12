@@ -3587,6 +3587,10 @@ class WatcherIntegrationTests(unittest.TestCase):
             # of being retried forever.
             remaining["count"] = 0
             for _ in range(5):
+                # Simulate the next scheduled retry without real sleeps.
+                # Priority delivery must not bypass per-message backoff.
+                for record in watcher.state.data["pending_deliveries"].values():
+                    record["next_attempt_at"] = ""
                 watcher.run_cycle()
 
             self.assertGreater(peak, 0)

@@ -15,6 +15,7 @@ import datetime as dt
 import getpass
 import hashlib
 import http.client
+import itertools
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -2410,12 +2411,14 @@ class StateStore(MovieStateMixin):
             return True
 
     def rotate_broadcast_recipients(
-        self, category: str, recipients: Sequence[str], *, advance: bool = True
+        self, category: str, recipients: Sequence[str], *, advance: bool = True,
+        priority_recipient: str | None = None,
     ) -> tuple[str, ...]:
         """Rotate a stable eligible ring, independently for each alert category.
 
         Remember the last first recipient, rather than an array offset, so
         subscriptions and filters can change without resetting to the first ID.
+        An eligible operator goes first, outside the rotating subscriber ring.
         Direct replies and operator messages do not consume broadcast turns.
         """
 
@@ -2423,7 +2426,10 @@ class StateStore(MovieStateMixin):
             unique = tuple(dict.fromkeys(str(chat_id) for chat_id in recipients))
             if not unique or category not in ROTATING_ALERT_CATEGORIES:
                 return unique
-            ordered = sorted(unique)
+            first = (priority_recipient,) if priority_recipient in unique else ()
+            ordered = sorted(chat_id for chat_id in unique if chat_id not in first)
+            if not ordered:
+                return first
             previous = self.data["broadcast_rotation"].get(category)
             start = 0
             if previous is not None:
@@ -2431,18 +2437,21 @@ class StateStore(MovieStateMixin):
             rotated = tuple(ordered[start:] + ordered[:start])
             if advance:
                 self.data["broadcast_rotation"][category] = rotated[0]
-            return rotated
+            return first + rotated
 
     def queue_broadcast_deliveries(
         self, recipients: Sequence[str], text: str, category: str, *,
         show_date: str | None = None, show_time: str | None = None,
         seats_available: int | None = None,
         movie_no: str | None = None, reply_markup: dict | None = None,
+        priority_recipient: str | None = None,
     ) -> int:
         """Save the rotated outbox and its cursor together before sending."""
 
         with self._lock:
-            ordered = self.rotate_broadcast_recipients(category, recipients, advance=False)
+            ordered = self.rotate_broadcast_recipients(
+                category, recipients, advance=False, priority_recipient=priority_recipient
+            )
             added = 0
             first_added = None
             for chat_id in ordered:
@@ -2452,10 +2461,10 @@ class StateStore(MovieStateMixin):
                     movie_no=movie_no, reply_markup=reply_markup,
                 ):
                     added += 1
-                    if first_added is None:
+                    if first_added is None and chat_id != priority_recipient:
                         first_added = chat_id
             if added:
-                if category in ROTATING_ALERT_CATEGORIES:
+                if category in ROTATING_ALERT_CATEGORIES and first_added is not None:
                     self.data["broadcast_rotation"][category] = first_added
                 # The sender cannot see this batch until this lock is released.
                 self.save()
@@ -3815,7 +3824,7 @@ class Watcher(MovieWatcherMixin):
         self._delivery_thread.start()
         self.logger.info(
             "Telegram 영속 발송 대기열 시작: 신규 오픈 최우선, "
-            "최대 초당 %d건, 알림별 수신자 시작 순번 순환",
+            "최대 초당 %d건, 운영자 우선 전송 후 나머지 수신자 시작 순번 순환",
             self.config.telegram_broadcast_rate_per_second,
         )
 
@@ -3867,6 +3876,23 @@ class Watcher(MovieWatcherMixin):
             sequence = 0
         return priority, str(record.get("queued_at") or ""), sequence, key
 
+    def _is_operator_alert(self, chat_id: str, category: str) -> bool:
+        return (
+            category in ROTATING_ALERT_CATEGORIES
+            and chat_id in self._operator_recipients()
+        )
+
+    def _prioritized_delivery_sort_key(
+        self, item: tuple[str, Mapping[str, Any]],
+    ) -> tuple[int, int, str, int, str]:
+        priority, queued_at, sequence, key = self._delivery_sort_key(item)
+        record = item[1]
+        # Opening priority still wins over operator seat alerts. This also
+        # applies to queued records restored from an older release, without
+        # rewriting them or consuming a new subscriber rotation turn.
+        operator_rank = 0 if self._is_operator_alert(record["chat_id"], record["category"]) else 1
+        return priority, operator_rank, queued_at, sequence, key
+
     def _delivery_loop(self) -> None:
         """Drain short priority batches while CGV scanning continues."""
 
@@ -3892,7 +3918,7 @@ class Watcher(MovieWatcherMixin):
                 if self._delivery_due_at(item[1]) <= now
             ]
             if due:
-                due.sort(key=self._delivery_sort_key)
+                due.sort(key=self._prioritized_delivery_sort_key)
                 # Re-read priorities after at most one second's worth of sends,
                 # so a new opening can jump ahead of a large seat-alert queue.
                 batch_size = min(
@@ -4188,6 +4214,7 @@ class Watcher(MovieWatcherMixin):
                 subscriber_ids, text, category, show_date=show_date,
                 show_time=show_time, seats_available=seats_available,
                 movie_no=movie_no,
+                priority_recipient=str(self.config.telegram_chat_id).strip(),
             )
             self._delivery_wake_event.set()
             self.logger.info(
@@ -4214,16 +4241,26 @@ class Watcher(MovieWatcherMixin):
 
         results: list[tuple[str, TelegramError | None]] = []
         if subscriber_ids:
-            subscriber_ids = self.state.rotate_broadcast_recipients(category, subscriber_ids)
+            subscriber_ids = self.state.rotate_broadcast_recipients(
+                category, subscriber_ids,
+                priority_recipient=str(self.config.telegram_chat_id).strip(),
+            )
             if not self.dry_run:
                 self.state.save()
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(
-                    self.config.telegram_broadcast_workers, len(subscriber_ids)
-                ),
-                thread_name_prefix="telegram-broadcast",
-            ) as executor:
-                results = list(executor.map(send, subscriber_ids))
+            remaining_ids = subscriber_ids
+            if self._is_operator_alert(subscriber_ids[0], category):
+                # Wait for this attempt before starting other recipients; just
+                # submitting it first to a pool does not guarantee send order.
+                results.append(send(subscriber_ids[0]))
+                remaining_ids = subscriber_ids[1:]
+            if remaining_ids:
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(
+                        self.config.telegram_broadcast_workers, len(remaining_ids)
+                    ),
+                    thread_name_prefix="telegram-broadcast",
+                ) as executor:
+                    results.extend(executor.map(send, remaining_ids))
 
         for chat_id, error in results:
             if error is not None:
@@ -4293,10 +4330,13 @@ class Watcher(MovieWatcherMixin):
             return
         changed = False
         eligible_records: list[tuple[str, Mapping[str, Any]]] = []
-        for key, record in (
-            sorted(self.state.pending_deliveries(), key=self._delivery_sort_key)
-            if pending is None else pending
+        now = dt.datetime.now(dt.timezone.utc)
+        for key, record in sorted(
+            self.state.pending_deliveries() if pending is None else pending,
+            key=self._prioritized_delivery_sort_key,
         ):
+            if self._delivery_due_at(record) > now:
+                continue
             chat_id = record["chat_id"]
             category = record["category"]
             if self.config.seat_alert_sweet_only and category in {ALERT_SEATS, ALERT_SEATS_UNCLASSIFIED}:
@@ -4346,14 +4386,26 @@ class Watcher(MovieWatcherMixin):
             return key, chat_id, None
 
         results: list[tuple[str, str, TelegramError | None]] = []
-        if eligible_records:
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(
-                    self.config.telegram_broadcast_workers, len(eligible_records)
-                ),
-                thread_name_prefix="telegram-retry",
-            ) as executor:
-                results = list(executor.map(resend, eligible_records))
+        for _priority, group in itertools.groupby(
+            eligible_records, key=lambda item: self._delivery_sort_key(item)[0]
+        ):
+            remaining_records = []
+            for item in group:
+                if self._is_operator_alert(item[1]["chat_id"], item[1]["category"]):
+                    # One bounded attempt, then continue with subscribers even
+                    # on a recipient-specific failure. Global 429 waits still
+                    # stop every sender through the existing shared send gate.
+                    results.append(resend(item))
+                else:
+                    remaining_records.append(item)
+            if remaining_records:
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(
+                        self.config.telegram_broadcast_workers, len(remaining_records)
+                    ),
+                    thread_name_prefix="telegram-retry",
+                ) as executor:
+                    results.extend(executor.map(resend, remaining_records))
 
         for key, chat_id, error in results:
             if error is not None:
