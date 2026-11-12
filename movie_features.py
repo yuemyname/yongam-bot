@@ -342,8 +342,8 @@ def public_help(lang, config):
              "\n".join(f"/{c} — {choose(lang, k, e)}" for c, k, e in commands)]
     if config.seat_alert_sweet_only and not config.open_only_mode:
         parts.append(choose(lang,
-            "잔여좌석은 명당만 알리며, 신규 오픈에는 좌석 제한이 없습니다.",
-            "Seat alerts are sweet spots only; opening alerts have no seat restriction."))
+            "잔여좌석은 새 명당 좌석이 생길 때만 알리며, 신규 오픈에는 좌석 제한이 없습니다.",
+            "Seat alerts require newly available sweet spots; opening alerts have no seat restriction."))
     if notes := _public_service_notes(lang, config):
         parts.append(notes)
     parts.append(choose(lang,
@@ -386,8 +386,8 @@ def public_guide(lang, config):
     parts.append(choose(lang,
         "🔔 신규 오픈 알림\n처음 발견한 상영 회차를 한 번 알립니다. 매진·좌석 수 미확인 회차도 안내하며, 선택 영화·알림 종류·상영 요일만 적용합니다. 좌석 번호는 조회하지 않습니다.\n/mode — 알림 종류 확인\n/mode_open — 신규 오픈 받기",
         "🔔 Opening alerts\nEach newly seen showing is announced once, including sold-out or unknown-count showings. Movie, mode and show-day settings apply. Check /mode; use /mode_open to receive openings. Seat numbers are not queried.") if config.open_only_mode else choose(lang,
-        "🔔 두 가지 알림\n• 신규 오픈: 처음 발견한 상영 회차를 한 번 알립니다. 매진이거나 좌석 수를 몰라도 신규 회차이면 안내합니다. 선택 영화·알림 종류·상영 요일만 적용하며 날짜·시간·좌석·최소 좌석 제한은 적용하지 않습니다.\n• 잔여좌석: 조건에 맞는 예매 가능 좌석(취소표 포함)을 알립니다. 좌석이 계속 남아 있으면 수가 같아도 다시 알릴 수 있습니다.\n/mode — 종류 확인·선택: /mode_all 둘 다 · /mode_open 신규만 · /mode_seats 좌석만",
-        "🔔 Two alert types\n• Openings: each newly seen showing is announced once, even if sold out or its seat count is unknown. Movie, mode and show-day settings apply; date/time/seat/minimum-count filters do not.\n• Seats: available seats, including cancellations, matching your filters. Alerts can repeat while seats remain, even if the count is unchanged.\n/mode: /mode_all both · /mode_open openings · /mode_seats seats"))
+        "🔔 두 가지 알림\n• 신규 오픈: 처음 발견한 상영 회차를 한 번 알립니다. 매진이거나 좌석 수를 몰라도 신규 회차이면 안내합니다. 선택 영화·알림 종류·상영 요일만 적용하며 날짜·시간·좌석·최소 좌석 제한은 적용하지 않습니다.\n• 잔여좌석: 조건에 맞는 예매 가능 좌석(취소표 포함)을 알립니다. 명당 알림은 새 명당 좌석이 생길 때만 보냅니다. 같은 자리 유지·감소·명당 밖 변화는 생략하며, 좌석 수가 같아도 새 번호가 나타나면 알립니다. 처음 좌석 위치를 확인한 회차는 한 번 안내할 수 있습니다.\n/mode — 종류 확인·선택: /mode_all 둘 다 · /mode_open 신규만 · /mode_seats 좌석만",
+        "🔔 Two alert types\n• Openings: each newly seen showing is announced once, even if sold out or its seat count is unknown. Movie, mode and show-day settings apply; date/time/seat/minimum-count filters do not.\n• Seats: available seats, including cancellations, matching your filters. Sweet-spot alerts require a newly available seat. Unchanged seats, removals and changes outside sweet spots are skipped; a new seat number still alerts at the same count. The first verified seat map may trigger one alert.\n/mode: /mode_all both · /mode_open openings · /mode_seats seats"))
 
     parts.append(choose(lang,
         "📅 상영 요일\n/day_all 모든 요일 · /day_weekend 토·일 상영분. 영화 상영일 기준이며 알림 도착 요일과는 무관합니다.\n/day — 현재 요일 설정 확인\n잔여좌석 날짜·시간·좌석·최소 좌석 설정은 현재 적용되지 않습니다.",

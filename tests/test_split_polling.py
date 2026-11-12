@@ -101,6 +101,15 @@ class SplitPollingTests(unittest.TestCase):
     def seat_requests(self):
         return [r for r in self.requests if r[0] == 'seat']
 
+    def test_unchanged_sweet_seats_do_not_requeue_or_add_requests(self):
+        self.config = dataclasses.replace(self.config, seat_alert_sweet_only=True)
+        self.restart()
+        for offset in (0, 60, 120, 180):
+            self.cycle(offset)
+        self.assertEqual(len(self.seat_requests()), 2)
+        self.assertFalse(any(record['category'].startswith('seats')
+                             for _, record in self.watcher.state.pending_deliveries()))
+
     def test_all_dates_and_new_open_alert_precede_any_seat_request(self):
         tomorrow = self.DAY+dt.timedelta(days=1)
         self.rows[tomorrow] = [self.row(tomorrow)]

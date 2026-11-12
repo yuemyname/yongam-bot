@@ -1424,11 +1424,11 @@ class BookingOpenWithoutSeatDetailTests(unittest.TestCase):
                 # A5 comes back: the non-A count does not move.
                 row_a = cycle(0)
 
-            # Two seats left and both are sweet ones, so every audience
-            # qualifies: the alert reports what is on sale, not what moved.
-            self.assertEqual(sale, ["2매이상", "기본", "명당"])
-            self.assertEqual(pair, ["2매이상", "기본", "명당"])
-            self.assertEqual(row_a, ["2매이상", "기본", "명당"])
+            # Legacy all-seat audiences retain their on-sale policy. Sweet
+            # seats J20/J21 never changed, so that audience hears nothing.
+            self.assertEqual(sale, ["2매이상", "기본"])
+            self.assertEqual(pair, ["2매이상", "기본"])
+            self.assertEqual(row_a, ["2매이상", "기본"])
             self.assertIn("잔여 좌석: 4/624석 (이전 2/624석)", pair_message)
             self.assertIn("변동 좌석수: 2석 → 4석", pair_message)
             self.assertIn("좌석 번호: B10 / C11 / J20~21", pair_message)

@@ -123,7 +123,8 @@ class PublicGuideTests(unittest.TestCase):
         text = self.command("/desc")
         for phrase in (
             "CGV 용산아이파크몰 IMAX", "5일 뒤까지", "60초", "120초",
-            "자동 선택되지는 않습니다", "매진이거나", "수가 같아도 다시",
+            "자동 선택되지는 않습니다", "매진이거나", "새 명당 좌석이 생길 때만",
+            "같은 자리 유지·감소·명당 밖 변화는 생략", "수가 같아도 새 번호",
             "날짜·시간·좌석·최소 좌석 제한은 적용하지 않습니다",
             "YYYYMMDD", "/date 20261106 20261108", "기간이 지나도 자동 해제되지",
             "위치 미확인 좌석은 제외", "전체 좌석 전환은 불가",
@@ -149,6 +150,14 @@ class PublicGuideTests(unittest.TestCase):
                     self.assertNotIn(inactive, text)
                 self.assertNotIn("120초", text)
                 self.assertNotIn("120s apart", text)
+
+    def test_english_guide_describes_new_seats_only(self):
+        self.watcher.state.set_language(self.config.telegram_chat_id, "en")
+        text = self.command("/desc")
+        self.assertIn("require a newly available seat", text)
+        self.assertIn("Unchanged seats, removals and changes outside sweet spots are skipped", text)
+        self.assertIn("new seat number still alerts at the same count", text)
+        self.assertNotIn("Alerts can repeat while seats remain", text)
 
     def test_guides_do_not_fetch_cgv_subscribe_or_change_preferences(self):
         chat = self.config.telegram_chat_id

@@ -3136,14 +3136,23 @@ def _available_seat_count(snapshot: SeatSnapshot) -> int:
 def _sweet_seats_available(
     previous: SeatSnapshot | None, current: SeatSnapshot
 ) -> tuple[SeatSnapshot | None, SeatSnapshot] | None:
-    """Snapshots to alert on while a sweet seat is on sale, or None."""
+    """Alert only when a newly available sweet seat is confirmed.
+
+    Compare seat identities, not totals: replacements at the same count
+    qualify, while removals, reordering and changes outside sweet spots do not.
+    The first complete map establishes the initial availability. The caller
+    preserves the last verified map across unsuccessful seat lookups.
+    """
 
     current_sweet = _sweet_seat_snapshot(current)
     if current_sweet is None or not current_sweet.available_seats:
         return None
-    return (
-        _sweet_seat_snapshot(previous) if previous is not None else None
-    ), current_sweet
+    previous_sweet = _sweet_seat_snapshot(previous) if previous is not None else None
+    if previous_sweet is not None and not (
+        set(current_sweet.available_seats) - set(previous_sweet.available_seats or ())
+    ):
+        return None
+    return previous_sweet, current_sweet
 
 
 def _available_seat_line(
@@ -3193,8 +3202,8 @@ def seat_change_message(
 ) -> str:
     previous_available, current_available = availability or (previous, current)
     ratio = _seat_ratio(session, remaining=current.total)
-    # The alert repeats while seats stay on sale, so the previous count is
-    # only worth printing when it actually differs.
+    # A newly available seat can replace another at the same total count;
+    # print a count comparison only when the count actually differs.
     if previous is not None and previous.total != current.total:
         ratio += f" (이전 {_seat_ratio(session, remaining=previous.total)})"
     lines = [
@@ -5811,6 +5820,7 @@ class Watcher(MovieWatcherMixin):
                 # comparisons need.  Until it exists there is nothing to tell
                 # a /seat_sweet or /count_2 subscriber apart by.
                 or not previous.seat_map_complete
+                or (self.config.seat_alert_sweet_only and previous.available_seats is None)
             )
             # A map CGV will not render must not be re-requested every minute,
             # which is what the deferral backoff below is for.
@@ -5906,7 +5916,8 @@ class Watcher(MovieWatcherMixin):
                     key in previously_notified
                     and snapshot.total > 0
                     and not snapshot.should_suppress
-                    and not snapshot.seat_map_complete
+                    and (not snapshot.seat_map_complete
+                         or (self.config.seat_alert_sweet_only and snapshot.available_seats is None))
                 )
                 changed = (
                     self.state.note_deferred(
@@ -5993,10 +6004,8 @@ class Watcher(MovieWatcherMixin):
                     tally.dirty = True
                 continue
 
-            # Most showings sit sold out cycle after cycle now that the alert
-            # no longer waits for a change.  Log the moment a showing enters
-            # an excluded state, not every minute it stays there; the DEBUG
-            # verdict line still carries the full per-cycle census.
+            # Log transitions into excluded states, not every unchanged scan;
+            # the DEBUG verdict line still carries the per-cycle census.
             changed = previous is None or _seat_snapshot_changed(
                 previous, current
             )
@@ -6028,6 +6037,23 @@ class Watcher(MovieWatcherMixin):
                     tally.dirty = True
                 continue
 
+            sweet_delivery = _sweet_seats_available(previous, current)
+            if self.config.seat_alert_sweet_only:
+                if not current.seat_map_complete or current.available_seats is None:
+                    # Do not replace a verified baseline with a timeout or an
+                    # unreadable map, otherwise recovery resends the old seats.
+                    verdicts[key] = "보류·명당 좌석 미확인"
+                    tally.deferred_keys.add(key)
+                    continue
+                if sweet_delivery is None:
+                    # Save removals too: a seat that disappears and later
+                    # returns should be announced again. No extra API call.
+                    verdicts[key] = "변화없음·새 명당 좌석 없음"
+                    if not self.dry_run:
+                        self.state.set_seat_snapshot(key, current)
+                        tally.dirty = True
+                    continue
+
             if not current.alertable:
                 verdicts[key] = "보류·A열 여부 미확인"
                 tally.deferred_keys.add(key)
@@ -6038,10 +6064,8 @@ class Watcher(MovieWatcherMixin):
                     )
                 continue
 
-            # Seats on sale are worth announcing whether or not the count
-            # moved since the last look: the subscriber wants to know a seat
-            # is bookable now, not that it changed.  A genuine change always
-            # goes out; only repeats of an unchanged showing can be throttled.
+            # Legacy non-sweet alerts retain their repeat setting. Sweet
+            # alerts require newly available seat identities, regardless of it.
             if not changed and not self.state.seat_alert_is_due(
                 key, self.config.local_now(), self.config.seat_alert_repeat_minutes
             ):
@@ -6094,7 +6118,6 @@ class Watcher(MovieWatcherMixin):
                 )
             else:
                 delivered = failed = total = 0
-            sweet_delivery = _sweet_seats_available(previous, current)
             open_sweet = (
                 _available_seat_count(sweet_delivery[1]) if sweet_delivery else 0
             )
@@ -6300,6 +6323,8 @@ class Watcher(MovieWatcherMixin):
                 tally.seat_detail_error_sample,
                 "차단 중에는 새 좌석 알림 보류, 신규 오픈 조회 유지"
                 if self._seat_lookup_paused()
+                else "명당 좌석 확인 전까지 좌석 알림 보류, 이전 좌석 목록 유지"
+                if self.config.seat_alert_sweet_only
                 else "6석 이하는 보류, 7석 이상은 전체 잔여 수 기준 알림",
             )
 
@@ -6638,7 +6663,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.info("다중 영화 운영: 극장별 일정 조회, IMAX만 추출, /movies 영화 선택 활성화 (최초 목록 %s)",
                     "완료" if watcher.state.movie_catalog_ready() else "수집 중")
     if config.seat_alert_sweet_only:
-        logger.info("잔여좌석 명당 전용 운영: 모든 구독자에게 명당만 알림, 신규 오픈 좌석 제한 없음")
+        logger.info("잔여좌석 명당 전용 운영: 새 명당 좌석이 생길 때만 알림, 동일·감소·명당 밖 변화 생략, 신규 오픈 좌석 제한 없음")
     if config.open_only_mode:
         logger.info("신규 오픈 전용 운영: 일정 API만 조회, 좌석 API·취소표 알림 중단")
     else:

@@ -129,10 +129,10 @@ class SweetOnlyOperationTests(unittest.TestCase):
             self.assertIn("0석 → 1석", text)
             self.assertNotIn("B1", text)
             self.assertNotIn("J10", text)
-            # This change deliberately does not change the repeat policy.
+            # An unchanged sweet seat is no longer re-announced.
             watcher.telegram.send_message.reset_mock()
             watcher.run_cycle()
-            watcher.telegram.send_message.assert_called_once()
+            watcher.telegram.send_message.assert_not_called()
 
     def test_unknown_positions_do_not_fall_back_to_total_even_above_seven(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(Config, "local_now", return_value=_kst(self.TODAY)):
