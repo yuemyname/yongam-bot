@@ -111,6 +111,7 @@ DELIVERY_CATEGORY_PRIORITIES = {
     ALERT_OPEN: 0,
     ALERT_REPLY: 5,
     "movie_summary": 5,
+    "movie_welcome": 5,
     ALERT_SEATS: 10,
     ALERT_SEATS_SWEET: 10,
     ALERT_SEATS_UNCLASSIFIED: 10,
@@ -118,6 +119,7 @@ DELIVERY_CATEGORY_PRIORITIES = {
     ALERT_SYSTEM: 20,
 }
 DEFAULT_DELIVERY_PRIORITY = 30
+MOVIE_SELECTION_DELIVERIES = frozenset({"movie_summary", "movie_welcome"})
 ROTATING_ALERT_CATEGORIES = frozenset({
     "movie",
     ALERT_OPEN, ALERT_SEATS, ALERT_SEATS_SWEET, ALERT_SEATS_UNCLASSIFIED, ALERT_NOTICE,
@@ -2816,6 +2818,7 @@ class StateStore(MovieStateMixin):
         self, chat_id: str, *, label: str = "", chat_type: str = "",
         initial_movies: Sequence[str] | None = None,
         initial_alert_mode: str = DEFAULT_ALERT_MODE,
+        welcome_pending: bool = False,
     ) -> bool:
         with self._lock:
             key = str(chat_id)
@@ -2839,11 +2842,20 @@ class StateStore(MovieStateMixin):
             # the same lock as registration, before the scanner can see them.
             if initial_movies is not None:
                 self.data["subscribers"][key]["movies"] = list(initial_movies)
+            if welcome_pending:
+                self.data["subscribers"][key]["welcome_pending"] = True
             return True
 
     def remove_subscriber(self, chat_id: str) -> bool:
         with self._lock:
-            return self.data["subscribers"].pop(str(chat_id), None) is not None
+            removed = self.data["subscribers"].pop(str(chat_id), None) is not None
+            # A later re-subscription must not receive this subscription's
+            # delayed introduction as well as its own welcome.
+            pending = self.data["pending_deliveries"]
+            for key, record in list(pending.items()):
+                if record.get("chat_id") == str(chat_id) and record.get("category") == "movie_welcome":
+                    del pending[key]
+            return removed
 
     @property
     def telegram_update_offset(self) -> int:
@@ -3893,12 +3905,12 @@ class Watcher(MovieWatcherMixin):
 
     @classmethod
     def _ordered_delivery_candidates(cls, pending):
-        """Only a chat's first movie-summary part is eligible for a send slot."""
+        """Serialize showings, settings and the optional first-time welcome."""
         summary_chats = set()
         candidates = []
         for item in sorted(pending, key=cls._delivery_sort_key):
             record = item[1]
-            if record["category"] == "movie_summary":
+            if record["category"] in MOVIE_SELECTION_DELIVERIES:
                 if record["chat_id"] in summary_chats:
                     continue
                 summary_chats.add(record["chat_id"])
@@ -4357,12 +4369,12 @@ class Watcher(MovieWatcherMixin):
         eligible_records: list[tuple[str, Mapping[str, Any]]] = []
         now = dt.datetime.now(dt.timezone.utc)
         # Movie-selection replies are a sequence: all cached showing chunks,
-        # then /status. Send only the head per chat so parallel workers and a
+        # then /status and an optional welcome. Send only the head so workers and a
         # backed-off earlier chunk cannot let settings overtake the showings.
         # Other chats and higher-priority opening alerts remain independent.
         summary_heads: dict[str, str] = {}
         for summary_key, summary in sorted(self.state.pending_deliveries(), key=self._delivery_sort_key):
-            if summary["category"] == "movie_summary":
+            if summary["category"] in MOVIE_SELECTION_DELIVERIES:
                 summary_heads.setdefault(summary["chat_id"], summary_key)
         for key, record in sorted(
             self.state.pending_deliveries() if pending is None else pending,
@@ -4395,10 +4407,12 @@ class Watcher(MovieWatcherMixin):
             )
             if category == "movie_summary":
                 eligible = {chat_id} if self.state.is_subscribed(chat_id) and self.state.wants_movie(chat_id, record.get("movie_no")) else set()
+            elif category == "movie_welcome":
+                eligible = {chat_id} if self.state.is_subscribed(chat_id) else set()
             if chat_id not in eligible:
                 changed = self.state.remove_pending_delivery(key) or changed
                 continue
-            if category == "movie_summary" and summary_heads.get(chat_id) != key:
+            if category in MOVIE_SELECTION_DELIVERIES and summary_heads.get(chat_id) != key:
                 continue
             eligible_records.append((key, record))
 
@@ -4407,6 +4421,11 @@ class Watcher(MovieWatcherMixin):
         ) -> tuple[str, str, TelegramError | None]:
             key, record = item
             chat_id = record["chat_id"]
+            if record["category"] == "movie_welcome":
+                with self.state._lock:
+                    if (key not in self.state.data["pending_deliveries"]
+                            or not self.state.is_subscribed(chat_id)):
+                        return key, chat_id, None
             # A command can cancel a queued film after this batch was copied.
             if record["category"] in {ALERT_OPEN, ALERT_SEATS, ALERT_SEATS_SWEET, ALERT_SEATS_UNCLASSIFIED, "movie_summary"}:
                 with self.state._lock:
@@ -5233,6 +5252,7 @@ class Watcher(MovieWatcherMixin):
                     chat_id, label=label, chat_type=chat_type,
                     initial_movies=() if self.config.multi_movie_enabled else None,
                     initial_alert_mode=ALERT_MODE_OPEN_ONLY,
+                    welcome_pending=self.config.multi_movie_enabled and chat_type == "private",
                 )
                 state_changed = state_changed or added
                 subscribers_changed = subscribers_changed or added

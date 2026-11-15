@@ -284,7 +284,7 @@ class MovieWatcherMixin:
         self._delivery_wake_event.set()
 
     def _queue_movie_selection_result(self, chat_id, movie_no):
-        """Follow cached showings with the actual /status reply, not a guide."""
+        """Showings, actual /status, then a one-time intro for new subscribers."""
         self._queue_movie_summary(chat_id, movie_no)
         _, markup = self._movie_menu(chat_id)
         chunks = self._stats_reply_chunks(self._status_reply(chat_id), heading=choose(
@@ -294,6 +294,14 @@ class MovieWatcherMixin:
             # Keep the picker usable without sending a third menu message.
             self.state.queue_pending_delivery(chat_id, chunk, "movie_summary", movie_no=movie_no,
                 reply_markup=markup if index == len(chunks) - 1 else None)
+        with self.state._lock:
+            subscriber = self.state.data["subscribers"].get(str(chat_id), {})
+            # Absent on existing subscriptions: never mass-send an introduction
+            # when deploying. Save this flag with the durable outbox below.
+            if subscriber.get("welcome_pending") is True:
+                self.state.queue_pending_delivery(chat_id,
+                    public_welcome(self.state.language(chat_id), self.config), "movie_welcome")
+                subscriber["welcome_pending"] = False
 
     def _queue_movie_summary(self, chat_id, movie_no):
         lang = self.state.language(chat_id)
@@ -445,6 +453,34 @@ def public_help(lang, config):
     return "\n\n".join(parts)
 
 
+def public_welcome(lang, config):
+    """Short first-subscription introduction, separate from /status and /desc."""
+    parts = [choose(lang,
+        "👋 용아맥 알리미에 오신 것을 환영해요!\n\nCGV 용산아이파크몰 IMAX의 예매 오픈과 예매 가능한 좌석을 알려주는 비공식 알림 봇입니다. 대화형 AI나 자동 예매 서비스가 아니므로 원하는 알림은 명령어로 직접 설정해주세요.",
+        "👋 Welcome to the Yongsan IMAX alert bot!\n\nThis unofficial bot reports booking openings and available seats at CGV Yongsan I'Park Mall IMAX. It is not a conversational AI or an automatic booking service. Please use commands to set your alert preferences.")]
+    parts.append(choose(lang,
+        "🔔 신규 구독은 ‘신규 오픈만’으로 시작합니다.",
+        "🔔 New subscriptions start with opening alerts only."))
+    if not config.open_only_mode:
+        parts.append(choose(lang,
+            "취소표 알림도 받고 싶다면 /mode 에서 ‘신규 오픈 + 잔여좌석’을 선택해주세요.",
+            "Want cancellation-seat alerts too? Use /mode and choose openings + seats."))
+    settings = choose(lang,
+        "필요할 때만 설정을 바꾸세요.\n/movies — 알림 받을 영화 추가·해제\n/day — 상영 요일 선택",
+        "Adjust settings when needed.\n/movies — Add or remove movies\n/day — Choose show weekdays")
+    if not config.open_only_mode:
+        settings += choose(lang,
+            "\n/date · /time — 잔여좌석 알림의 날짜·시간 설정\n/seat — 좌석 구역 확인\n/count — 최소 좌석 수 선택",
+            "\n/date · /time — Dates and times for seat alerts\n/seat — Check seat scope\n/count — Minimum available seats")
+    parts.append(settings)
+    parts.append(choose(lang,
+        "/status — 현재 설정\n/language — 한국어 / English\n/help — 전체 명령어\n/desc — 자세한 사용 방법\n/stop — 알림 해지",
+        "/status — Current settings\n/language — 한국어 / English\n/help — All commands\n/desc — Detailed guide\n/stop — Unsubscribe"))
+    if notes := _public_service_notes(lang, config):
+        parts.append(notes)
+    return "\n\n".join(parts)
+
+
 def public_guide(lang, config):
     """Detailed /desc content. Keep commands separate from Korean particles."""
     today = config.local_today()
@@ -468,8 +504,8 @@ def public_guide(lang, config):
         f"🔎 Coverage and timing\n{config.scan_range_label('en')} (Korea time).\n{cadence}\nShowings outside this range may not be detected."))
 
     movies = choose(lang,
-        "2. /start 답장의 버튼에서 영화를 선택합니다. 최초 구독 시 자동 선택되는 영화는 없으며, 선택 전에는 영화별 오픈·좌석 알림을 받지 않습니다.\n/movies — 영화 선택 다시 열기. ✅는 선택됨이며 여러 편을 고를 수 있고, 다시 누르면 해제됩니다. 기존 구독자의 선택은 유지합니다.\n새 영화 발견 안내가 와도 자동 선택되지는 않습니다. 선택하면 최근 조회한 예정 회차 → /status 와 같은 현재 설정 순서로 안내합니다. 실시간 좌석을 보장하지 않습니다.",
-        "2. Choose films using the buttons in the /start reply. New subscribers start with no selected movies and receive no film-specific opening/seat alerts until choosing one.\n/movies — Reopen selection. ✅ means selected; tap again to remove. Multiple films are allowed. Existing choices are preserved.\nNew-film announcements do not automatically select the film. Selecting one shows cached upcoming showings, then the same settings as /status. Live availability is not guaranteed.") if config.multi_movie_enabled else choose(lang,
+        "2. /start 답장의 버튼에서 영화를 선택합니다. 최초 구독 시 자동 선택되는 영화는 없으며, 선택 전에는 영화별 오픈·좌석 알림을 받지 않습니다.\n/movies — 영화 선택 다시 열기. ✅는 선택됨이며 여러 편을 고를 수 있고, 다시 누르면 해제됩니다. 기존 구독자의 선택은 유지합니다.\n새 영화 발견 안내가 와도 자동 선택되지는 않습니다. 선택하면 최근 조회한 예정 회차 → /status 와 같은 현재 설정 순서로 안내합니다. 신규 구독자의 첫 선택에는 짧은 봇 소개도 한 번 보냅니다. 실시간 좌석을 보장하지 않습니다.",
+        "2. Choose films using the buttons in the /start reply. New subscribers start with no selected movies and receive no film-specific opening/seat alerts until choosing one.\n/movies — Reopen selection. ✅ means selected; tap again to remove. Multiple films are allowed. Existing choices are preserved.\nNew-film announcements do not automatically select the film. Selecting one shows cached upcoming showings, then the same settings as /status. New subscribers also receive a short introduction once. Live availability is not guaranteed.") if config.multi_movie_enabled else choose(lang,
         f"2. 현재 알림 영화: {config.movie_label}", f"2. Current film: {config.movie_label}")
     default_mode_note = choose(lang,
         "신규 구독은 '신규 오픈만'으로 시작합니다.",
