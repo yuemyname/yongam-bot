@@ -112,7 +112,9 @@ class PublicGuideTests(unittest.TestCase):
         for command in ("/desc", "/description", "/desc@YongamBot"):
             with self.subTest(command=command):
                 text = self.command(command)
-                self.assertIn("2. /movies — 봇과의 개인 채팅에서 원하는 영화를", text)
+                self.assertIn("2. /start 답장의 버튼에서 영화를 선택", text)
+                self.assertIn("/movies — 영화 선택 다시 열기", text)
+                self.assertIn("최초 구독 시 자동 선택되는 영화는 없으며", text)
                 self.assertIn("3. /status — 선택 영화와 설정 확인", text)
                 self.assertIn("/language — 한국어·English 선택", text)
                 self.assertIn("/date 20261106 20261108", text)

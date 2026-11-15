@@ -2813,7 +2813,8 @@ class StateStore(MovieStateMixin):
             )
 
     def add_subscriber(
-        self, chat_id: str, *, label: str = "", chat_type: str = ""
+        self, chat_id: str, *, label: str = "", chat_type: str = "",
+        initial_movies: Sequence[str] | None = None,
     ) -> bool:
         with self._lock:
             key = str(chat_id)
@@ -2830,6 +2831,11 @@ class StateStore(MovieStateMixin):
                 "seat_selection": SEAT_SELECTION_SWEET if self.sweet_only else DEFAULT_SEAT_SELECTION,
                 "min_seats": MIN_SEATS_DEFAULT,
             }
+            # Missing movies means the legacy default. Explicitly empty means
+            # the new subscriber has not chosen any films yet. Set it under
+            # the same lock as registration, before the scanner can see them.
+            if initial_movies is not None:
+                self.data["subscribers"][key]["movies"] = list(initial_movies)
             return True
 
     def remove_subscriber(self, chat_id: str) -> bool:
@@ -5193,7 +5199,8 @@ class Watcher(MovieWatcherMixin):
                 reply = signup_notice + "\n신규 구독이 재개된 뒤 /start를 보내주세요."
             elif command in {"/start", "/subscribe"}:
                 added = self.state.add_subscriber(
-                    chat_id, label=label, chat_type=chat_type
+                    chat_id, label=label, chat_type=chat_type,
+                    initial_movies=() if self.config.multi_movie_enabled else None,
                 )
                 state_changed = state_changed or added
                 subscribers_changed = subscribers_changed or added
@@ -5445,7 +5452,12 @@ class Watcher(MovieWatcherMixin):
                     + reply
                 )
 
-            reply = self._public_reply(command, chat_id, reply)
+            reply_markup = None
+            if (command in {"/start", "/subscribe"}
+                    and self.config.multi_movie_enabled and self.state.is_subscribed(chat_id)):
+                reply, reply_markup = self._movie_start_reply(chat_id, chat_type)
+            else:
+                reply = self._public_reply(command, chat_id, reply)
             replies = (
                 self._stats_reply_chunks(reply)
                 if command in {ADMIN_STATS_COMMAND, ADMIN_STATS_SUMMARY_COMMAND}
@@ -5453,7 +5465,7 @@ class Watcher(MovieWatcherMixin):
             )
             for part in replies:
                 try:
-                    self._send_or_queue_reply(part, chat_id=chat_id)
+                    self._send_or_queue_reply(part, chat_id=chat_id, reply_markup=reply_markup)
                 except TelegramError as exc:
                     self.logger.warning("Telegram 구독 명령 답장 실패: %s", exc)
                 else:

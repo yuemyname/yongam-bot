@@ -173,6 +173,36 @@ class MovieWatcherMixin:
         except self._telegram_error as exc:
             self.logger.warning("영화/언어 명령 응답 실패: %s", exc)
 
+    def _movie_start_reply(self, chat_id, chat_type):
+        """Open the cached movie picker without changing existing preferences."""
+        lang = self.state.language(chat_id)
+        if chat_type != "private":
+            return self._public_reply("/status", chat_id, "") + choose(lang,
+                "\n\n영화 선택은 봇과의 개인 채팅에서만 가능합니다. 개인 채팅에서 /start 를 보내주세요. 이 채팅에 영화가 자동 선택되지는 않습니다.",
+                "\n\nMovie selection is available only in a private chat with the bot. Send /start there. No movie is automatically selected for this chat."), None
+        intro = choose(lang,
+            "✅ 용산 IMAX 알림 구독 중\n",
+            "✅ Subscribed to Yongsan IMAX alerts\n")
+        intro += choose(lang,
+            "기존 영화 선택과 알림 설정은 유지했습니다. 아래에서 영화를 추가·해제할 수 있어요.\n\n",
+            "Your movie choices and alert settings are unchanged. Add or remove movies below.\n\n") if self.state.selected_movies(chat_id) else choose(lang,
+            "영화는 자동 선택되지 않습니다. 아래에서 원하는 영화를 하나 이상 선택해주세요.\n선택 전에는 영화별 신규 오픈·잔여좌석 알림을 받지 않습니다.\n\n",
+            "No movie is selected automatically. Choose at least one movie below to receive its opening and seat alerts.\n\n")
+        menu, markup = self._movie_menu(chat_id)
+        footer = choose(lang,
+            "\n\n/movies — 영화 선택 다시 열기\n/status — 현재 설정\n/desc — 자세한 사용법\n/language — 한국어 / English",
+            "\n\n/movies — Reopen movie selection\n/status — Current settings\n/desc — Full guide\n/language — 한국어 / English")
+        if notes := _public_service_notes(lang, self.config):
+            footer += "\n\n" + notes
+        if any((self.cgv_recovery_status_text(), self.seat_api_status_text(), self.telegram_send_status_text())):
+            footer += choose(lang,
+                "\n⚠️ 조회 또는 발송에 대기/중단 상태가 있습니다. 운영자에게 문의해주세요.",
+                "\n⚠️ Lookups or delivery are paused/delayed. Contact the operator.")
+        # Preserve buttons even with a long saved selection or emoji titles.
+        room = 4096 - len((intro + footer).encode("utf-16-le")) // 2
+        menu = menu.encode("utf-16-le")[:room * 2].decode("utf-16-le", errors="ignore")
+        return intro + menu + footer, markup
+
     def _handle_movie_callback(self, query):
         message = query.get("message") or {}
         if not isinstance(message, dict):
@@ -318,7 +348,9 @@ def _public_service_notes(lang, config):
 def public_help(lang, config):
     """A compact command index, not the detailed /desc walkthrough."""
     commands = [
-        ("start", "알림 구독", "Subscribe"), ("stop", "알림 해지", "Unsubscribe"),
+        ("start", "알림 구독·영화 선택" if config.multi_movie_enabled else "알림 구독",
+         "Subscribe / choose movies" if config.multi_movie_enabled else "Subscribe"),
+        ("stop", "알림 해지", "Unsubscribe"),
         ("status", "현재 구독 및 설정", "Current settings"), ("movies", "알림 받을 영화 선택 (복수 선택)", "Choose movies (multiple)"),
         ("language", "한국어 / English 선택", "Choose 한국어 / English"),
         ("mode", "알림 종류 선택", "Choose alert type"), ("mode_all", "신규 오픈 + 잔여좌석", "Openings + seats"),
@@ -375,8 +407,8 @@ def public_guide(lang, config):
         f"🔎 Coverage and timing\n{config.scan_range_label('en')} (Korea time).\n{cadence}\nShowings outside this range may not be detected."))
 
     movies = choose(lang,
-        "2. /movies — 봇과의 개인 채팅에서 원하는 영화를 눌러 선택합니다. ✅ 표시가 선택된 영화이며 여러 편을 고를 수 있습니다. 다시 누르면 해제됩니다.\n새 영화 발견 안내는 구독자에게 한 번 보내지만, 그 영화가 자동 선택되지는 않습니다. 영화 선택 시 최근 조회한 예정 회차를 안내하며 실시간 좌석을 보장하지 않습니다.",
-        "2. In a private chat, use /movies and tap films to select them. ✅ means selected; tap again to remove. Multiple films are allowed.\nNew-film announcements do not automatically select the film. Selecting one shows cached upcoming showings, not guaranteed live availability.") if config.multi_movie_enabled else choose(lang,
+        "2. /start 답장의 버튼에서 영화를 선택합니다. 최초 구독 시 자동 선택되는 영화는 없으며, 선택 전에는 영화별 오픈·좌석 알림을 받지 않습니다.\n/movies — 영화 선택 다시 열기. ✅는 선택됨이며 여러 편을 고를 수 있고, 다시 누르면 해제됩니다. 기존 구독자의 선택은 유지합니다.\n새 영화 발견 안내가 와도 자동 선택되지는 않습니다. 선택 시 최근 조회한 예정 회차를 안내하며 실시간 좌석을 보장하지 않습니다.",
+        "2. Choose films using the buttons in the /start reply. New subscribers start with no selected movies and receive no film-specific opening/seat alerts until choosing one.\n/movies — Reopen selection. ✅ means selected; tap again to remove. Multiple films are allowed. Existing choices are preserved.\nNew-film announcements do not automatically select the film. Selecting one shows cached upcoming showings, not guaranteed live availability.") if config.multi_movie_enabled else choose(lang,
         f"2. 현재 알림 영화: {config.movie_label}", f"2. Current film: {config.movie_label}")
     parts.append(choose(lang,
         "📌 시작하기\n1. /start — 알림 구독\n", "📌 Getting started\n1. /start — Subscribe\n") + movies + choose(lang,
