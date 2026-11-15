@@ -3891,6 +3891,20 @@ class Watcher(MovieWatcherMixin):
             and chat_id in self._operator_recipients()
         )
 
+    @classmethod
+    def _ordered_delivery_candidates(cls, pending):
+        """Only a chat's first movie-summary part is eligible for a send slot."""
+        summary_chats = set()
+        candidates = []
+        for item in sorted(pending, key=cls._delivery_sort_key):
+            record = item[1]
+            if record["category"] == "movie_summary":
+                if record["chat_id"] in summary_chats:
+                    continue
+                summary_chats.add(record["chat_id"])
+            candidates.append(item)
+        return candidates
+
     def _prioritized_delivery_sort_key(
         self, item: tuple[str, Mapping[str, Any]],
     ) -> tuple[int, int, str, int, str]:
@@ -3920,7 +3934,9 @@ class Watcher(MovieWatcherMixin):
                 self.logger.info("Telegram 발송 대기 종료: 신규 오픈 우선으로 재시도합니다.")
                 waiting = False
             now = dt.datetime.now(dt.timezone.utc)
-            pending = self.state.pending_deliveries()
+            # Include a backed-off summary head, not its ready continuation,
+            # so this loop sleeps until retry instead of spinning on the tail.
+            pending = self._ordered_delivery_candidates(self.state.pending_deliveries())
             due = [
                 item
                 for item in pending
@@ -4340,6 +4356,14 @@ class Watcher(MovieWatcherMixin):
         changed = False
         eligible_records: list[tuple[str, Mapping[str, Any]]] = []
         now = dt.datetime.now(dt.timezone.utc)
+        # Movie-selection replies are a sequence: all cached showing chunks,
+        # then /status. Send only the head per chat so parallel workers and a
+        # backed-off earlier chunk cannot let settings overtake the showings.
+        # Other chats and higher-priority opening alerts remain independent.
+        summary_heads: dict[str, str] = {}
+        for summary_key, summary in sorted(self.state.pending_deliveries(), key=self._delivery_sort_key):
+            if summary["category"] == "movie_summary":
+                summary_heads.setdefault(summary["chat_id"], summary_key)
         for key, record in sorted(
             self.state.pending_deliveries() if pending is None else pending,
             key=self._prioritized_delivery_sort_key,
@@ -4373,6 +4397,8 @@ class Watcher(MovieWatcherMixin):
                 eligible = {chat_id} if self.state.is_subscribed(chat_id) and self.state.wants_movie(chat_id, record.get("movie_no")) else set()
             if chat_id not in eligible:
                 changed = self.state.remove_pending_delivery(key) or changed
+                continue
+            if category == "movie_summary" and summary_heads.get(chat_id) != key:
                 continue
             eligible_records.append((key, record))
 
@@ -4579,7 +4605,7 @@ class Watcher(MovieWatcherMixin):
         return "\n".join(lines)
 
     @staticmethod
-    def _stats_reply_chunks(text: str) -> list[str]:
+    def _stats_reply_chunks(text: str, *, heading: str = "📊 통계") -> list[str]:
         """Keep every movie count, splitting long replies at line boundaries.
 
         Use UTF-16 units conservatively so emoji-rich titles also fit within
@@ -4606,7 +4632,7 @@ class Watcher(MovieWatcherMixin):
         if len(chunks) > 1:
             # Unique part numbers also prevent outbox deduplication from
             # collapsing two identical pieces of an unusually long title.
-            return [f"📊 통계 {index}/{len(chunks)}\n{part}" for index, part in enumerate(chunks, 1)]
+            return [f"{heading} {index}/{len(chunks)}\n{part}" for index, part in enumerate(chunks, 1)]
         return chunks
 
     def _status_reply(self, chat_id: str) -> str:

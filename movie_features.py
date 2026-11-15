@@ -271,14 +271,29 @@ class MovieWatcherMixin:
         if not match and not page_match:
             return
         with self.state._lock:
+            selected = False
             if match and (match[3] is None or int(match[3]) == self.state.movie_revision(chat_id)):
                 changed = self.state.select_movie(chat_id, match[1], match[2] == "1")
                 if changed and match[2] == "1":
-                    self._queue_movie_summary(chat_id, match[1])
-            text, markup = self._movie_menu(chat_id, int(page_match[1]) if page_match else 0)
-            self.state.queue_pending_delivery(chat_id, text, "reply", reply_markup=markup)
+                    self._queue_movie_selection_result(chat_id, match[1])
+                    selected = True
+            if not selected:
+                text, markup = self._movie_menu(chat_id, int(page_match[1]) if page_match else 0)
+                self.state.queue_pending_delivery(chat_id, text, "reply", reply_markup=markup)
             self.state.save()
         self._delivery_wake_event.set()
+
+    def _queue_movie_selection_result(self, chat_id, movie_no):
+        """Follow cached showings with the actual /status reply, not a guide."""
+        self._queue_movie_summary(chat_id, movie_no)
+        _, markup = self._movie_menu(chat_id)
+        chunks = self._stats_reply_chunks(self._status_reply(chat_id), heading=choose(
+            self.state.language(chat_id), "⚙️ 현재 설정", "⚙️ Current settings"))
+        for index, chunk in enumerate(chunks):
+            # Share the summary queue's ordering and deselection cancellation.
+            # Keep the picker usable without sending a third menu message.
+            self.state.queue_pending_delivery(chat_id, chunk, "movie_summary", movie_no=movie_no,
+                reply_markup=markup if index == len(chunks) - 1 else None)
 
     def _queue_movie_summary(self, chat_id, movie_no):
         lang = self.state.language(chat_id)
@@ -453,8 +468,8 @@ def public_guide(lang, config):
         f"🔎 Coverage and timing\n{config.scan_range_label('en')} (Korea time).\n{cadence}\nShowings outside this range may not be detected."))
 
     movies = choose(lang,
-        "2. /start 답장의 버튼에서 영화를 선택합니다. 최초 구독 시 자동 선택되는 영화는 없으며, 선택 전에는 영화별 오픈·좌석 알림을 받지 않습니다.\n/movies — 영화 선택 다시 열기. ✅는 선택됨이며 여러 편을 고를 수 있고, 다시 누르면 해제됩니다. 기존 구독자의 선택은 유지합니다.\n새 영화 발견 안내가 와도 자동 선택되지는 않습니다. 선택 시 최근 조회한 예정 회차를 안내하며 실시간 좌석을 보장하지 않습니다.",
-        "2. Choose films using the buttons in the /start reply. New subscribers start with no selected movies and receive no film-specific opening/seat alerts until choosing one.\n/movies — Reopen selection. ✅ means selected; tap again to remove. Multiple films are allowed. Existing choices are preserved.\nNew-film announcements do not automatically select the film. Selecting one shows cached upcoming showings, not guaranteed live availability.") if config.multi_movie_enabled else choose(lang,
+        "2. /start 답장의 버튼에서 영화를 선택합니다. 최초 구독 시 자동 선택되는 영화는 없으며, 선택 전에는 영화별 오픈·좌석 알림을 받지 않습니다.\n/movies — 영화 선택 다시 열기. ✅는 선택됨이며 여러 편을 고를 수 있고, 다시 누르면 해제됩니다. 기존 구독자의 선택은 유지합니다.\n새 영화 발견 안내가 와도 자동 선택되지는 않습니다. 선택하면 최근 조회한 예정 회차 → /status 와 같은 현재 설정 순서로 안내합니다. 실시간 좌석을 보장하지 않습니다.",
+        "2. Choose films using the buttons in the /start reply. New subscribers start with no selected movies and receive no film-specific opening/seat alerts until choosing one.\n/movies — Reopen selection. ✅ means selected; tap again to remove. Multiple films are allowed. Existing choices are preserved.\nNew-film announcements do not automatically select the film. Selecting one shows cached upcoming showings, then the same settings as /status. Live availability is not guaranteed.") if config.multi_movie_enabled else choose(lang,
         f"2. 현재 알림 영화: {config.movie_label}", f"2. Current film: {config.movie_label}")
     default_mode_note = choose(lang,
         "신규 구독은 '신규 오픈만'으로 시작합니다.",
