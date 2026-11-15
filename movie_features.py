@@ -15,6 +15,39 @@ def choose(lang, ko, en):
     return en if lang == "en" else ko
 
 
+def _movie_summary_chunks(header, blocks, limit=4000):
+    """Keep dates together, except for a date exceeding Telegram's limit.
+
+    An oversized date is split at line boundaries without losing any time
+    rows or repeating its booking link. Count UTF-16 units for emoji titles.
+    """
+    def fits(text):
+        return len(text.encode("utf-16-le")) // 2 <= limit
+
+    chunk = header
+    for block in blocks:
+        if fits(chunk + "\n\n" + block):
+            chunk += "\n\n" + block
+            continue
+        if chunk != header:
+            yield chunk
+            chunk = header
+        if fits(header + "\n\n" + block):
+            chunk += "\n\n" + block
+            continue
+        for line in block.splitlines():
+            if not fits(header + "\n\n" + line):
+                raise ValueError("Movie summary line exceeds Telegram message limit")
+            separator = "\n\n" if chunk == header else "\n"
+            if not fits(chunk + separator + line):
+                yield chunk
+                chunk = header
+                separator = "\n\n"
+            chunk += separator + line
+    if chunk != header:
+        yield chunk
+
+
 class MovieStateMixin:
     def configure_movies(self, movie_no, movie_label):
         with self._lock:
@@ -188,10 +221,16 @@ class MovieWatcherMixin:
             "Your movie choices and alert settings are unchanged. Add or remove movies below.\n\n") if self.state.selected_movies(chat_id) else choose(lang,
             "영화는 자동 선택되지 않습니다. 아래에서 원하는 영화를 하나 이상 선택해주세요.\n선택 전에는 영화별 신규 오픈·잔여좌석 알림을 받지 않습니다.\n\n",
             "No movie is selected automatically. Choose at least one movie below to receive its opening and seat alerts.\n\n")
+        mode = self.state.alert_mode(chat_id)
+        mode_labels = {"open": ("신규 오픈만", "Openings only"),
+                       "all": ("신규 오픈 + 잔여좌석", "Openings + seats"),
+                       "seats": ("잔여좌석만", "Seats only")}
+        intro += choose(lang, f"🔔 알림 종류: {mode_labels[mode][0]}\n\n",
+                        f"🔔 Alerts: {mode_labels[mode][1]}\n\n")
         menu, markup = self._movie_menu(chat_id)
         footer = choose(lang,
-            "\n\n/movies — 영화 선택 다시 열기\n/status — 현재 설정\n/desc — 자세한 사용법\n/language — 한국어 / English",
-            "\n\n/movies — Reopen movie selection\n/status — Current settings\n/desc — Full guide\n/language — 한국어 / English")
+            "\n\n/movies — 영화 선택 다시 열기\n/status — 현재 설정\n/mode — 알림 종류 선택\n/desc — 자세한 사용법\n/language — 한국어 / English",
+            "\n\n/movies — Reopen movie selection\n/status — Current settings\n/mode — Choose alert types\n/desc — Full guide\n/language — 한국어 / English")
         if notes := _public_service_notes(lang, self.config):
             footer += "\n\n" + notes
         if any((self.cgv_recovery_status_text(), self.seat_api_status_text(), self.telegram_send_status_text())):
@@ -243,8 +282,8 @@ class MovieWatcherMixin:
 
     def _queue_movie_summary(self, chat_id, movie_no):
         lang = self.state.language(chat_id)
-        title = self.state.movie_catalog()[movie_no]["title"]
-        rows = []
+        title = " ".join(self.state.movie_catalog()[movie_no]["title"].split())[:200]
+        days = {}
         now = self.config.local_now()
         for record in self.state.data["movie_sessions"].values():
             for raw in record.get("sessions", []):
@@ -253,20 +292,23 @@ class MovieWatcherMixin:
                 session = self._session_class(**raw)
                 start = session.start_datetime(self.config.timezone_name)
                 if start is not None and start > now + dt.timedelta(minutes=self.config.booking_close_margin_minutes):
-                    rows.append((session, record["checked_at"]))
-        header = choose(lang, f"✅ 영화 알림 선택: {title}\n\n최근 조회한 열린 회차 (실시간 예매 가능 보장 아님)\n", f"✅ Following: {title}\n\nLast observed upcoming showings (availability may change)\n")
-        lines = []
-        for session, checked in sorted(rows, key=lambda row: (row[0].date, row[0].start_time)):
-            lines.append(f"{session.date} {session.start_time} — {session.remaining_seats if session.remaining_seats is not None else '?'}/{session.total_seats if session.total_seats is not None else '?'}\n{self._booking_url(session, self.config)}\n" + choose(lang, "조회: ", "Checked: ") + checked[:19])
-        if not lines:
-            lines = [choose(lang, "아직 조회된 예정 회차가 없습니다. 이후 새 회차를 발견하면 설정에 맞춰 알려드립니다.", "No upcoming showings are cached yet. Future openings will follow your alert settings.")]
-        chunk = header
-        for line in lines:
-            if len(chunk) + len(line) > 3500:
-                self.state.queue_pending_delivery(chat_id, chunk, "movie_summary", movie_no=movie_no)
-                chunk = header
-            chunk += "\n" + line + "\n"
-        self.state.queue_pending_delivery(chat_id, chunk, "movie_summary", movie_no=movie_no)
+                    days.setdefault(session.date, []).append(session)
+        header = choose(lang, f"✅ 영화 알림 선택: {title}\n\n최근 조회한 열린 회차 (실시간 예매 가능 보장 아님)", f"✅ Following: {title}\n\nLast observed upcoming showings (availability may change)")
+        blocks = []
+        for day, sessions in sorted(days.items()):
+            sessions.sort(key=lambda session: tuple(int(p) for p in session.start_time.split(":")))
+            lines = [day]
+            for session in sessions:
+                remaining = (choose(lang, f"{session.remaining_seats}석", f"{session.remaining_seats} seats")
+                             if session.remaining_seats is not None else choose(lang, "미확인", "Unknown"))
+                lines.append(f"{session.start_time} - {remaining}")
+            # All showings of this movie/date share the same booking URL.
+            lines.append(self._booking_url(sessions[0], self.config))
+            blocks.append("\n".join(lines))
+        if not blocks:
+            blocks = [choose(lang, "아직 조회된 예정 회차가 없습니다. 이후 새 회차를 발견하면 설정에 맞춰 알려드립니다.", "No upcoming showings are cached yet. Future openings will follow your alert settings.")]
+        for chunk in _movie_summary_chunks(header, blocks):
+            self.state.queue_pending_delivery(chat_id, chunk, "movie_summary", movie_no=movie_no)
 
     def _public_reply(self, command, chat_id, original):
         """Render built-in UI only. Operator-authored announcements are untouched."""
@@ -288,6 +330,10 @@ class MovieWatcherMixin:
                 f"✅ Subscribed to Yongsan IMAX alerts\n\n🎬 Movies: {titles}\nAlerts: {mode_label[1]}\nShow days: {'Sat/Sun' if days == 'weekend' else 'Every day'}\nSeat-alert dates: {date_label}\nSeat-alert times: {time_label} (Korea time)\nSeats: {'Sweet spots' if self.state.seat_selection(chat_id) == 'sweet' else 'All except row A'}\nMinimum seats: {self.state.min_seats(chat_id)}\n\n/movies — Choose movies\n/mode · /day · /date · /time · /seat · /count — Settings\n/language — 한국어 / English\n/desc — Guide · /stop — Unsubscribe\n\nNew movies are announced, not automatically selected. Opening alerts use movie, mode and weekday settings only; seat/date/time restrictions do not apply.")
             if self.config.open_only_mode:
                 text += choose(lang, "\n⚠️ 현재 신규 오픈 전용 운영 중입니다. 좌석 조회는 중단되어 있습니다.", "\n⚠️ Openings-only operation: seat lookups are disabled.")
+            elif mode == "open":
+                text += choose(lang,
+                    "\n\n💺 취소표 알림도 받고 싶다면 /mode 에서 알림 종류를 변경해주세요.",
+                    "\n\n💺 Want cancellation-seat alerts too? Use /mode to change your alert types.")
             paused = any((self.cgv_recovery_status_text(), self.seat_api_status_text(), self.telegram_send_status_text()))
             if paused:
                 text += choose(lang, "\n⚠️ 조회 또는 발송에 대기/중단 상태가 있습니다. 운영자에게 문의해주세요.", "\n⚠️ Lookups or delivery are paused/delayed. Contact the operator.")
@@ -354,7 +400,7 @@ def public_help(lang, config):
         ("status", "현재 구독 및 설정", "Current settings"), ("movies", "알림 받을 영화 선택 (복수 선택)", "Choose movies (multiple)"),
         ("language", "한국어 / English 선택", "Choose 한국어 / English"),
         ("mode", "알림 종류 선택", "Choose alert type"), ("mode_all", "신규 오픈 + 잔여좌석", "Openings + seats"),
-        ("mode_open", "신규 오픈만", "Openings only"), ("mode_seats", "잔여좌석만", "Seats only"),
+        ("mode_open", "신규 오픈만 (신규 구독 기본)", "Openings only (new subscriber default)"), ("mode_seats", "잔여좌석만", "Seats only"),
         ("day", "상영 요일 선택", "Show weekdays"), ("day_all", "모든 요일", "Every day"), ("day_weekend", "토·일 상영분", "Sat/Sun showings"),
         ("date", "잔여좌석 날짜 설정", "Seat-alert date range"), ("date_all", "날짜 제한 해제", "Clear date filter"),
         ("time", "잔여좌석 시간 설정", "Seat-alert time range"), ("time_all", "시간 제한 해제", "Clear time filter"),
@@ -410,10 +456,17 @@ def public_guide(lang, config):
         "2. /start 답장의 버튼에서 영화를 선택합니다. 최초 구독 시 자동 선택되는 영화는 없으며, 선택 전에는 영화별 오픈·좌석 알림을 받지 않습니다.\n/movies — 영화 선택 다시 열기. ✅는 선택됨이며 여러 편을 고를 수 있고, 다시 누르면 해제됩니다. 기존 구독자의 선택은 유지합니다.\n새 영화 발견 안내가 와도 자동 선택되지는 않습니다. 선택 시 최근 조회한 예정 회차를 안내하며 실시간 좌석을 보장하지 않습니다.",
         "2. Choose films using the buttons in the /start reply. New subscribers start with no selected movies and receive no film-specific opening/seat alerts until choosing one.\n/movies — Reopen selection. ✅ means selected; tap again to remove. Multiple films are allowed. Existing choices are preserved.\nNew-film announcements do not automatically select the film. Selecting one shows cached upcoming showings, not guaranteed live availability.") if config.multi_movie_enabled else choose(lang,
         f"2. 현재 알림 영화: {config.movie_label}", f"2. Current film: {config.movie_label}")
+    default_mode_note = choose(lang,
+        "신규 구독은 '신규 오픈만'으로 시작합니다.",
+        "New subscriptions default to openings only.")
+    if not config.open_only_mode:
+        default_mode_note += choose(lang,
+            " /mode — 취소표 알림도 원할 때 변경",
+            " Use /mode to add cancellation-seat alerts.")
     parts.append(choose(lang,
         "📌 시작하기\n1. /start — 알림 구독\n", "📌 Getting started\n1. /start — Subscribe\n") + movies + choose(lang,
-        "\n3. /status — 선택 영화와 설정 확인\n/language — 한국어·English 선택",
-        "\n3. Check /status for your settings. Use /language to choose Korean or English."))
+        f"\n3. /status — 선택 영화와 설정 확인\n{default_mode_note}\n/language — 한국어·English 선택",
+        f"\n3. Check /status for your settings. {default_mode_note} Use /language to choose Korean or English."))
 
     parts.append(choose(lang,
         "🔔 신규 오픈 알림\n처음 발견한 상영 회차를 한 번 알립니다. 매진·좌석 수 미확인 회차도 안내하며, 선택 영화·알림 종류·상영 요일만 적용합니다. 좌석 번호는 조회하지 않습니다.\n/mode — 알림 종류 확인\n/mode_open — 신규 오픈 받기",

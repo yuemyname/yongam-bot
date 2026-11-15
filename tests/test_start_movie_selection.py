@@ -8,7 +8,8 @@ import unittest
 from unittest.mock import Mock
 
 from test_watcher import make_config
-from watcher import ALERT_OPEN, ALERT_SEATS_SWEET, TelegramDeferred, Watcher
+from watcher import (ALERT_MODE_ALL, ALERT_MODE_OPEN_ONLY, ALERT_MODE_SEATS_ONLY,
+                     ALERT_OPEN, ALERT_SEATS_SWEET, TelegramDeferred, Watcher)
 
 
 class StartMovieSelectionTests(unittest.TestCase):
@@ -50,6 +51,8 @@ class StartMovieSelectionTests(unittest.TestCase):
         call = self.command()
         self.assertEqual(self.watcher.state.selected_movies(self.NEW_CHAT), ())
         self.assertEqual(self.watcher.state.data['subscribers'][self.NEW_CHAT]['movies'], [])
+        self.assertEqual(self.watcher.state.alert_mode(self.NEW_CHAT), ALERT_MODE_OPEN_ONLY)
+        self.assertIn('알림 종류: 신규 오픈만', call.args[0])
         self.assertIn('영화는 자동 선택되지 않습니다', call.args[0])
         self.assertIn('현재: 없음', call.args[0])
         buttons = [b for row in call.kwargs['reply_markup']['inline_keyboard'] for b in row]
@@ -69,6 +72,8 @@ class StartMovieSelectionTests(unittest.TestCase):
             ALERT_OPEN, movie_no=self.FILM))
         self.assertNotIn(self.NEW_CHAT, self.watcher.state.subscriber_ids_for(
             ALERT_OPEN, movie_no=self.config.movie_no))
+        self.assertNotIn(self.NEW_CHAT, self.watcher.state.subscriber_ids_for(
+            ALERT_SEATS_SWEET, movie_no=self.FILM, seats_available=2))
         self.assertEqual(self.watcher.cgv.mock_calls, [])
 
     def test_legacy_selection_and_filters_survive_repeated_start(self):
@@ -88,6 +93,7 @@ class StartMovieSelectionTests(unittest.TestCase):
         self.command()
         self.watcher = self.make_watcher()
         self.assertEqual(self.watcher.state.selected_movies(self.NEW_CHAT), ())
+        self.assertEqual(self.watcher.state.alert_mode(self.NEW_CHAT), ALERT_MODE_OPEN_ONLY)
         self.callback(f'mv:{self.FILM}:1:0')
         before = copy.deepcopy(self.watcher.state.data['subscribers'][self.NEW_CHAT])
         self.watcher = self.make_watcher()
@@ -102,7 +108,37 @@ class StartMovieSelectionTests(unittest.TestCase):
         call = self.command()
         self.assertEqual(self.watcher.state.selected_movies(self.NEW_CHAT), ())
         self.assertEqual(self.watcher.state.language(self.NEW_CHAT), 'en')
+        self.assertEqual(self.watcher.state.alert_mode(self.NEW_CHAT), ALERT_MODE_OPEN_ONLY)
         self.assertIn('No movie is selected automatically', call.args[0])
+
+    def test_mode_opt_in_and_repeated_start_preserve_existing_preferences(self):
+        self.command()
+        self.callback(f'mv:{self.FILM}:1:0')
+        self.command('/mode_all')
+        self.assertIn(self.NEW_CHAT, self.watcher.state.subscriber_ids_for(
+            ALERT_SEATS_SWEET, movie_no=self.FILM, seats_available=2))
+        for mode in (ALERT_MODE_ALL, ALERT_MODE_SEATS_ONLY):
+            self.watcher.state.set_alert_mode(self.NEW_CHAT, mode)
+            before = copy.deepcopy(self.watcher.state.data['subscribers'][self.NEW_CHAT])
+            self.command()
+            self.assertEqual(self.watcher.state.data['subscribers'][self.NEW_CHAT], before)
+
+    def test_status_explains_cancellation_opt_in_in_both_languages(self):
+        self.command()
+        for language in ('ko', 'en'):
+            self.watcher.state.set_language(self.NEW_CHAT, language)
+            text = self.command('/status').args[0]
+            self.assertIn('알림 종류: 신규 오픈만' if language == 'ko' else 'Alerts: Openings only', text)
+            self.assertIn('취소표 알림도 받고 싶다면 /mode ' if language == 'ko'
+                          else 'Want cancellation-seat alerts too? Use /mode ', text)
+            self.assertNotRegex(text, r'/[A-Za-z0-9_]+[가-힣ㄱ-ㅎㅏ-ㅣ]')
+
+    def test_single_movie_new_subscriber_defaults_to_openings_and_status_guides_mode(self):
+        self.config = dataclasses.replace(self.config, multi_movie_enabled=False)
+        self.watcher = self.make_watcher()
+        self.command()
+        self.assertEqual(self.watcher.state.alert_mode(self.NEW_CHAT), ALERT_MODE_OPEN_ONLY)
+        self.assertIn('취소표 알림도 받고 싶다면 /mode ', self.command('/status').args[0])
 
     def test_aliases_and_bot_mentions_show_the_picker(self):
         for command in ('/subscribe', '/start@YongamBot', '/start referral'):

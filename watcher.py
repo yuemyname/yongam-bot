@@ -162,8 +162,8 @@ ALERT_MODE_ALIASES = {
 }
 MODE_GUIDE = (
     "알림 종류를 고를 수 있습니다.\n"
-    "/mode_all - 신규 오픈 + 잔여 좌석 (기본)\n"
-    "/mode_open - 신규 오픈만\n"
+    "/mode_all - 신규 오픈 + 잔여 좌석\n"
+    "/mode_open - 신규 오픈만 (신규 구독 기본)\n"
     "/mode_seats - 잔여 좌석만"
 )
 
@@ -2815,16 +2815,19 @@ class StateStore(MovieStateMixin):
     def add_subscriber(
         self, chat_id: str, *, label: str = "", chat_type: str = "",
         initial_movies: Sequence[str] | None = None,
+        initial_alert_mode: str = DEFAULT_ALERT_MODE,
     ) -> bool:
         with self._lock:
             key = str(chat_id)
             if key in self.data["subscribers"]:
                 return False
+            if initial_alert_mode not in ALERT_MODES:
+                raise ValueError("Invalid initial alert mode")
             self.data["subscribers"][key] = {
                 "subscribed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                 "label": label[:100],
                 "chat_type": chat_type[:30],
-                "alert_mode": DEFAULT_ALERT_MODE,
+                "alert_mode": initial_alert_mode,
                 "show_day": DEFAULT_SHOW_DAY,
                 "seat_time_range": None,
                 "seat_date_range": None,
@@ -4638,6 +4641,8 @@ class Watcher(MovieWatcherMixin):
                 "\n잔여 좌석 대상 변경: /seat"
                 "\n예매 가능 최소 좌석 변경: /count"
             )
+            if mode == ALERT_MODE_OPEN_ONLY and not self.config.open_only_mode:
+                reply += "\n\n💺 취소표 알림도 받고 싶다면 /mode 에서 알림 종류를 변경해주세요."
         else:
             prompt = (
                 "알림을 받으려면 /start를 보내주세요."
@@ -5201,6 +5206,7 @@ class Watcher(MovieWatcherMixin):
                 added = self.state.add_subscriber(
                     chat_id, label=label, chat_type=chat_type,
                     initial_movies=() if self.config.multi_movie_enabled else None,
+                    initial_alert_mode=ALERT_MODE_OPEN_ONLY,
                 )
                 state_changed = state_changed or added
                 subscribers_changed = subscribers_changed or added
@@ -5213,7 +5219,7 @@ class Watcher(MovieWatcherMixin):
                 # can see in the BotFather menu.
                 reply += (
                     "\n\n🔔 기본 설정"
-                    "\n• 신규 예매 오픈 + 예매 가능 좌석 알림"
+                    f"\n• {ALERT_MODE_LABELS[self.state.alert_mode(chat_id)]}"
                     "\n• 모든 요일 상영분 · 잔여좌석 날짜·시간 제한 없음"
                     f"\n• 잔여 좌석은 {'명당 좌석만 (운영 정책)' if self.config.seat_alert_sweet_only else '모든 A열 제외 좌석'}"
                     "\n• 1석부터 모두 알림"
@@ -5362,14 +5368,14 @@ class Watcher(MovieWatcherMixin):
                     "• 상영이 이미 시작된 경우\n"
                     "※ 신규 회차 오픈 알림은 매진이어도 전송\n\n"
                     "⚙️ 기본 설정\n"
-                    "• 신규 예매 오픈 + 예매 가능 좌석 알림\n"
+                    "• 신규 예매 오픈만 (신규 구독 기본)\n"
                     f"• {'명당 좌석만 알림 (운영 정책)' if self.config.seat_alert_sweet_only else '모든 A열 제외 좌석 알림'}\n"
                     "• 모든 요일·전체 날짜·전체 상영 시간\n"
                     "• 별도 설정 없이 바로 사용 가능\n\n"
                     "🔧 알림 종류 선택\n"
                     "• /mode — 현재 설정과 선택 방법 확인\n"
-                    "• /mode_all — 신규 오픈과 예매 가능 좌석 모두 받기 (기본)\n"
-                    "• /mode_open — 신규 예매 오픈만\n"
+                    "• /mode_all — 신규 오픈과 예매 가능 좌석 모두 받기\n"
+                    "• /mode_open — 신규 예매 오픈만 (신규 구독 기본)\n"
                     "• /mode_seats — 예매 가능 좌석만\n\n"
                     "📅 알림 상영일 선택 (선택 사항)\n"
                     "기본값은 모든 요일 상영분 받기입니다.\n"

@@ -1140,6 +1140,8 @@ class MinimumSeatsTests(unittest.TestCase):
 
             watcher.sync_subscribers()
             self.assertEqual(watcher.state.min_seats("111222"), MIN_SEATS_DEFAULT)
+            # Seat-filter tests opt in; new public subscriptions are open-only.
+            watcher.state.set_alert_mode("111222", ALERT_MODE_ALL)
 
             watcher.sync_subscribers()
             self.assertEqual(watcher.state.min_seats("111222"), 2)
@@ -2593,6 +2595,8 @@ class WatcherIntegrationTests(unittest.TestCase):
                 watcher.state.seat_selection("111222"), SEAT_SELECTION_ALL
             )
 
+            watcher.state.set_alert_mode("111222", ALERT_MODE_ALL)
+
             watcher.sync_subscribers()
             self.assertEqual(
                 watcher.state.seat_selection("111222"), SEAT_SELECTION_SWEET
@@ -3735,7 +3739,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             self.assertEqual(watcher.state.alert_mode("555"), ALERT_MODE_ALL)
 
             watcher.sync_subscribers()
-            self.assertEqual(watcher.state.alert_mode("111222"), ALERT_MODE_ALL)
+            self.assertEqual(watcher.state.alert_mode("111222"), ALERT_MODE_OPEN_ONLY)
 
             watcher.sync_subscribers()
             self.assertEqual(
@@ -4378,7 +4382,7 @@ class WatcherIntegrationTests(unittest.TestCase):
             welcome = replies[-1]
 
             self.assertIn("🔔 기본 설정", welcome)
-            self.assertIn("신규 예매 오픈 + 예매 가능 좌석 알림", welcome)
+            self.assertIn("신규 오픈만", welcome)
             self.assertIn("모든 요일 상영분", welcome)
             self.assertIn("잔여 좌석은 모든 A열 제외 좌석", welcome)
             self.assertIn("알림 종류 선택: /mode", welcome)
