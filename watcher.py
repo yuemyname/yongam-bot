@@ -2799,10 +2799,7 @@ class StateStore(MovieStateMixin):
                 return tuple(
                     str(chat_id)
                     for chat_id in self.data["subscribers"]
-                    if ALERT_SEATS in ALERT_MODES[self.alert_mode(chat_id)]
-                    and wants_this_date(chat_id)
-                    and self.wants_seat_date(chat_id, show_date)
-                    and self.wants_seat_time(chat_id, show_time)
+                    if self._wants_seat_show(chat_id, movie_no, show_date, show_time)
                     and self.seat_selection(chat_id) == selection
                     and wants_this_many(chat_id)
                 )
@@ -2813,6 +2810,33 @@ class StateStore(MovieStateMixin):
                 if category in ALERT_MODES[self.alert_mode(chat_id)]
                 and wants_this_date(chat_id)
             )
+
+    def _wants_seat_show(self, chat_id, movie_no, show_date, show_time) -> bool:
+        return (ALERT_SEATS in ALERT_MODES[self.alert_mode(chat_id)]
+                and self.wants_movie(chat_id, movie_no)
+                and self.wants_show_date(chat_id, show_date)
+                and self.wants_seat_date(chat_id, show_date)
+                and self.wants_seat_time(chat_id, show_time))
+
+    def has_seat_audience(self, movie_no: str, show_date: str, show_time: str) -> bool:
+        # Seat identities and eligible-seat count are only known AFTER the
+        # detail request. Ignore those filters here, but never at delivery.
+        with self._lock:
+            return any(self._wants_seat_show(chat_id, movie_no, show_date, show_time)
+                       for chat_id in self.data["subscribers"])
+
+    def mark_seat_map_stale(self, key: str) -> bool:
+        with self._lock:
+            record = self.data["seat_counts"].get(key)
+            if not isinstance(record, dict) or record.get("refresh_on_interest"):
+                return False
+            record["refresh_on_interest"] = True
+            return True
+
+    def seat_map_is_stale(self, key: str) -> bool:
+        with self._lock:
+            record = self.data["seat_counts"].get(key)
+            return isinstance(record, dict) and record.get("refresh_on_interest") is True
 
     def add_subscriber(
         self, chat_id: str, *, label: str = "", chat_type: str = "",
@@ -3376,6 +3400,9 @@ class _CycleTally:
 
     successful_dates: int = 0
     matching_sessions: int = 0
+    bookable_movies: dict[str, int] = dataclasses.field(default_factory=dict)
+    no_seat_audience: set[str] = dataclasses.field(default_factory=set)
+    seat_map_attempts: int = 0
     new_sessions: int = 0
     seat_changes: int = 0
     suppressed_row_a_only: int = 0
@@ -5713,6 +5740,9 @@ class Watcher(MovieWatcherMixin):
                     len(closed_sessions),
                 )
             tally.matching_sessions += len(sessions)
+            for session in sessions:
+                label = _session_movie_log_label(session, self.config)
+                tally.bookable_movies[label] = tally.bookable_movies.get(label, 0) + 1
             if self.config.multi_movie_enabled and not self.dry_run:
                 self._observe_movies(show_date, sessions)
                 watched = []
@@ -5720,8 +5750,12 @@ class Watcher(MovieWatcherMixin):
                     if self.state.anyone_wants_movie(session.movie_no):
                         watched.append(session)
                     else:
-                        self.state.mark_notified(session.notification_key(site_no=self.config.site_no, movie_no=self.config.movie_no), session)
-                        tally.dirty = True
+                        key = session.notification_key(site_no=self.config.site_no, movie_no=self.config.movie_no)
+                        if not self.config.open_only_mode:
+                            self._skip_seat_audience(key, tally)
+                        if not self.state.was_notified(key):
+                            self.state.mark_notified(key, session)
+                            tally.dirty = True
                 sessions = watched
             if sessions:
                 new_sessions = [
@@ -5746,12 +5780,27 @@ class Watcher(MovieWatcherMixin):
                     # tickets, both for priority and crash-safe de-duplication.
                     self._flush_state(tally)
                 if existing_sessions:
+                    if not self.config.open_only_mode:
+                        existing_sessions = [s for s in existing_sessions if self._seat_audience(s, tally)]
                     if self.config.seat_poll_interval_seconds:
                         if not self.config.open_only_mode:
                             self._queue_seat_checks(existing_sessions)
                     else:
                         self._alert_for_sessions(existing_sessions, tally)
             self._flush_state(tally)
+
+    def _skip_seat_audience(self, key: str, tally: "_CycleTally") -> None:
+        tally.no_seat_audience.add(key)
+        if not self.dry_run and self.state.mark_seat_map_stale(key):
+            tally.dirty = True
+
+    def _seat_audience(self, session: BookingSession, tally: "_CycleTally") -> bool:
+        if self.state.has_seat_audience(session.movie_no or self.config.movie_no,
+                                        session.date, session.start_time):
+            return True
+        self._skip_seat_audience(session.notification_key(site_no=self.config.site_no,
+                                                         movie_no=self.config.movie_no), tally)
+        return False
 
     def _queue_seat_checks(self, sessions: Sequence[BookingSession]) -> None:
         for session in sessions:
@@ -5775,6 +5824,8 @@ class Watcher(MovieWatcherMixin):
         failed = {day.isoformat() for day in errors}
         for key in list(self._seat_next_due):
             day = key.split(":")[2]
+            if key in tally.no_seat_audience and self._seat_next_due[key] > time.monotonic():
+                continue  # A quick opt-out/opt-in must not reset the minimum request interval.
             if day not in requested or (day not in failed and key not in self._seat_fresh):
                 self._seat_next_due.pop(key, None)
         for key, session in list(self._seat_pending.items()):
@@ -5804,7 +5855,7 @@ class Watcher(MovieWatcherMixin):
                 break
             if due > time.monotonic():
                 time.sleep(max(0.0, due - time.monotonic()))
-            if (self.config.multi_movie_enabled and not self.state.anyone_wants_movie(session.movie_no)):
+            if not self._seat_audience(session, tally):
                 self._seat_pending.pop(key, None)
                 continue
             current, _closed = self._split_closed_sessions([session])
@@ -5819,6 +5870,8 @@ class Watcher(MovieWatcherMixin):
             self._alert_for_sessions([session], tally)
             self._flush_state(tally)
             self._seat_pending.pop(key, None)
+            if key in tally.no_seat_audience:
+                continue
             # Count from the actual HTTP attempt, after the shared pacing wait.
             # Using the job's earlier start could make the next request too soon
             # when that next schedule scan happens to finish faster.
@@ -5929,6 +5982,7 @@ class Watcher(MovieWatcherMixin):
             previous = previous_snapshots.get(key)
             needs_detail = (
                 forced_recheck
+                or self.state.seat_map_is_stale(key)
                 or previous is None
                 or previous.total != remaining
                 # The booking-open alert went out without reading the map, so
@@ -5970,8 +6024,12 @@ class Watcher(MovieWatcherMixin):
             for index, session in enumerate(seat_candidates):
                 key = session_keys[session]
                 self._wait_for_cgv_request_slot()
+                if not self._seat_audience(session, tally):
+                    continue  # Settings can change during pacing; no request or snapshot update.
                 self._last_seat_request_started_at = time.monotonic()
                 try:
+                    if session.screen_no and session.screen_sequence:
+                        tally.seat_map_attempts += 1
                     snapshots[key] = self.cgv.fetch_seat_snapshot(session)
                     if session.screen_no and session.screen_sequence:
                         freshly_fetched.add(key)
@@ -6220,6 +6278,7 @@ class Watcher(MovieWatcherMixin):
             open_all = _available_seat_count(current)
             if self.state.subscriber_ids_for(
                 all_category,
+                movie_no=session.movie_no or self.config.movie_no,
                 seats_available=open_all,
                 show_date=session.date,
                 show_time=session.start_time,
@@ -6242,6 +6301,7 @@ class Watcher(MovieWatcherMixin):
                 and sweet_delivery is not None
                 and self.state.subscriber_ids_for(
                     ALERT_SEATS_SWEET,
+                    movie_no=session.movie_no or self.config.movie_no,
                     seats_available=open_sweet,
                     show_date=session.date,
                     show_time=session.start_time,
@@ -6417,6 +6477,12 @@ class Watcher(MovieWatcherMixin):
                 processed, len(self._seat_pending), self.config.seat_poll_interval_seconds,
             )
 
+        self.logger.info(
+            "일정에서 확인한 IMAX 영화(미마감): %s | 좌석 수신 대상 없어 생략 %d회차, 좌석 상세 요청 %d건",
+            ", ".join(f"{label} {n}회차" for label, n in sorted(tally.bookable_movies.items()))
+            or "성공한 날짜에서 확인된 회차 없음",
+            len(tally.no_seat_audience), tally.seat_map_attempts,
+        )
         if tally.latest_session_date:
             try:
                 observed = dt.date.fromisoformat(tally.latest_session_date)

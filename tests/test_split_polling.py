@@ -101,6 +101,93 @@ class SplitPollingTests(unittest.TestCase):
     def seat_requests(self):
         return [r for r in self.requests if r[0] == 'seat']
 
+    def test_open_only_follower_skips_detail_but_gets_new_opening_and_discovery(self):
+        chat = self.config.telegram_chat_id
+        self.watcher.state.set_alert_mode(chat, 'open')
+        tomorrow = self.DAY + dt.timedelta(days=1)
+        self.rows[tomorrow] = [self.row(tomorrow, '1800'),
+                               dict(self.row(tomorrow, '2000'), movNo='90001', movNm='새 영화')]
+        with self.assertLogs(self.logger, level='INFO') as logs:
+            self.cycle(0)
+        self.assertIn('[새 영화 (90001)] 1회차', '\n'.join(logs.output))
+        self.assertIn('좌석 상세 요청 0건', '\n'.join(logs.output))
+        self.assertEqual(len([r for r in self.requests if r[0] == 'schedule']), 2)
+        self.assertEqual(self.seat_requests(), [])
+        self.assertEqual(self.watcher._seat_pending, {})
+        records = [r for _, r in self.watcher.state.pending_deliveries()]
+        self.assertTrue(any(r['category'] == 'open' and r['show_date'] == str(tomorrow)
+                            and r['movie_no'] == self.config.movie_no for r in records))
+        self.assertTrue(any(r['category'] == 'movie' and r['movie_no'] == '90001' for r in records))
+        self.assertIn('90001', self.watcher.state.movie_catalog())
+        self.assertEqual(len(self.watcher.state.data['movie_sessions'][str(tomorrow)]['sessions']), 2)
+
+    def test_other_film_receiver_does_not_enable_detail_for_this_film(self):
+        self.watcher.state.set_alert_mode(self.config.telegram_chat_id, 'open')
+        self.watcher.state.add_subscriber('other', initial_movies=['98765'], initial_alert_mode='seats')
+        self.cycle(0)
+        self.assertEqual(self.seat_requests(), [])
+        self.watcher.state.add_subscriber('interested', initial_movies=[self.config.movie_no],
+                                          initial_alert_mode='seats')
+        self.watcher.state.set_min_seats('interested', 2)
+        self.cycle(60)
+        self.assertEqual(len(self.seat_requests()), 1)  # Determine the scoped count from the map.
+        self.assertFalse(any(r['category'].startswith('seats') for _, r in
+                             self.watcher.state.pending_deliveries()))
+
+    def test_weekday_date_and_time_filters_remove_jobs_then_resume_even_at_same_total(self):
+        chat = self.config.telegram_chat_id
+        state = self.watcher.state
+        state.set_show_day_selection(chat, 'weekend')  # The fixture is a Wednesday.
+        self.cycle(0)
+        state.set_show_day_selection(chat, 'all')
+        state.set_seat_date_range(chat, (str(self.DAY + dt.timedelta(days=1)), None))
+        self.cycle(60)
+        state.set_seat_date_range(chat, None)
+        state.set_seat_time_range(chat, ('19:00', '02:00'))
+        self.cycle(120)
+        self.assertEqual(self.seat_requests(), [])
+        self.restart()  # Old seat identities remain available for comparison.
+        self.watcher.state.set_seat_time_range(chat, None)
+        with patch.object(self.watcher, '_forces_seat_recheck', return_value=False):
+            self.cycle(180)
+            self.assertEqual(len(self.seat_requests()), 1)
+            self.cycle(300)
+            self.assertEqual(len(self.seat_requests()), 1)  # Forced refresh is one-time.
+
+    def test_last_receiver_opts_out_while_waiting_for_request_slot(self):
+        original = self.watcher._wait_for_cgv_request_slot
+        def wait():
+            original()
+            if len([r for r in self.requests if r[0] == 'schedule']) == 2:
+                self.watcher.state.set_alert_mode(self.config.telegram_chat_id, 'open')
+        with patch.object(self.watcher, '_wait_for_cgv_request_slot', side_effect=wait):
+            self.cycle(0)
+        self.assertEqual(self.seat_requests(), [])
+        self.assertEqual(self.watcher._seat_pending, {})
+        self.watcher.state.set_alert_mode(self.config.telegram_chat_id, 'seats')
+        self.cycle(60)
+        self.assertEqual(len(self.seat_requests()), 1)
+
+    def test_carryover_for_last_receiver_is_discarded_if_they_unsubscribe(self):
+        self.schedule_cost = 23
+        self.cycle(0)
+        self.assertTrue(self.watcher._seat_pending)
+        self.watcher.state.remove_subscriber(self.config.telegram_chat_id)
+        self.schedule_cost = 1
+        self.cycle(60)
+        self.assertFalse(self.watcher._seat_pending)
+        self.assertEqual(self.seat_requests(), [])
+
+    def test_unsplit_scan_also_skips_unwanted_details(self):
+        self.config = dataclasses.replace(self.config, seat_poll_interval_seconds=0)
+        self.restart()
+        self.watcher.state.set_alert_mode(self.config.telegram_chat_id, 'open')
+        self.cycle(0)
+        self.assertEqual(self.seat_requests(), [])
+        self.watcher.state.set_alert_mode(self.config.telegram_chat_id, 'all')
+        self.cycle(60)
+        self.assertEqual(len(self.seat_requests()), 1)
+
     def test_unchanged_sweet_seats_do_not_requeue_or_add_requests(self):
         self.config = dataclasses.replace(self.config, seat_alert_sweet_only=True)
         self.restart()
