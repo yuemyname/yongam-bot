@@ -188,3 +188,87 @@ class MonthlyWindowTests(unittest.TestCase):
         plan = self.w._plan_scan(dt.date(2026, 12, 21))
         self.assertNotIn(self.pin, plan.dates)
         self.assertFalse(plan.priority_dates)  # All dates now qualify equally.
+
+    def enable_handoff(self):
+        self.enable_priorities()
+        self.dune, self.avengers = "30001790", "30001943"
+        self.cfg = dataclasses.replace(self.cfg, monthly_pin_movie_no=self.avengers,
+                                       monthly_follow_movies=(self.dune, self.avengers))
+        self.restart()
+
+    def dec(self, d):
+        return dt.date(2026, 12, d)
+
+    def observe(self, day, movies):
+        day = self.dec(day)
+        rows = [row(n, "test", scnYmd=day.strftime("%Y%m%d"), frSeatCnt=0, **extra)
+                for n, extra in movies]
+        sessions = self.w._extract_sessions({day: {"data": rows}})
+        self.w._observe_movies(day, list(sessions.values()))
+
+    def test_handoff_only_for_exact_pin_movie_date_theater_and_imax(self):
+        self.enable_handoff()
+        self.observe(16, [(self.dune, {}),
+                          (self.avengers, {"siteNo": "0001"}),
+                          (self.avengers, {"scnsNm": "1관", "movkndDsplNm": "2D"})])
+        self.observe(17, [(self.avengers, {})])
+        self.observe(20, [(self.dune, {})])
+        self.observe(24, [("777", {})])
+        self.assertEqual(self.w._plan_scan(self.today).priority_dates[0], self.pin)
+        self.assertFalse(self.w.state.opening_progress()[0])
+        self.observe(16, [(self.avengers, {})])  # No follower, no available seats needed.
+        self.assertEqual(self.w._plan_scan(self.today).priority_dates,
+                         tuple(self.dec(i) for i in [21, 18, 22, 19, 23]))
+
+    def test_next_real_cycle_switches_order_then_keeps_and_moves_each_film_independently(self):
+        self.enable_handoff()
+        self.observe(20, [(self.dune, {})])
+        def schedules(day):
+            movies = [self.avengers] if day == self.pin else []
+            return {"data": [row(n, "test", scnYmd=day.strftime("%Y%m%d"), frSeatCnt=0) for n in movies]}
+        self.w.cgv.fetch_date.side_effect = schedules
+        self.w.run_cycle()
+        self.assertEqual(self.w.cgv.fetch_date.call_args_list[0].args[0], self.pin)
+        self.observe(16, [])  # CGV removes the showing before restart.
+        self.restart()
+        self.w.run_cycle()
+        calls = [c.args[0] for c in self.w.cgv.fetch_date.call_args_list]
+        self.assertEqual(calls[:5], [self.dec(d) for d in [21, 17, 22, 18, 23]])
+        self.assertEqual(len(set(calls)), len(calls))
+        self.assertLessEqual(len(calls), 16)
+        self.observe(22, [(self.dune, {})])
+        self.assertEqual(self.w._plan_scan(self.today).priority_dates[:2], (self.dec(23), self.dec(17)))
+        self.observe(22, [(self.avengers, {})])
+        self.assertEqual(self.w._plan_scan(self.today).priority_dates, (self.dec(23), self.dec(24)))
+        self.observe(24, [(self.avengers, {}), (self.dune, {})])
+        plan = self.w._plan_scan(self.today)
+        self.assertFalse(plan.priority_dates)
+        self.assertLessEqual(max(plan.dates), self.dec(24))
+        self.assertEqual(self.w._plan_scan(self.today + dt.timedelta(days=1)).priority_dates, (self.dec(25),))
+        self.w.cgv.fetch_seat_snapshot.assert_not_called()
+
+    def test_legacy_record_migration_is_site_scoped_and_not_a_new_broadcast(self):
+        self.enable_priorities()
+        for site, movie, day in [("7777", "30001943", 16), ("0013", "30001790", 20)]:
+            s = BookingSession(date=str(self.dec(day)), start_time="14:00", movie_no=movie)
+            self.w.state.mark_notified(s.notification_key(site_no=site, movie_no=movie), s)
+        self.w.state.save()
+        self.enable_handoff()
+        self.assertEqual(self.w.state.opening_progress(), (False, {self.dune: self.dec(20)}))
+        self.assertFalse(self.w.state.pending_deliveries())
+
+    def test_post_handoff_still_sweeps_gaps_and_preserves_near_days_every_cycle(self):
+        self.enable_handoff()
+        self.observe(20, [(self.dune, {})])
+        self.observe(16, [(self.avengers, {})])
+        seen = set()
+        for _ in range(7):
+            self.w.run_cycle()
+            days = [c.args[0] for c in self.w.cgv.fetch_date.call_args_list]
+            self.assertEqual(days[:2], [self.dec(21), self.dec(17)])
+            self.assertLessEqual(len(days), 16)
+            self.assertEqual(len(set(days)), len(days))
+            self.assertTrue(all(self.today + dt.timedelta(days=i) in days for i in range(7)))
+            seen.update(days)
+            self.restart()
+        self.assertEqual(seen, set(self.cfg.target_dates()))

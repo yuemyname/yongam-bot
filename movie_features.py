@@ -58,6 +58,48 @@ class MovieStateMixin:
             self.data.setdefault("movie_catalog_initialized", False)
             self.default_movie_label = movie_label
 
+    def configure_opening_watch(self, config):
+        """Seed from past, site-scoped showing records, never from a movie's mere catalog presence."""
+        self._opening_watch = None
+        if not (config.multi_movie_enabled and config.scan_mode == "monthly"
+                and config.monthly_priority_date and config.monthly_pin_movie_no and config.monthly_follow_movies):
+            return
+        pin = config.monthly_priority_date.isoformat()
+        trigger = config.monthly_pin_movie_no
+        key = f"{config.site_no}:{trigger}:{pin}"
+        with self._lock:
+            record = self.data.setdefault("opening_watches", {}).setdefault(key, {"opened": False, "latest": {}})
+            self._opening_watch = (record, pin, trigger, set(config.monthly_follow_movies) | {trigger})
+            for saved in self.data["notified"]:
+                parts = saved.split(":", 3)
+                if len(parts) == 4 and parts[0] == config.site_no:
+                    self.note_open_showing(parts[1], parts[2])
+
+    def note_open_showing(self, number, day):
+        """Latch the exact opening and keep per-film high-water marks after a sold-out/removed listing."""
+        watch = getattr(self, "_opening_watch", None)
+        if not watch or number not in watch[3]:
+            return False
+        try:
+            day = dt.date.fromisoformat(day).isoformat()
+        except (ValueError, TypeError):
+            return False
+        record, pin, trigger, _ = watch
+        with self._lock:
+            latest = record["latest"]
+            latest[number] = max(day, latest.get(number, day))
+            if not record["opened"] and (number, day) == (trigger, pin):
+                record["opened"] = True
+                return True
+        return False
+
+    def opening_progress(self):
+        with self._lock:
+            watch = getattr(self, "_opening_watch", None)
+            if not watch:
+                return False, {}
+            return watch[0]["opened"], {n: dt.date.fromisoformat(d) for n, d in watch[0]["latest"].items()}
+
     def language(self, chat_id):
         with self._lock:
             return "en" if self.data.get("languages", {}).get(str(chat_id)) == "en" else "ko"
@@ -142,6 +184,9 @@ class MovieWatcherMixin:
                 number = session.movie_no
                 if not number:
                     continue
+                if session.date == show_date.isoformat() and self.state.note_open_showing(number, session.date):
+                    self.logger.info("고정 상영일 오픈 확인: %s (%s) %s. 다음 주기부터 영화별 마지막 오픈일 다음 날 우선.",
+                                     session.movie_label, number, session.date)
                 fresh = number not in catalog
                 record = catalog.setdefault(number, {"first_seen": now})
                 record.update(title=session.movie_label, last_seen=now)
@@ -498,7 +543,11 @@ def public_guide(lang, config):
     if config.scan_mode == "monthly" and config.dynamic_date_window:
         today, end = config.target_range()
         pin, first = config.monthly_priority_date, config.monthly_priority_from
-        if (pin and today <= pin <= end) or (first and today < first <= end):
+        if config.monthly_pin_movie_no and config.monthly_follow_movies:
+            cadence += choose(lang,
+                " 지정 영화의 고정 상영일 오픈을 확인하면 다음 주기부터 각 대상 영화의 마지막 오픈 상영일 다음 날을 우선합니다. 기존 날짜도 계속 확인합니다.",
+                " Once the specified movie opens on its pinned date, the next cycle prioritizes the day after each tracked film’s latest observed show date. Other dates remain monitored.")
+        elif (pin and today <= pin <= end) or (first and today < first <= end):
             cadence += choose(lang,
                 " 지정 상영일을 먼저 확인합니다. 오늘 포함 7일도 매번 확인하며, 다른 날짜는 나눠서 조회합니다.",
                 " Priority show dates are checked first. The next 7 days including today are still checked every cycle; other dates rotate.")
