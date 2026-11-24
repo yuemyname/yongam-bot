@@ -495,6 +495,10 @@ def public_guide(lang, config):
     cadence = choose(lang,
         f"신규 일정 확인: 약 {config.poll_interval_seconds}초 간격.",
         f"Schedule checks: about every {config.poll_interval_seconds}s.")
+    if config.scan_mode == "monthly" and config.dynamic_date_window:
+        cadence += choose(lang,
+            " 오늘 포함 7일은 매번, 그 이후 날짜는 나눠서 정상 운영 시 3주기 안에 모두 확인합니다.",
+            " The next 7 days including today are checked every cycle; later dates are covered within three normal cycles.")
     if config.seat_poll_interval_seconds and not config.open_only_mode:
         cadence += choose(lang,
             f" 잔여좌석 확인: 회차별 최소 {config.seat_poll_interval_seconds}초 간격. 신규 일정이 우선이며 남은 좌석 작업은 다음 주기로 이월됩니다.",

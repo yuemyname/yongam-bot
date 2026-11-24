@@ -8,6 +8,7 @@ credentials are neither accepted nor sent.
 from __future__ import annotations
 
 import argparse
+import calendar
 import concurrent.futures
 import copy
 import dataclasses
@@ -80,7 +81,10 @@ TELEGRAM_FLOOD_WAIT_MARGIN_SECONDS = 1
 SCAN_MODE_FULL = "full"
 SCAN_MODE_CURSOR = "cursor"
 SCAN_MODE_FRONTIER = "frontier"
-SCAN_MODES = (SCAN_MODE_FULL, SCAN_MODE_CURSOR, SCAN_MODE_FRONTIER)
+SCAN_MODE_MONTHLY = "monthly"
+MONTHLY_NEAR_DAYS = 7
+MONTHLY_ROTATING_DAYS = 9
+SCAN_MODES = (SCAN_MODE_FULL, SCAN_MODE_CURSOR, SCAN_MODE_FRONTIER, SCAN_MODE_MONTHLY)
 DEFAULT_SCAN_MODE = SCAN_MODE_CURSOR
 
 # Alert categories a broadcast can belong to.  "system" messages (fetch error
@@ -966,6 +970,10 @@ class Config:
             return start, end if self.dynamic_date_window else min(end, self.target_end)
         if not self.dynamic_date_window:
             return start, self.target_end
+        if self.scan_mode == SCAN_MODE_MONTHLY:
+            month = start.month % 12 + 1
+            year = start.year + (month == 1)
+            return start, dt.date(year, month, min(start.day, calendar.monthrange(year, month)[1]))
         return start, start + dt.timedelta(days=self.target_window_days - 1)
 
     def target_dates(
@@ -976,6 +984,11 @@ class Config:
         return [start + dt.timedelta(days=offset) for offset in range(count)]
 
     def scan_range_label(self, language: str = "ko") -> str:
+        if self.scan_mode == SCAN_MODE_MONTHLY:
+            if not self.dynamic_date_window:
+                return f"{self.target_start} ~ {self.target_end}"
+            return ("Today through the same date next month (or month-end), inclusive"
+                    if language == "en" else "오늘부터 다음 달 같은 날짜까지 포함 (그 날짜가 없으면 말일까지)")
         if self.scan_mode == SCAN_MODE_FRONTIER:
             days = self.cursor_probe_days
             return (
@@ -2605,6 +2618,14 @@ class StateStore(MovieStateMixin):
             bucket = self.data.setdefault("failed_schedule_dates", {})
             return bucket.pop(show_date.isoformat(), None) is not None
 
+    def monthly_last_date(self) -> dt.date | None:
+        with self._lock:
+            return _parse_show_date(str(self.data.get("monthly_last_date", "")))
+
+    def set_monthly_last_date(self, day: dt.date) -> None:
+        with self._lock:
+            self.data["monthly_last_date"] = day.isoformat()
+
     def failed_schedule_dates(self) -> tuple[dt.date, ...]:
         with self._lock:
             bucket = self.data.setdefault("failed_schedule_dates", {})
@@ -3387,6 +3408,7 @@ class ScanPlan:
     open_end: dt.date | None = None
     window_end: dt.date | None = None
     probe_end: dt.date | None = None
+    monthly_rotation: tuple[dt.date, ...] = ()
 
     def probe_hit(self, latest_session_date: str) -> bool:
         if self.open_end is None or not latest_session_date:
@@ -4027,6 +4049,16 @@ class Watcher(MovieWatcherMixin):
         window = self.config.target_dates(today=today, frontier=frontier)
         if not window:
             return ScanPlan(dates=tuple(window), full_scan=True)
+
+        if self.config.scan_mode == SCAN_MODE_MONTHLY:
+            near = window[:MONTHLY_NEAR_DAYS]
+            far = list(reversed(window[MONTHLY_NEAR_DAYS:]))
+            last = self.state.monthly_last_date()
+            if last is not None:
+                far = [day for day in far if day < last] + [day for day in far if day >= last]
+            batch = tuple(far[:MONTHLY_ROTATING_DAYS])
+            return ScanPlan(tuple(near) + batch, full_scan=len(batch) == len(far),
+                            window_end=window[-1], monthly_rotation=batch)
 
         retry_set = set(self.state.failed_schedule_dates())
         retry_dates = [date for date in window if date in retry_set]
@@ -5813,6 +5845,7 @@ class Watcher(MovieWatcherMixin):
     def _run_due_seat_checks(
         self, dates: Sequence[dt.date], errors: Mapping[dt.date, str],
         tally: "_CycleTally", *, deadline: float,
+        retained_range: tuple[dt.date, dt.date] | None = None,
     ) -> int:
         """Use time left before the next schedule scan, retaining unfinished jobs.
 
@@ -5822,14 +5855,21 @@ class Watcher(MovieWatcherMixin):
         """
         requested = {day.isoformat() for day in dates}
         failed = {day.isoformat() for day in errors}
+        retained = tuple(day.isoformat() for day in retained_range) if retained_range else ()
+
+        def expired(day: str, key: str) -> bool:
+            if day in requested:
+                return day not in failed and key not in self._seat_fresh
+            return not retained or not retained[0] <= day <= retained[1]
+
         for key in list(self._seat_next_due):
             day = key.split(":")[2]
             if key in tally.no_seat_audience and self._seat_next_due[key] > time.monotonic():
                 continue  # A quick opt-out/opt-in must not reset the minimum request interval.
-            if day not in requested or (day not in failed and key not in self._seat_fresh):
+            if expired(day, key):
                 self._seat_next_due.pop(key, None)
         for key, session in list(self._seat_pending.items()):
-            if session.date not in requested or (session.date not in failed and key not in self._seat_fresh):
+            if expired(session.date, key):
                 self._seat_pending.pop(key, None)
 
         processed = 0
@@ -6400,6 +6440,7 @@ class Watcher(MovieWatcherMixin):
             else self.state.pending_deliveries()
         )
         today = self.config.local_today()
+        monthly = self.config.scan_mode == SCAN_MODE_MONTHLY
         plan = self._plan_scan(today)
         if self.config.multi_movie_enabled and not self.state.movie_catalog_ready():
             plan = ScanPlan(dates=tuple(self.config.target_dates(
@@ -6435,6 +6476,7 @@ class Watcher(MovieWatcherMixin):
             "조회 시작: %s 모드, %d일 (%s~%s), 예매 열린 마지막 날 %s",
             (f"오픈일+{self.config.cursor_probe_days}일 제한"
              if self.config.scan_mode == SCAN_MODE_FRONTIER
+             else "한 달 순환" if monthly
              else "전체" if plan.full_scan else "커서"),
             len(dates),
             min(dates).isoformat() if dates else "-",
@@ -6463,14 +6505,28 @@ class Watcher(MovieWatcherMixin):
         else:
             self._scan_and_alert(dates, errors, tally)
 
+        if monthly:
+            start, end = self.config.target_range(today=today)
+            # The throttle guard always skips a suffix. Never advance over a
+            # date that wasn't attempted; otherwise restarts can lose coverage.
+            attempted = len(plan.monthly_rotation) - tally.schedule_skipped_dates
+            if attempted > 0 and not self.dry_run:
+                self.state.set_monthly_last_date(plan.monthly_rotation[attempted - 1])
+                tally.dirty = True
+                self._flush_state(tally)
+            self.logger.info("한 달 감시 범위: %s~%s | 이번 주기 원거리 조회 성공: %s",
+                             start, end, ", ".join(d.isoformat() for d in plan.monthly_rotation[:max(0, attempted)]
+                                                   if d not in errors) or "-")
+
         if self.config.seat_poll_interval_seconds and not self.config.open_only_mode:
             self.logger.info(
                 "신규 일정 확인 완료: %.1f초, 신규 %d개, 이전 주기 이월 좌석 작업 %d개",
                 time.monotonic() - cycle_started, tally.new_sessions, len(self._seat_pending),
             )
             processed = self._run_due_seat_checks(
-                dates, errors, tally,
+                dates[:len(dates) - tally.schedule_skipped_dates] if monthly else dates, errors, tally,
                 deadline=cycle_started + self.config.poll_interval_seconds,
+                retained_range=(start, end) if monthly else None,
             )
             self.logger.info(
                 "잔여좌석 확인: %d회차 처리, %d회차 다음 주기로 이월 (회차별 최소 %d초 간격)",

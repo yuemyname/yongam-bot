@@ -353,7 +353,7 @@ Mac이 잠자기 상태이거나 덮개가 닫혀 있으면 감시가 중단될 
 | `RATE_LIMIT_BACKOFF_INITIAL_SECONDS` | `1800` | HTTP 429 발생 후 첫 대기 시간(30분) |
 | `RATE_LIMIT_BACKOFF_MAX_SECONDS` | `7200` | 연속 HTTP 429 시 최대 대기 시간(120분) |
 | `DYNAMIC_DATE_WINDOW` | `true` | 오늘 기준 감시 범위를 매일 이동 |
-| `TARGET_WINDOW_DAYS` | `28` | 기존 `cursor`/`full` 모드의 날짜 수 (`frontier`에서는 미사용) |
+| `TARGET_WINDOW_DAYS` | `28` | 기존 `cursor`/`full` 모드의 날짜 수 (`monthly`·`frontier`에서는 미사용) |
 | `APP_TIMEZONE` | `Asia/Seoul` | 날짜 계산 기준 시간대 |
 | `STRICT_IMAX_MATCH` | `true` | IMAX 이름 또는 코드가 있는 회차만 감지 |
 | `BOOKING_CLOSE_MARGIN_MINUTES` | `0` | 상영 시작 몇 분 전부터 예매 마감으로 볼지 |
@@ -363,7 +363,7 @@ Mac이 잠자기 상태이거나 덮개가 닫혀 있으면 감시가 중단될 
 | `SEAT_RECHECK_ROTATE_DAYS` | `7` | 그 뒤로 순환하며 다시 읽을 일수 |
 | `SEAT_RECHECK_ROTATE_CYCLES` | `5` | 순환 구간을 몇 주기에 걸쳐 한 바퀴 돌지 |
 | `PENDING_DELIVERY_MAX_ATTEMPTS` | `30` | 전송 실패 재시도를 몇 번까지 할지 |
-| `SCAN_MODE` | 코드 기본 `cursor`, 운영 `frontier` | `frontier`: 마지막 관측일+N까지만 / `cursor`: 주기적 전체 조회 / `full`: 매번 전체 조회 |
+| `SCAN_MODE` | 코드 기본 `cursor`, 운영 `monthly` | `monthly`: 한 달 순환 / `frontier`: 마지막 관측일+N까지만 / `cursor`: 주기적 전체 조회 / `full`: 매번 전체 조회 |
 | `CURSOR_PROBE_DAYS` | 코드 기본 `3`, 운영 `5` | `frontier`의 범위 끝 / `cursor`의 우선 조회 일수 |
 | `CURSOR_EXPANSION_DAYS` | `21` | 신규 오픈 감지 후 이어서 조회할 최대 일수(안전장치) |
 | `FULL_SCAN_EVERY_CYCLES` | `10` | `cursor` 모드에서도 전체를 조회하는 주기 |
@@ -436,9 +436,17 @@ INFO Telegram 명령 조회 복구: 연속 5회 실패 후 정상화
 
 1시간짜리 Telegram 장애 기준으로 요청 1800건·로그 1800줄이 **요청 63건·로그 1줄**로 줄어듭니다. 이미 실패하는 API를 2초마다 두드려봐야 얻는 것이 없고, 그러다 봇이 따로 요청 제한을 받을 수 있습니다.
 
-## 조회 범위 — frontier 운영 정책
+## 조회 범위 — 운영 모드 monthly
 
-운영 설정은 `SCAN_MODE=frontier`, `CURSOR_PROBE_DAYS=5`, `DYNAMIC_DATE_WINDOW=true`입니다. 신규 일정은 `POLL_INTERVAL_SECONDS=60`, 잔여좌석은 `SEAT_POLL_INTERVAL_SECONDS=120`으로 분리하며 요청 사이의 2초 간격은 유지합니다. 코드 기본 모드는 기존 설치와의 호환을 위해 `cursor`이며, 새 설치용 `.env.example`은 `frontier`입니다.
+`SCAN_MODE=monthly`, `DYNAMIC_DATE_WINDOW=true`: 한국시간 오늘부터 다음 달 같은 날(없으면 말일)까지, 양 끝을 포함합니다. 예: 11/24~12/24, 1/31~2/28(윤년 2/29). 프론티어와 무관하게 빈 날짜 너머도 조회합니다.
+
+- 매 주기 오늘 포함 7일을 먼저 확인한 뒤 원거리 날짜를 최대 9일씩 역순으로 순환합니다. 정상적인 60초 주기에서는 3주기 이내에 한 달을 확인합니다. 요청은 직렬이며 2초 간격·기존 차단 처리를 유지합니다.
+- 원거리에서 마지막으로 시도한 날짜를 상태 파일에 저장합니다. 재시작해도 이어서 조회하며, 요청 제한으로 시도하지 못한 날짜는 건너뛰지 않습니다. 이번에 조회하지 않은 날짜의 좌석 작업은 보관하되 최신 일정이 확인되기 전에는 실행하지 않습니다.
+- 다중 영화 목록이 한 번도 초기화되지 않은 신규 설치는 기존 영화에 일괄 발견 알림을 보내지 않도록 첫 기준 목록을 전 범위에서 수집합니다. 초기화가 끝난 운영 설치에는 적용되지 않습니다.
+
+### 선택 모드 frontier (이전 운영 방식)
+
+`SCAN_MODE=frontier`, `CURSOR_PROBE_DAYS=5`인 경우에만 아래 제한을 적용합니다.
 
 - 매 주기 시작할 때 **오늘~저장된 마지막 관측 IMAX 상영일+5일(양 끝 포함)**을 고정합니다. 예: 오늘 10/28, 마지막 상영일 11/1이면 10/28~11/6만 조회합니다.
 - 신규 오픈 후보인 11/2~11/6을 먼저, 이미 열린 10/28~11/1을 이후에 조회합니다. 선택된 영화뿐 아니라 관측한 모든 IMAX 영화의 상영일이 프론티어 기준입니다.
@@ -462,7 +470,7 @@ INFO Telegram 명령 조회 복구: 연속 5회 실패 후 정상화
 
 ## 기존 조회 범위 — full과 cursor
 
-아래는 `SCAN_MODE=cursor` 또는 `full`로 되돌린 경우에만 해당합니다. `frontier` 운영에는 적용되지 않습니다.
+아래는 `SCAN_MODE=cursor` 또는 `full`로 되돌린 경우에만 해당합니다. `monthly` 운영에는 적용되지 않습니다.
 
 `SCAN_MODE=full`은 매 주기 감시 기간 28일을 모두 조회합니다. `CGV_REQUEST_SPACING_SECONDS=2` 때문에 한 주기에 최소 약 56초가 걸리고, 좌석 상세 조회가 붙으면 `POLL_INTERVAL_SECONDS`를 넘겨 사실상 쉬는 시간 없이 돌아갑니다.
 
