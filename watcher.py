@@ -84,6 +84,8 @@ SCAN_MODE_FRONTIER = "frontier"
 SCAN_MODE_MONTHLY = "monthly"
 MONTHLY_NEAR_DAYS = 7
 MONTHLY_ROTATING_DAYS = 9
+# Of the nine distant schedule requests, leave at least four for the sweep.
+MONTHLY_FOCUS_SLOTS = 5
 SCAN_MODES = (SCAN_MODE_FULL, SCAN_MODE_CURSOR, SCAN_MODE_FRONTIER, SCAN_MODE_MONTHLY)
 DEFAULT_SCAN_MODE = SCAN_MODE_CURSOR
 
@@ -634,6 +636,8 @@ class Config:
     # Zero retains legacy combined scans. Positive values enable schedule-first
     # polling and a separate minimum interval for each showing's seat work.
     seat_poll_interval_seconds: int = 0
+    monthly_priority_date: dt.date | None = None
+    monthly_priority_from: dt.date | None = None
 
     @classmethod
     def from_env_file(
@@ -883,6 +887,10 @@ class Config:
                 name="SEAT_ALERT_SWEET_ONLY",
             ),
             scan_mode=_parse_scan_mode(value("SCAN_MODE", DEFAULT_SCAN_MODE)),
+            monthly_priority_date=(_parse_date(pin, name="MONTHLY_PRIORITY_DATE")
+                                   if (pin := value("MONTHLY_PRIORITY_DATE")) else None),
+            monthly_priority_from=(_parse_date(first, name="MONTHLY_PRIORITY_FROM")
+                                   if (first := value("MONTHLY_PRIORITY_FROM")) else None),
             booking_close_margin_minutes=_parse_int(
                 value("BOOKING_CLOSE_MARGIN_MINUTES", "0"),
                 name="BOOKING_CLOSE_MARGIN_MINUTES",
@@ -2618,13 +2626,15 @@ class StateStore(MovieStateMixin):
             bucket = self.data.setdefault("failed_schedule_dates", {})
             return bucket.pop(show_date.isoformat(), None) is not None
 
-    def monthly_last_date(self) -> dt.date | None:
+    def monthly_last_date(self, *, priority: bool = False) -> dt.date | None:
         with self._lock:
-            return _parse_show_date(str(self.data.get("monthly_last_date", "")))
+            key = "monthly_priority_last_date" if priority else "monthly_last_date"
+            return _parse_show_date(str(self.data.get(key, "")))
 
-    def set_monthly_last_date(self, day: dt.date) -> None:
+    def set_monthly_last_date(self, day: dt.date, *, priority: bool = False) -> None:
         with self._lock:
-            self.data["monthly_last_date"] = day.isoformat()
+            key = "monthly_priority_last_date" if priority else "monthly_last_date"
+            self.data[key] = day.isoformat()
 
     def failed_schedule_dates(self) -> tuple[dt.date, ...]:
         with self._lock:
@@ -3409,6 +3419,8 @@ class ScanPlan:
     window_end: dt.date | None = None
     probe_end: dt.date | None = None
     monthly_rotation: tuple[dt.date, ...] = ()
+    priority_dates: tuple[dt.date, ...] = ()
+    priority_rotation: tuple[dt.date, ...] = ()
 
     def probe_hit(self, latest_session_date: str) -> bool:
         if self.open_end is None or not latest_session_date:
@@ -4052,13 +4064,29 @@ class Watcher(MovieWatcherMixin):
 
         if self.config.scan_mode == SCAN_MODE_MONTHLY:
             near = window[:MONTHLY_NEAR_DAYS]
-            far = list(reversed(window[MONTHLY_NEAR_DAYS:]))
+            distant = window[MONTHLY_NEAR_DAYS:]
+            pin = self.config.monthly_priority_date
+            first = self.config.monthly_priority_from
+            pinned = [pin] if pin in window else []
+            # Once the *whole* window qualifies, no date outranks another.
+            focus = [d for d in window if d >= first and d != pin] if first and window[0] < first else []
+            candidates = [d for d in focus if d not in near]
+            prev = self.state.monthly_last_date(priority=True)
+            if prev is not None:
+                candidates = [d for d in candidates if d > prev] + [d for d in candidates if d <= prev]
+            focus_batch = candidates[:MONTHLY_FOCUS_SLOTS - int(pin in distant)]
+            priority = tuple(pinned + [d for d in focus if d in near] + focus_batch)
+            leading = priority + tuple(d for d in near if d not in priority)
+
+            far = [d for d in reversed(distant) if d not in priority]
             last = self.state.monthly_last_date()
             if last is not None:
                 far = [day for day in far if day < last] + [day for day in far if day >= last]
-            batch = tuple(far[:MONTHLY_ROTATING_DAYS])
-            return ScanPlan(tuple(near) + batch, full_scan=len(batch) == len(far),
-                            window_end=window[-1], monthly_rotation=batch)
+            budget = MONTHLY_ROTATING_DAYS - sum(d in distant for d in priority)
+            batch = tuple(far[:budget])
+            return ScanPlan(leading + batch, full_scan=len(batch) == len(far),
+                            window_end=window[-1], monthly_rotation=batch,
+                            priority_dates=priority, priority_rotation=tuple(focus_batch))
 
         retry_set = set(self.state.failed_schedule_dates())
         retry_dates = [date for date in window if date in retry_set]
@@ -6443,8 +6471,9 @@ class Watcher(MovieWatcherMixin):
         monthly = self.config.scan_mode == SCAN_MODE_MONTHLY
         plan = self._plan_scan(today)
         if self.config.multi_movie_enabled and not self.state.movie_catalog_ready():
-            plan = ScanPlan(dates=tuple(self.config.target_dates(
-                today=today, frontier=self.state.frontier_date)), full_scan=True)
+            window = self.config.target_dates(today=today, frontier=self.state.frontier_date)
+            plan = ScanPlan(dates=plan.priority_dates + tuple(d for d in window if d not in plan.priority_dates),
+                            full_scan=True, priority_dates=plan.priority_dates)
         dates = list(plan.dates)
         tally = _CycleTally()
         pruned_records = 0 if self.dry_run else self.state.prune_expired(today)
@@ -6509,14 +6538,19 @@ class Watcher(MovieWatcherMixin):
             start, end = self.config.target_range(today=today)
             # The throttle guard always skips a suffix. Never advance over a
             # date that wasn't attempted; otherwise restarts can lose coverage.
-            attempted = len(plan.monthly_rotation) - tally.schedule_skipped_dates
-            if attempted > 0 and not self.dry_run:
-                self.state.set_monthly_last_date(plan.monthly_rotation[attempted - 1])
-                tally.dirty = True
-                self._flush_state(tally)
+            attempted = set(dates[:len(dates) - tally.schedule_skipped_dates])
+            for is_priority, rotation in ((True, plan.priority_rotation), (False, plan.monthly_rotation)):
+                last = next((d for d in reversed(rotation) if d in attempted), None)
+                if last is not None and not self.dry_run:
+                    self.state.set_monthly_last_date(last, priority=is_priority)
+                    tally.dirty = True
+            self._flush_state(tally)
+            if plan.priority_dates:
+                self.logger.info("신규 오픈 우선 조회 성공 (요청 순서): %s",
+                                 ", ".join(str(d) for d in plan.priority_dates if d in attempted and d not in errors) or "-")
             self.logger.info("한 달 감시 범위: %s~%s | 이번 주기 원거리 조회 성공: %s",
-                             start, end, ", ".join(d.isoformat() for d in plan.monthly_rotation[:max(0, attempted)]
-                                                   if d not in errors) or "-")
+                             start, end, ", ".join(d.isoformat() for d in plan.monthly_rotation
+                                                   if d in attempted and d not in errors) or "-")
 
         if self.config.seat_poll_interval_seconds and not self.config.open_only_mode:
             self.logger.info(
