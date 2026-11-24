@@ -7,7 +7,6 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from movie_features import public_guide
 from test_movies import row
 from test_watcher import make_config, _kst
 from watcher import BookingSession, Config, FetchError, Watcher, _CycleTally
@@ -43,8 +42,6 @@ class MonthlyWindowTests(unittest.TestCase):
                              (start, dt.date.fromisoformat(end)))
         fixed = dataclasses.replace(self.cfg, dynamic_date_window=False)
         self.assertEqual(fixed.target_range(), (fixed.target_start, fixed.target_end))
-        self.assertIn("3주기", public_guide("ko", self.cfg))
-        self.assertIn("three normal cycles", public_guide("en", self.cfg))
 
     def test_near_every_cycle_far_all_within_three_even_after_restart(self):
         seen = set()

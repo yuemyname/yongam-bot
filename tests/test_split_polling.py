@@ -8,7 +8,6 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from movie_features import public_guide
 from watcher import CgvClient, Config, FetchError, SeatSnapshot, Watcher
 from test_watcher import make_config, _kst
 
@@ -347,10 +346,7 @@ class SplitPollingTests(unittest.TestCase):
         self.assertFalse(self.watcher._seat_pending)
         self.assertFalse(self.seat_requests())
 
-    def test_cadence_is_localized_and_env_setting_parses(self):
-        self.assertIn('60초', public_guide('ko', self.config))
-        self.assertIn('120초', public_guide('ko', self.config))
-        self.assertIn('120s apart', public_guide('en', self.config))
+    def test_seat_poll_interval_env_setting_parses(self):
         with patch.dict(os.environ, {'SEAT_POLL_INTERVAL_SECONDS':'120'}):
             self.assertEqual(make_config(self.root).seat_poll_interval_seconds, 120)
 

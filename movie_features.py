@@ -537,32 +537,6 @@ def public_guide(lang, config):
     if notes := _public_service_notes(lang, config):
         parts.append(notes)
 
-    cadence = choose(lang,
-        f"신규 일정 확인: 약 {config.poll_interval_seconds}초 간격.",
-        f"Schedule checks: about every {config.poll_interval_seconds}s.")
-    if config.scan_mode == "monthly" and config.dynamic_date_window:
-        today, end = config.target_range()
-        pin, first = config.monthly_priority_date, config.monthly_priority_from
-        if config.monthly_pin_movie_no and config.monthly_follow_movies:
-            cadence += choose(lang,
-                " 지정 영화의 고정 상영일 오픈을 확인하면 다음 주기부터 각 대상 영화의 마지막 오픈 상영일 다음 날을 우선합니다. 기존 날짜도 계속 확인합니다.",
-                " Once the specified movie opens on its pinned date, the next cycle prioritizes the day after each tracked film’s latest observed show date. Other dates remain monitored.")
-        elif (pin and today <= pin <= end) or (first and today < first <= end):
-            cadence += choose(lang,
-                " 지정 상영일을 먼저 확인합니다. 오늘 포함 7일도 매번 확인하며, 다른 날짜는 나눠서 조회합니다.",
-                " Priority show dates are checked first. The next 7 days including today are still checked every cycle; other dates rotate.")
-        else:
-            cadence += choose(lang,
-                " 오늘 포함 7일은 매번, 그 이후 날짜는 나눠서 정상 운영 시 3주기 안에 모두 확인합니다.",
-                " The next 7 days including today are checked every cycle; later dates are covered within three normal cycles.")
-    if config.seat_poll_interval_seconds and not config.open_only_mode:
-        cadence += choose(lang,
-            f" 잔여좌석 확인: 회차별 최소 {config.seat_poll_interval_seconds}초 간격. 신규 일정이 우선이며 남은 좌석 작업은 다음 주기로 이월됩니다.",
-            f" Seat checks: at least {config.seat_poll_interval_seconds}s apart per showing. Schedules take priority; unfinished seat work carries forward.")
-    parts.append(choose(lang,
-        f"🔎 조회 범위와 주기\n{config.scan_range_label()} (한국시간 기준).\n{cadence}\n조회 범위 밖의 회차는 감지하지 못할 수 있습니다.",
-        f"🔎 Coverage and timing\n{config.scan_range_label('en')} (Korea time).\n{cadence}\nShowings outside this range may not be detected."))
-
     movies = choose(lang,
         "2. /start 답장의 버튼에서 영화를 선택합니다. 최초 구독 시 자동 선택되는 영화는 없으며, 선택 전에는 영화별 오픈·좌석 알림을 받지 않습니다.\n/movies — 영화 선택 다시 열기. ✅는 선택됨이며 여러 편을 고를 수 있고, 다시 누르면 해제됩니다. 기존 구독자의 선택은 유지합니다.\n새 영화 발견 안내가 와도 자동 선택되지는 않습니다. 선택하면 최근 조회한 예정 회차 → /status 와 같은 현재 설정 순서로 안내합니다. 신규 구독자의 첫 선택에는 짧은 봇 소개도 한 번 보냅니다. 실시간 좌석을 보장하지 않습니다.",
         "2. Choose films using the buttons in the /start reply. New subscribers start with no selected movies and receive no film-specific opening/seat alerts until choosing one.\n/movies — Reopen selection. ✅ means selected; tap again to remove. Multiple films are allowed. Existing choices are preserved.\nNew-film announcements do not automatically select the film. Selecting one shows cached upcoming showings, then the same settings as /status. New subscribers also receive a short introduction once. Live availability is not guaranteed.") if config.multi_movie_enabled else choose(lang,
@@ -592,12 +566,12 @@ def public_guide(lang, config):
         f"/date {date_start} — 입력한 날짜 포함 이후\n/date {date_start} {date_end} — 양 끝 날짜 포함\n"
         "날짜는 하이픈 없이 YYYYMMDD로 입력합니다. 기간이 지나도 자동 해제되지 않습니다. 날짜 제한 해제: /date_all\n"
         "/time 18:00 23:59 — 저녁 상영\n/time 22:00 02:00 — 자정을 넘는 심야 상영\n"
-        "한국시간 상영 시작시각 기준, 양 끝 포함. 시간 제한 해제: /time_all\n날짜·시간은 잔여좌석에만 적용하며 조회 범위를 늘리지는 않습니다.",
+        "한국시간 상영 시작시각 기준, 양 끝 포함. 시간 제한 해제: /time_all\n날짜·시간 필터는 잔여좌석 알림에만 적용합니다.",
         "📅 Day, date and time filters\n/day_all every day · /day_weekend Sat/Sun showings. This is the film's show day, not the day you receive the alert; it applies to both alert types. Check with /day.\n"
         f"/date {date_start} — from this date, inclusive\n/date {date_start} {date_end} — inclusive range\n"
         "Enter YYYYMMDD without hyphens. Expired filters stay active; clear with /date_all.\n"
         "/time 18:00 23:59 — evening\n/time 22:00 02:00 — overnight\n"
-        "Korea-time show starts, both endpoints included. Clear with /time_all. Date/time filters affect seats only and do not extend the scan range."))
+        "Korea-time show starts, both endpoints included. Clear with /time_all. Date/time filters apply to seat alerts only."))
 
     policy = choose(lang,
         "현재 모든 구독자에게 명당만 알립니다. 위치 미확인 좌석은 제외합니다.\n/seat_all — 현재 명당 전용이므로 전체 좌석 전환은 불가합니다.",

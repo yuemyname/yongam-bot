@@ -8,7 +8,6 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from movie_features import public_guide
 from watcher import Config, SCAN_MODE_FRONTIER, Watcher
 from test_watcher import make_config, _kst
 
@@ -124,10 +123,10 @@ class FrontierWindowTests(unittest.TestCase):
         self.assertEqual(set(requested), self.expected_dates())
         self.assertTrue(self.watcher.state.movie_catalog_ready())
 
-    def test_guide_explains_active_range_in_both_languages(self):
+    def test_active_range_label_in_both_languages(self):
         for language, phrase in (('ko', '상영일의 5일 뒤까지'),
                                  ('en', '5 days after the latest observed IMAX show date')):
-            text = public_guide(language, self.config)
+            text = self.config.scan_range_label(language)
             self.assertIn(phrase, text)
             self.assertNotIn('28일', text)
             self.assertNotIn('28 days', text)

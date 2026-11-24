@@ -124,7 +124,7 @@ class PublicGuideTests(unittest.TestCase):
     def test_guide_explains_current_policy_not_old_odyssey_defaults(self):
         text = self.command("/desc")
         for phrase in (
-            "CGV 용산아이파크몰 IMAX", "5일 뒤까지", "60초", "120초",
+            "CGV 용산아이파크몰 IMAX",
             "자동 선택되지는 않습니다", "매진이거나", "새 명당 좌석이 생길 때만",
             "같은 자리 유지·감소·명당 밖 변화는 생략", "수가 같아도 새 번호",
             "날짜·시간·좌석·최소 좌석 제한은 적용하지 않습니다",
@@ -138,6 +138,17 @@ class PublicGuideTests(unittest.TestCase):
             self.assertIn(phrase, text)
         self.assertNotIn("28일", text)
         self.assertNotIn("오디세이 선택을 유지", text)
+
+    def test_description_omits_scan_details_in_both_languages(self):
+        for lang, hidden in (("ko", ("조회 범위", "조회 주기", "60초", "120초")),
+                             ("en", ("Coverage and timing", "scan range", "Schedule checks:", "Seat checks:"))):
+            self.watcher.state.set_language(self.config.telegram_chat_id, lang)
+            text = self.command("/desc")
+            for phrase in hidden:
+                self.assertNotIn(phrase, text)
+            self.assertEqual(text, public_guide(lang, dataclasses.replace(
+                self.config, scan_mode="monthly", poll_interval_seconds=95,
+                seat_poll_interval_seconds=230)))
 
     def test_open_only_does_not_advertise_inactive_seat_commands(self):
         self.watcher = self.make_watcher(open_only_mode=True)
