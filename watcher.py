@@ -84,8 +84,9 @@ SCAN_MODE_FRONTIER = "frontier"
 SCAN_MODE_MONTHLY = "monthly"
 MONTHLY_NEAR_DAYS = 7
 MONTHLY_ROTATING_DAYS = 9
-# Of the nine distant schedule requests, leave at least four for the sweep.
-MONTHLY_FOCUS_SLOTS = 5
+# Divide the same nine distant requests between priority dates and the sweep.
+MONTHLY_DATE_FOCUS_SLOTS = 6
+MONTHLY_FOLLOW_FOCUS_SLOTS = 5
 SCAN_MODES = (SCAN_MODE_FULL, SCAN_MODE_CURSOR, SCAN_MODE_FRONTIER, SCAN_MODE_MONTHLY)
 DEFAULT_SCAN_MODE = SCAN_MODE_CURSOR
 
@@ -4093,7 +4094,7 @@ class Watcher(MovieWatcherMixin):
                 lanes = ([[d for d in window if d >= start] for _, start in starts]
                          if any(start >= window[0] for _, start in starts) else [])
                 order = dict.fromkeys(d for group in itertools.zip_longest(*lanes) for d in group if d is not None)
-                first_far = set(itertools.islice((d for d in order if d in distant), MONTHLY_FOCUS_SLOTS))
+                first_far = set(itertools.islice((d for d in order if d in distant), MONTHLY_FOLLOW_FOCUS_SLOTS))
                 priority = tuple(d for d in order if d in near or d in first_far)
                 focus_batch = []  # No static-period cursor in the new phase.
             else:
@@ -4103,10 +4104,13 @@ class Watcher(MovieWatcherMixin):
                 # Both anchors precede the persisted cursor; rotate only later dates.
                 focus = [d for d in window if d > first and d != pin] if first and window[0] < first else []
                 candidates = [d for d in focus if d not in near]
-                prev = self.state.monthly_last_date(priority=True)
-                if prev is not None:
-                    candidates = [d for d in candidates if d > prev] + [d for d in candidates if d <= prev]
-                slots = MONTHLY_FOCUS_SLOTS - sum(d in distant for d in pinned)
+                slots = MONTHLY_DATE_FOCUS_SLOTS - sum(d in distant for d in pinned)
+                if len(candidates) > slots:
+                    # For a longer range, resume in ascending order. Wrap only
+                    # between cycles, never after a later date in the same batch.
+                    prev = self.state.monthly_last_date(priority=True)
+                    if prev is not None:
+                        candidates = [d for d in candidates if d > prev] or candidates
                 focus_batch = candidates[:slots]
                 priority = tuple(pinned + [d for d in focus if d in near] + focus_batch)
             leading = priority + tuple(d for d in near if d not in priority)

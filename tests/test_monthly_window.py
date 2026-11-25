@@ -124,24 +124,36 @@ class MonthlyWindowTests(unittest.TestCase):
             self.restart()
         self.assertEqual(seen, set(self.cfg.target_dates()))
 
-    def test_two_pins_lead_actual_requests_while_later_dates_rotate(self):
+    def test_all_six_target_dates_requested_in_order_each_cycle_after_restart(self):
         self.enable_priorities()
         day = dt.date(2026, 11, 25)
         # Start from a cursor written by the old release, already past both pins.
         self.w.state.set_monthly_last_date(self.dec(23), priority=True)
         self.w.state.save()
         self.restart()
-        seen = set()
+        ordered = [self.dec(d) for d in (16, 21, 22, 23, 24, 25)]
         with patch.object(Config, "local_now", return_value=_kst(day)):
-            for rotating in [(24, 25, 22), (23, 24, 25), (22, 23, 24), (25, 22, 23)]:
+            for _ in range(3):
                 self.w.run_cycle()
                 days = [c.args[0] for c in self.w.cgv.fetch_date.call_args_list]
-                self.assertEqual(days[:5], [self.pin, self.first, *(self.dec(d) for d in rotating)])
+                self.assertEqual(days[:6], ordered)
                 self.assertEqual(len(days), 16)
                 self.assertEqual(len(set(days)), 16)
-                seen.update(days)
                 self.restart()
-        self.assertTrue(set(self.dec(d) for d in range(21, 26)) <= seen)
+
+    def test_longer_priority_range_wraps_only_between_cycles(self):
+        self.enable_priorities()
+        with patch.object(Config, "local_now", return_value=_kst(dt.date(2026, 11, 26))):
+            for batch in [(16, 21, 22, 23, 24, 25), (16, 21, 26), (16, 21, 22, 23, 24, 25)]:
+                plan = self.w._plan_scan(self.cfg.local_today())
+                expected = tuple(self.dec(d) for d in batch)
+                self.assertEqual(plan.priority_dates, expected)
+                self.w.run_cycle()
+                days = [c.args[0] for c in self.w.cgv.fetch_date.call_args_list]
+                self.assertEqual(tuple(days[:len(batch)]), expected)
+                self.assertEqual(len(days), len(set(days)))
+                self.assertEqual(len(days), 16)
+                self.restart()
 
     def test_growing_priority_range_rotates_and_recovers_after_restart_or_throttle(self):
         self.enable_priorities()
@@ -164,7 +176,8 @@ class MonthlyWindowTests(unittest.TestCase):
                 self.assertEqual(plan.dates[:2], (self.pin, self.first))
                 self.assertEqual(len(plan.dates), len(set(plan.dates)))
                 self.assertEqual(len(plan.dates), 16)
-                self.assertGreaterEqual(len(plan.monthly_rotation), 4)
+                self.assertGreaterEqual(len(plan.monthly_rotation), 3)
+                self.assertEqual(plan.priority_dates, tuple(sorted(plan.priority_dates)))
                 seen.update(plan.dates)
                 focus.update(plan.priority_rotation)
                 self.w.run_cycle()
