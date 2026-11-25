@@ -124,6 +124,25 @@ class MonthlyWindowTests(unittest.TestCase):
             self.restart()
         self.assertEqual(seen, set(self.cfg.target_dates()))
 
+    def test_two_pins_lead_actual_requests_while_later_dates_rotate(self):
+        self.enable_priorities()
+        day = dt.date(2026, 11, 25)
+        # Start from a cursor written by the old release, already past both pins.
+        self.w.state.set_monthly_last_date(self.dec(23), priority=True)
+        self.w.state.save()
+        self.restart()
+        seen = set()
+        with patch.object(Config, "local_now", return_value=_kst(day)):
+            for rotating in [(24, 25, 22), (23, 24, 25), (22, 23, 24), (25, 22, 23)]:
+                self.w.run_cycle()
+                days = [c.args[0] for c in self.w.cgv.fetch_date.call_args_list]
+                self.assertEqual(days[:5], [self.pin, self.first, *(self.dec(d) for d in rotating)])
+                self.assertEqual(len(days), 16)
+                self.assertEqual(len(set(days)), 16)
+                seen.update(days)
+                self.restart()
+        self.assertTrue(set(self.dec(d) for d in range(21, 26)) <= seen)
+
     def test_growing_priority_range_rotates_and_recovers_after_restart_or_throttle(self):
         self.enable_priorities()
         day = dt.date(2026, 12, 1)
@@ -135,13 +154,14 @@ class MonthlyWindowTests(unittest.TestCase):
             self.w.cgv.fetch_date.side_effect = throttle
             self.w.run_cycle()
             self.restart()
-            self.assertEqual(self.w._plan_scan(day).dates[:2],
-                             (self.pin, self.first + dt.timedelta(days=1)))
+            self.assertEqual(self.w._plan_scan(day).dates[:3],
+                             (self.pin, self.first, self.first + dt.timedelta(days=1)))
+            self.assertIsNone(self.w.state.monthly_last_date(priority=True))
             self.assertIsNone(self.w.state.monthly_last_date())
             seen, focus = set(), set()
             for _ in range(7):
                 plan = self.w._plan_scan(day)
-                self.assertEqual(plan.dates[0], self.pin)
+                self.assertEqual(plan.dates[:2], (self.pin, self.first))
                 self.assertEqual(len(plan.dates), len(set(plan.dates)))
                 self.assertEqual(len(plan.dates), 16)
                 self.assertGreaterEqual(len(plan.monthly_rotation), 4)
@@ -151,7 +171,7 @@ class MonthlyWindowTests(unittest.TestCase):
                 self.restart()
             month = set(self.cfg.target_dates())
             self.assertEqual(seen, month)
-            self.assertEqual(focus, {d for d in month if d >= self.first})
+            self.assertEqual(focus, {d for d in month if d > self.first})
 
     def test_new_avengers_and_later_dune_notify_through_existing_filters(self):
         self.enable_priorities()
@@ -180,11 +200,12 @@ class MonthlyWindowTests(unittest.TestCase):
         plan = self.w._plan_scan(dt.date(2026, 11, 1))
         self.assertFalse(plan.priority_dates)
         plan = self.w._plan_scan(dt.date(2026, 12, 15))
-        self.assertEqual(plan.dates[0], self.pin)
+        self.assertEqual(plan.dates[:2], (self.pin, self.first))
         self.assertEqual(len(set(plan.dates)), len(plan.dates))
         plan = self.w._plan_scan(dt.date(2026, 12, 21))
         self.assertNotIn(self.pin, plan.dates)
-        self.assertFalse(plan.priority_dates)  # All dates now qualify equally.
+        self.assertEqual(plan.priority_dates, (self.first,))  # Today is still checked once.
+        self.assertEqual(plan.dates.count(self.first), 1)
 
     def enable_handoff(self):
         self.enable_priorities()

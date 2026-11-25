@@ -4098,12 +4098,16 @@ class Watcher(MovieWatcherMixin):
                 focus_batch = []  # No static-period cursor in the new phase.
             else:
                 pinned = [pin] if pin in window else []
-                focus = [d for d in window if d >= first and d != pin] if first and window[0] < first else []
+                if first in window and first != pin:
+                    pinned.append(first)
+                # Both anchors precede the persisted cursor; rotate only later dates.
+                focus = [d for d in window if d > first and d != pin] if first and window[0] < first else []
                 candidates = [d for d in focus if d not in near]
                 prev = self.state.monthly_last_date(priority=True)
                 if prev is not None:
                     candidates = [d for d in candidates if d > prev] + [d for d in candidates if d <= prev]
-                focus_batch = candidates[:MONTHLY_FOCUS_SLOTS - int(pin in distant)]
+                slots = MONTHLY_FOCUS_SLOTS - sum(d in distant for d in pinned)
+                focus_batch = candidates[:slots]
                 priority = tuple(pinned + [d for d in focus if d in near] + focus_batch)
             leading = priority + tuple(d for d in near if d not in priority)
 
