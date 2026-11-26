@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 
 from test_movies import row
 from test_watcher import make_config, _kst
-from watcher import BookingSession, Config, FetchError, Watcher, _CycleTally
+from watcher import BookingSession, Config, FetchError, SeatSnapshot, Watcher, _CycleTally
 
 
 class MonthlyWindowTests(unittest.TestCase):
@@ -237,7 +237,7 @@ class MonthlyWindowTests(unittest.TestCase):
         sessions = self.w._extract_sessions({day: {"data": rows}})
         self.w._observe_movies(day, list(sessions.values()))
 
-    def test_handoff_only_for_exact_pin_movie_date_theater_and_imax(self):
+    def test_exact_movie_day_theater_and_imax_can_close_only_that_movies_gap(self):
         self.enable_handoff()
         self.observe(16, [(self.dune, {}),
                           (self.avengers, {"siteNo": "0001"}),
@@ -249,13 +249,17 @@ class MonthlyWindowTests(unittest.TestCase):
         self.assertFalse(self.w.state.opening_progress()[0])
         self.observe(16, [(self.avengers, {})])  # No follower, no available seats needed.
         self.assertEqual(self.w._plan_scan(self.today).priority_dates,
-                         tuple(self.dec(i) for i in [21, 18, 22, 19, 23]))
+                         tuple(self.dec(i) for i in range(18, 25)))
+        self.observe(21, [(self.dune, {})])
+        self.assertIn(self.dec(21), self.w._plan_scan(self.today).priority_dates)
+        self.observe(21, [(self.avengers, {})])
+        self.assertNotIn(self.dec(21), self.w._plan_scan(self.today).priority_dates)
 
-    def test_next_real_cycle_switches_order_then_keeps_and_moves_each_film_independently(self):
+    def test_gaps_remain_priority_after_noncontiguous_openings_and_restart(self):
         self.enable_handoff()
         self.observe(20, [(self.dune, {})])
         def schedules(day):
-            movies = [self.avengers] if day == self.pin else []
+            movies = [self.avengers] if day in (self.pin, self.dec(19)) else []
             return {"data": [row(n, "test", scnYmd=day.strftime("%Y%m%d"), frSeatCnt=0) for n in movies]}
         self.w.cgv.fetch_date.side_effect = schedules
         self.w.run_cycle()
@@ -264,18 +268,19 @@ class MonthlyWindowTests(unittest.TestCase):
         self.restart()
         self.w.run_cycle()
         calls = [c.args[0] for c in self.w.cgv.fetch_date.call_args_list]
-        self.assertEqual(calls[:5], [self.dec(d) for d in [21, 17, 22, 18, 23]])
+        self.assertEqual(calls[:7], [self.dec(d) for d in (17, 18, 20, 21, 22, 23, 24)])
         self.assertEqual(len(set(calls)), len(calls))
         self.assertLessEqual(len(calls), 16)
         self.observe(22, [(self.dune, {})])
-        self.assertEqual(self.w._plan_scan(self.today).priority_dates[:2], (self.dec(23), self.dec(17)))
+        self.assertIn(self.dec(22), self.w._plan_scan(self.today).priority_dates)
         self.observe(22, [(self.avengers, {})])
-        self.assertEqual(self.w._plan_scan(self.today).priority_dates, (self.dec(23), self.dec(24)))
+        self.assertNotIn(self.dec(22), self.w._plan_scan(self.today).priority_dates)
         self.observe(24, [(self.avengers, {}), (self.dune, {})])
         plan = self.w._plan_scan(self.today)
-        self.assertFalse(plan.priority_dates)
+        self.assertEqual(plan.priority_dates, tuple(self.dec(d) for d in (17,18,20,21,23)))
         self.assertLessEqual(max(plan.dates), self.dec(24))
-        self.assertEqual(self.w._plan_scan(self.today + dt.timedelta(days=1)).priority_dates, (self.dec(25),))
+        self.assertEqual(self.w._plan_scan(self.today + dt.timedelta(days=1)).priority_dates,
+                         plan.priority_dates + (self.dec(25),))
         self.w.cgv.fetch_seat_snapshot.assert_not_called()
 
     def test_legacy_record_migration_is_site_scoped_and_not_a_new_broadcast(self):
@@ -288,7 +293,7 @@ class MonthlyWindowTests(unittest.TestCase):
         self.assertEqual(self.w.state.opening_progress(), (False, {self.dune: self.dec(20)}))
         self.assertFalse(self.w.state.pending_deliveries())
 
-    def test_post_handoff_still_sweeps_gaps_and_preserves_near_days_every_cycle(self):
+    def test_priority_gaps_and_full_month_sweep_without_pinning_near_seven(self):
         self.enable_handoff()
         self.observe(20, [(self.dune, {})])
         self.observe(16, [(self.avengers, {})])
@@ -296,10 +301,104 @@ class MonthlyWindowTests(unittest.TestCase):
         for _ in range(7):
             self.w.run_cycle()
             days = [c.args[0] for c in self.w.cgv.fetch_date.call_args_list]
-            self.assertEqual(days[:2], [self.dec(21), self.dec(17)])
+            self.assertEqual(days[:8], [self.dec(d) for d in range(17,25)])
             self.assertLessEqual(len(days), 16)
             self.assertEqual(len(set(days)), len(days))
-            self.assertTrue(all(self.today + dt.timedelta(days=i) in days for i in range(7)))
             seen.update(days)
             self.restart()
         self.assertEqual(seen, set(self.cfg.target_dates()))
+
+    def test_production_window_and_overflow_include_every_missing_date(self):
+        self.enable_handoff()
+        today = dt.date(2026, 11, 26)
+        self.assertEqual(self.w._plan_scan(today).dates[:11], tuple(self.dec(d) for d in range(16,27)))
+        today = self.dec(14)
+        with patch.object(Config, "local_now", return_value=_kst(today)):
+            priorities, covered = set(), set()
+            for _ in range(6):
+                plan = self.w._plan_scan(today)
+                self.assertEqual(tuple(sorted(plan.priority_dates)), plan.priority_dates)
+                self.assertIn(self.pin, plan.priority_dates)
+                self.assertIn(self.first, plan.priority_dates)
+                self.assertEqual(len(set(plan.dates)), len(plan.dates))
+                self.assertLessEqual(len(plan.dates), 16)
+                priorities.update(plan.priority_dates)
+                covered.update(plan.dates)
+                self.w.run_cycle()
+                self.restart()
+            window = set(self.cfg.target_dates())
+            self.assertEqual(priorities, {d for d in window if d >= self.pin})
+            self.assertEqual(covered, window)
+
+    def test_seat_refresh_follows_actual_sold_out_imax_show_and_audience(self):
+        self.enable_handoff()
+        self.cfg = dataclasses.replace(self.cfg, open_only_mode=False, seat_poll_interval_seconds=120)
+        self.restart()
+        self.observe(10, [(self.dune, {})])  # sold out, well outside today's seven days
+        self.observe(11, [("777", {})])  # no one wants this movie
+        chat = self.cfg.telegram_chat_id
+        self.w.state.select_movie(chat, self.dune, True)
+        self.w.state.set_alert_mode(chat, "seats")
+        plan = self.w._plan_scan(self.today)
+        self.assertEqual(plan.seat_rotation, (self.dec(10),))
+        self.assertTrue(self.w._forces_seat_recheck(self.dec(10), self.today))
+        self.observe(10, [])
+        self.assertFalse(self.w._plan_scan(self.today).seat_rotation)
+
+    def test_interrupted_sorted_rotating_page_does_not_skip_unattempted_dates(self):
+        self.enable_handoff()
+        today = self.dec(14)
+        previous = dt.date(2027, 1, 11)
+        self.w.state.set_monthly_last_date(previous, priority=True)
+        self.w.state.save()
+        with patch.object(Config, "local_now", return_value=_kst(today)):
+            plan = self.w._plan_scan(today)
+            self.assertEqual(plan.priority_rotation[0], dt.date(2027, 1, 12))
+            def throttle(day):
+                if day == self.dec(18):
+                    raise FetchError("HTTP 429")
+                return {"data": []}
+            self.w.cgv.fetch_date.side_effect = throttle
+            self.w.run_cycle()
+            self.restart()
+            self.assertEqual(self.w.state.monthly_last_date(priority=True), previous)
+            self.assertEqual(self.w._plan_scan(today).priority_dates, plan.priority_dates)
+
+    def test_sold_out_distant_show_reopens_then_swaps_seats_at_equal_total(self):
+        self.enable_handoff()
+        self.cfg = dataclasses.replace(self.cfg, open_only_mode=False, seat_poll_interval_seconds=120,
+                                       poll_interval_seconds=60, seat_alert_sweet_only=True)
+        self.restart()
+        day = self.dec(10)
+        self.observe(10, [(self.dune, {})])
+        chat = self.cfg.telegram_chat_id
+        self.w.state.select_movie(chat, self.dune, True)
+        self.w.state.set_alert_mode(chat, "seats")
+        remaining = 0
+        def schedules(d):
+            return {"data": [row(self.dune, "듄", scnYmd="20261210", frSeatCnt=remaining)] if d == day else []}
+        self.w.cgv.fetch_date.side_effect = schedules
+        now = 1000
+        def tick():
+            self.w.run_cycle()
+        def seat(number):
+            return SeatSnapshot(total=1, usable=1, mapped_total=1, available_rows=("J",),
+                                available_seats=(("J", number),))
+        with patch("watcher.time.monotonic", side_effect=lambda: now):
+            tick()  # known showing, sold out
+            now += 60
+            tick()
+            self.w.cgv.fetch_seat_snapshot.assert_not_called()
+            remaining = 1
+            self.w.cgv.fetch_seat_snapshot.return_value = seat("20")
+            now += 121
+            tick()
+            self.assertEqual(self.w.cgv.fetch_seat_snapshot.call_count, 1)
+            self.w.cgv.fetch_seat_snapshot.return_value = seat("21")
+            now += 121
+            tick()
+            self.assertEqual(self.w.cgv.fetch_seat_snapshot.call_count, 2)
+            alerts = [r["text"] for _, r in self.w.state.pending_deliveries()
+                      if r.get("category") in ("seats", "seats_sweet") and r.get("movie_no") == self.dune]
+            self.assertTrue(any("J20" in text for text in alerts))
+            self.assertTrue(any("J21" in text for text in alerts))

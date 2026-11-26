@@ -69,6 +69,7 @@ class MovieStateMixin:
         key = f"{config.site_no}:{trigger}:{pin}"
         with self._lock:
             record = self.data.setdefault("opening_watches", {}).setdefault(key, {"opened": False, "latest": {}})
+            record.setdefault("days", {})
             self._opening_watch = (record, pin, trigger, set(config.monthly_follow_movies) | {trigger})
             for saved in self.data["notified"]:
                 parts = saved.split(":", 3)
@@ -86,12 +87,27 @@ class MovieStateMixin:
             return False
         record, pin, trigger, _ = watch
         with self._lock:
+            record["days"].setdefault(number, {})[day] = True
             latest = record["latest"]
             latest[number] = max(day, latest.get(number, day))
             if not record["opened"] and (number, day) == (trigger, pin):
                 record["opened"] = True
                 return True
         return False
+
+    def observed_movie_dates(self):
+        with self._lock:
+            watch = getattr(self, "_opening_watch", None)
+            if not watch:
+                return {}
+            return {n: set(days) for n, days in watch[0]["days"].items()}
+
+    def cached_show_times(self, day):
+        """Only the last successful Yongsan IMAX schedule supplies seat candidates."""
+        with self._lock:
+            rows = self.data.get("movie_sessions", {}).get(day, {}).get("sessions", ())
+            return [(r["movie_no"], r["start_time"]) for r in rows
+                    if r.get("date") == day and r.get("movie_no") and r.get("start_time")]
 
     def opening_progress(self):
         with self._lock:
@@ -185,7 +201,7 @@ class MovieWatcherMixin:
                 if not number:
                     continue
                 if session.date == show_date.isoformat() and self.state.note_open_showing(number, session.date):
-                    self.logger.info("고정 상영일 오픈 확인: %s (%s) %s. 다음 주기부터 영화별 마지막 오픈일 다음 날 우선.",
+                    self.logger.info("지정 상영일 오픈 확인: %s (%s) %s. 다른 미오픈 날짜는 우선 감시 유지.",
                                      session.movie_label, number, session.date)
                 fresh = number not in catalog
                 record = catalog.setdefault(number, {"first_seen": now})
