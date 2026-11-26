@@ -115,7 +115,7 @@ class FloodWaitTests(unittest.TestCase):
     def command(self, text):
         self.watcher.telegram.get_updates.return_value = [{
             "update_id": self.watcher.state.telegram_update_offset,
-            "message": {"text": text, "chat": {"id": self.chat, "type": "private"}},
+            "message": {"text": text, "from": {"id": self.chat, "is_bot": False}, "chat": {"id": self.chat, "type": "private"}},
         }]
         self.assertTrue(self.watcher.sync_subscribers())
 

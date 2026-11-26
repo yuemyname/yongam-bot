@@ -62,7 +62,7 @@ class MovieTests(unittest.TestCase):
     def command(self, command):
         self.watcher.telegram.get_updates.return_value = [{
             "update_id": self.watcher.state.telegram_update_offset,
-            "message": {"text": command, "chat": {"id": self.chat, "type": "private"}}}]
+            "message": {"text": command, "from": {"id": self.chat, "is_bot": False}, "chat": {"id": self.chat, "type": "private"}}}]
         self.watcher.sync_subscribers()
         return self.watcher.telegram.send_message.call_args.args[0]
 

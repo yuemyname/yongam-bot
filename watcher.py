@@ -4329,6 +4329,27 @@ class Watcher(MovieWatcherMixin):
         operator = str(self.config.telegram_chat_id or "").strip()
         return (operator,) if operator else ()
 
+    def _is_operator_message(
+        self, message: Mapping[str, Any], chat_id: str, chat_type: str
+    ) -> bool:
+        """Whether a command was typed by the operator in person.
+
+        The chat id alone is not enough: if TELEGRAM_CHAT_ID points at a
+        group, every member of that group writes from the same chat id.  So
+        the operator must be a human in a private chat with the bot, where
+        the chat id and the sender id are the same number.
+        """
+
+        operator = self._operator_recipients()
+        if not operator or chat_type != "private" or chat_id != operator[0]:
+            return False
+        sender = message.get("from")
+        return (
+            isinstance(sender, Mapping)
+            and str(sender.get("id")) == chat_id
+            and sender.get("is_bot") is False
+        )
+
     def _broadcast_message(
         self,
         text: str,
@@ -5457,24 +5478,18 @@ class Watcher(MovieWatcherMixin):
                 )
                 state_changed = state_changed or min_seats_changed
             elif command == ADMIN_USER_STATUS_COMMAND:
-                sender = message.get("from")
                 # Do not expose one subscriber's settings to a group, even if
                 # that group is configured as the operator destination.
-                if (
-                    chat_type == "private"
-                    and chat_id == str(self.config.telegram_chat_id)
-                    and isinstance(sender, Mapping)
-                    and str(sender.get("id")) == chat_id
-                    and sender.get("is_bot") is False
-                ):
+                if self._is_operator_message(message, chat_id, chat_type):
                     reply = self._handle_user_status_command(body)
                 else:
                     reply = "사용 가능한 명령어를 보려면 /help를 보내주세요."
-            elif command in ADMIN_COMMANDS and chat_id == str(
-                self.config.telegram_chat_id
+            elif command in ADMIN_COMMANDS and self._is_operator_message(
+                message, chat_id, chat_type
             ):
-                # Anyone else falls through to the unknown-command reply, so
-                # these are not advertised to subscribers at all.
+                # Anyone else, including other members of an operator group,
+                # falls through to the unknown-command reply, so these are
+                # not advertised to subscribers at all.
                 if command == ADMIN_STATS_COMMAND:
                     reply = self._subscriber_stats_message()
                 elif command == ADMIN_STATS_SUMMARY_COMMAND:

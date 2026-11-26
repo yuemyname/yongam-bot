@@ -40,7 +40,7 @@ class PublicGuideTests(unittest.TestCase):
         self.watcher.telegram.send_message.reset_mock()
         self.watcher.telegram.get_updates.return_value = [{
             "update_id": self.watcher.state.telegram_update_offset,
-            "message": {"text": command, "chat": {"id": chat, "type": "private"}},
+            "message": {"text": command, "from": {"id": chat, "is_bot": False}, "chat": {"id": chat, "type": "private"}},
         }]
         self.assertTrue(self.watcher.sync_subscribers())
         self.watcher.telegram.send_message.assert_called_once()

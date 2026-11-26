@@ -296,7 +296,7 @@ class CgvHeaderProbeTests(unittest.TestCase):
         self.assertTrue(watcher.run_cycle().cgv_paused)
         watcher.telegram.get_updates.return_value = [{
             "update_id": 1, "message": {
-                "chat": {"id": 987654, "type": "private"}, "text": "/status",
+                "from": {"id": 987654, "is_bot": False}, "chat": {"id": 987654, "type": "private"}, "text": "/status",
             },
         }]
         self.assertTrue(watcher.sync_subscribers())

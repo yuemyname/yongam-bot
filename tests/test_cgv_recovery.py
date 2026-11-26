@@ -250,7 +250,7 @@ class CgvRecoveryTests(RecoveryFixture):
     def test_status_commands_keep_working_while_paused(self):
         self.watcher.telegram.get_updates.return_value = [{
             "update_id": 1, "message": {
-                "chat": {"id": 987654, "type": "private"}, "text": "/status",
+                "from": {"id": 987654, "is_bot": False}, "chat": {"id": 987654, "type": "private"}, "text": "/status",
             },
         }]
         self.assertTrue(self.watcher.sync_subscribers())
@@ -330,7 +330,7 @@ class CgvResumeCommandTests(RecoveryFixture):
     def send(self, watcher, chat_id, text, update_id=1):
         watcher.telegram.get_updates.return_value = [{
             "update_id": update_id, "message": {
-                "chat": {"id": chat_id, "type": "private"}, "text": text,
+                "from": {"id": chat_id, "is_bot": False}, "chat": {"id": chat_id, "type": "private"}, "text": text,
             },
         }]
         self.assertTrue(watcher.sync_subscribers())

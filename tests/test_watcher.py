@@ -1116,7 +1116,7 @@ class MinimumSeatsTests(unittest.TestCase):
                         "update_id": update_id,
                         "message": {
                             "text": text,
-                            "chat": {"id": chat_id, "type": "private"},
+                            "from": {"id": chat_id, "is_bot": False}, "chat": {"id": chat_id, "type": "private"},
                         },
                     }
                 ]
@@ -2027,7 +2027,7 @@ class WatcherIntegrationTests(unittest.TestCase):
                         "update_id": 11,
                         "message": {
                             "text": "/stop",
-                            "chat": {"id": 111222, "type": "private"},
+                            "from": {"id": 111222, "is_bot": False}, "chat": {"id": 111222, "type": "private"},
                         },
                     }
                 ],
@@ -2569,7 +2569,7 @@ class WatcherIntegrationTests(unittest.TestCase):
                         "update_id": update_id,
                         "message": {
                             "text": text,
-                            "chat": {"id": chat_id, "type": "private"},
+                            "from": {"id": chat_id, "is_bot": False}, "chat": {"id": chat_id, "type": "private"},
                         },
                     }
                 ]
@@ -3716,7 +3716,7 @@ class WatcherIntegrationTests(unittest.TestCase):
                         "update_id": update_id,
                         "message": {
                             "text": text,
-                            "chat": {"id": chat_id, "type": "private"},
+                            "from": {"id": chat_id, "is_bot": False}, "chat": {"id": chat_id, "type": "private"},
                         },
                     }
                 ]
@@ -3785,7 +3785,7 @@ class WatcherIntegrationTests(unittest.TestCase):
                         "update_id": update_id,
                         "message": {
                             "text": text,
-                            "chat": {"id": chat_id, "type": "private"},
+                            "from": {"id": chat_id, "is_bot": False}, "chat": {"id": chat_id, "type": "private"},
                         },
                     }
                 ]
@@ -3857,7 +3857,7 @@ class WatcherIntegrationTests(unittest.TestCase):
                         "update_id": update_id,
                         "message": {
                             "text": text,
-                            "chat": {"id": 4242, "type": "private"},
+                            "from": {"id": 4242, "is_bot": False}, "chat": {"id": 4242, "type": "private"},
                         },
                     }
                 ]
@@ -3913,6 +3913,7 @@ class WatcherIntegrationTests(unittest.TestCase):
                 "update_id": update_id,
                 "message": {
                     "text": text,
+                    "from": {"id": int(chat_id), "is_bot": False},
                     "chat": {"id": int(chat_id), "type": "private", **chat_fields},
                 },
             }
@@ -4180,7 +4181,7 @@ class WatcherIntegrationTests(unittest.TestCase):
                         "update_id": update_id,
                         "message": {
                             "text": text,
-                            "chat": {"id": chat_id, "type": "private"},
+                            "from": {"id": chat_id, "is_bot": False}, "chat": {"id": chat_id, "type": "private"},
                         },
                     }
                 ]
@@ -4244,6 +4245,86 @@ class WatcherIntegrationTests(unittest.TestCase):
                     int(re.search(r"… 외 (\d+)명", message).group(1)), 81 - listed
                 )
 
+    def test_operator_commands_need_the_operator_in_a_private_chat(self):
+        group = "-1001234567890"
+        operator_user = 555000
+        cases = [
+            # (configured operator chat, chat id, chat type, sender)
+            ("group member", group, group, "supergroup",
+             {"id": 999111, "is_bot": False}),
+            ("operator inside the group", group, group, "supergroup",
+             {"id": operator_user, "is_bot": False}),
+            ("a bot posting as the operator chat", str(operator_user),
+             operator_user, "private", {"id": operator_user, "is_bot": True}),
+            ("no sender at all", str(operator_user), operator_user, "private",
+             None),
+            ("sender id differs from the chat", str(operator_user),
+             operator_user, "private", {"id": 999111, "is_bot": False}),
+            ("is_bot missing", str(operator_user), operator_user, "private",
+             {"id": operator_user}),
+        ]
+        for name, configured, chat_id, chat_type, sender in cases:
+            for update_id, command in enumerate(sorted(ADMIN_COMMANDS), start=1):
+                with self.subTest(case=name, command=command):
+                    with tempfile.TemporaryDirectory() as temporary:
+                        config = dataclasses.replace(
+                            make_config(Path(temporary)),
+                            subscriptions_enabled=True,
+                            telegram_chat_id=configured,
+                        )
+                        logger = logging.getLogger(f"watcher-gate-{id(self)}")
+                        logger.handlers = [logging.NullHandler()]
+                        watcher = Watcher(config, logger=logger)
+                        watcher.state.add_subscriber("7061234567")
+                        sent = []
+                        watcher.telegram.send_message = (
+                            lambda text, **kwargs: sent.append(
+                                (str(kwargs.get("chat_id")), text)
+                            )
+                        )
+                        message = {
+                            "text": f"{command} 7061234567 안녕하세요",
+                            "chat": {"id": int(chat_id), "type": chat_type},
+                        }
+                        if sender is not None:
+                            message["from"] = sender
+                        watcher.telegram.get_updates = lambda **_kwargs: [
+                            {"update_id": update_id, "message": message}
+                        ]
+                        watcher.sync_subscribers()
+
+                        # Only the generic reply, back to where it came from:
+                        # no stats, no relayed /reply, no notice draft.
+                        self.assertEqual(
+                            [chat for chat, _text in sent], [str(chat_id)]
+                        )
+                        self.assertIn("사용 가능한 명령어", sent[0][1])
+                        self.assertIsNone(watcher._notice_draft)
+
+        # The operator typing in their own private chat still works.
+        with tempfile.TemporaryDirectory() as temporary:
+            config = dataclasses.replace(
+                make_config(Path(temporary)),
+                subscriptions_enabled=True,
+                telegram_chat_id=str(operator_user),
+            )
+            logger = logging.getLogger(f"watcher-gate-ok-{id(self)}")
+            logger.handlers = [logging.NullHandler()]
+            watcher = Watcher(config, logger=logger)
+            sent = []
+            watcher.telegram.send_message = lambda text, **kwargs: sent.append(text)
+            watcher.telegram.get_updates = lambda **_kwargs: [{
+                "update_id": 1,
+                "message": {
+                    "text": ADMIN_STATS_SUMMARY_COMMAND,
+                    "from": {"id": operator_user, "is_bot": False},
+                    "chat": {"id": operator_user, "type": "private"},
+                },
+            }]
+            watcher.sync_subscribers()
+            self.assertIn("전체", sent[-1])
+            self.assertNotIn("사용 가능한 명령어", sent[-1])
+
     def test_stats_command_answers_the_operator_only(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = dataclasses.replace(
@@ -4272,7 +4353,7 @@ class WatcherIntegrationTests(unittest.TestCase):
                         "update_id": update_id,
                         "message": {
                             "text": text,
-                            "chat": {"id": chat_id, "type": "private"},
+                            "from": {"id": chat_id, "is_bot": False}, "chat": {"id": chat_id, "type": "private"},
                         },
                     }
                 ]
@@ -4374,7 +4455,7 @@ class WatcherIntegrationTests(unittest.TestCase):
                     "update_id": 1,
                     "message": {
                         "text": "/start",
-                        "chat": {"id": 777, "type": "private"},
+                        "from": {"id": 777, "is_bot": False}, "chat": {"id": 777, "type": "private"},
                     },
                 }
             ]

@@ -40,7 +40,7 @@ class SeatTimeTests(unittest.TestCase):
     def command(self, text, chat=None):
         self.watcher.telegram.get_updates.return_value = [{
             "update_id": self.watcher.state.telegram_update_offset,
-            "message": {"text": text, "chat": {"id": chat or self.chat, "type": "private"}},
+            "message": {"text": text, "from": {"id": chat or self.chat, "is_bot": False}, "chat": {"id": chat or self.chat, "type": "private"}},
         }]
         self.assertTrue(self.watcher.sync_subscribers())
         return self.watcher.telegram.send_message.call_args.args[0]

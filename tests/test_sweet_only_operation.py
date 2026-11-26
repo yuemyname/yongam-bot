@@ -184,7 +184,7 @@ class SweetOnlyOperationTests(unittest.TestCase):
             for i, command in enumerate(("/start", "/status", "/seat", "/seat_all", "/seat all", "/seat_sweet", "/desc", "/help"), 1):
                 watcher.telegram.get_updates = lambda **kwargs: [{
                     "update_id": i,
-                    "message": {"text": command, "chat": {"id": 100, "type": "private"}},
+                    "message": {"text": command, "from": {"id": 100, "is_bot": False}, "chat": {"id": 100, "type": "private"}},
                 }]
                 watcher.sync_subscribers()
                 text = watcher.telegram.send_message.call_args.args[0]

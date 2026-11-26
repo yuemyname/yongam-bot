@@ -39,10 +39,14 @@ class MovieStatsTests(unittest.TestCase):
 
     def command(self, command, chat_id=None):
         self.watcher.telegram.send_message.reset_mock()
+        sender = chat_id or self.config.telegram_chat_id
         self.watcher.telegram.get_updates.return_value = [{
             "update_id": self.state.telegram_update_offset,
-            "message": {"text": command, "chat": {
-                "id": chat_id or self.config.telegram_chat_id, "type": "private"}},
+            "message": {
+                "text": command,
+                "from": {"id": int(sender), "is_bot": False},
+                "chat": {"id": sender, "type": "private"},
+            },
         }]
         self.watcher.sync_subscribers()
         return [call.args[0] for call in self.watcher.telegram.send_message.call_args_list]
