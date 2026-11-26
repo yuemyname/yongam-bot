@@ -332,6 +332,11 @@ FORWARD_MAX_CHARS = 500
 # Recent senders, so a reply can name who it reached even before they
 # subscribe.  In memory: a restart just loses the convenience.
 FORWARD_RECENT_SENDERS = 200
+# A refused operator command is reported to the operator, a few per chat per
+# hour, so someone probing the bot cannot flood the operator's inbox.
+REFUSED_COMMAND_ALERT_MAX_PER_HOUR = 3
+# Chats remembered for that cap; older ones are pruned past this size.
+REFUSED_COMMAND_TRACKED_CHATS = 500
 REPLY_HEADER = "💬 운영자 답장"
 REPLY_GUIDE = (
     "구독자 한 명에게 답장합니다.\n"
@@ -3552,6 +3557,7 @@ class Watcher(MovieWatcherMixin):
         self._notice_draft: tuple[str, dt.datetime] | None = None
         self._forwarded_at: dict[str, list[dt.datetime]] = {}
         self._recent_senders: dict[str, str] = {}
+        self._refused_reported_at: dict[str, list[dt.datetime]] = {}
         self._recovery_payloads: dict[dt.date, Any] = {}
         self._header_probe_checked = False
         self.state.load()
@@ -4329,10 +4335,10 @@ class Watcher(MovieWatcherMixin):
         operator = str(self.config.telegram_chat_id or "").strip()
         return (operator,) if operator else ()
 
-    def _is_operator_message(
+    def _operator_refusal_reason(
         self, message: Mapping[str, Any], chat_id: str, chat_type: str
-    ) -> bool:
-        """Whether a command was typed by the operator in person.
+    ) -> str | None:
+        """Why a command was not typed by the operator in person, or None.
 
         The chat id alone is not enough: if TELEGRAM_CHAT_ID points at a
         group, every member of that group writes from the same chat id.  So
@@ -4341,13 +4347,114 @@ class Watcher(MovieWatcherMixin):
         """
 
         operator = self._operator_recipients()
-        if not operator or chat_type != "private" or chat_id != operator[0]:
-            return False
+        if not operator:
+            return "운영자 채팅이 설정되지 않음"
+        if chat_id != operator[0]:
+            return "운영자가 아닌 채팅"
+        if chat_type != "private":
+            return "운영자 채팅이지만 1:1 채팅이 아님"
         sender = message.get("from")
-        return (
-            isinstance(sender, Mapping)
-            and str(sender.get("id")) == chat_id
-            and sender.get("is_bot") is False
+        if not isinstance(sender, Mapping):
+            return "보낸 사람 정보 없음"
+        if str(sender.get("id")) != chat_id:
+            return "보낸 사람 ID가 운영자와 다름"
+        if sender.get("is_bot") is not False:
+            return "봇 계정"
+        return None
+
+    def _is_operator_message(
+        self, message: Mapping[str, Any], chat_id: str, chat_type: str
+    ) -> bool:
+        return self._operator_refusal_reason(message, chat_id, chat_type) is None
+
+    def _report_refused_operator_command(
+        self,
+        message: Mapping[str, Any],
+        chat: Mapping[str, Any],
+        chat_id: str,
+        chat_type: str,
+        command: str,
+        reason: str,
+    ) -> None:
+        """Tell the operator someone tried an operator-only command.
+
+        Only the command name goes out, never its arguments: a /reply or
+        /notice body is whatever the stranger typed.  Every name and the
+        command are made untappable, because Telegram turns any "/word" in
+        a message into a button that would run as the operator.
+        """
+
+        sender = message.get("from")
+        sender_id = (
+            str(sender.get("id") or "") if isinstance(sender, Mapping) else ""
+        )
+        self.logger.warning(
+            "운영자 명령 거절: %s (%s) chat_id=%s, 유형=%s, 보낸 사람=%s",
+            command,
+            reason,
+            chat_id,
+            chat_type or "미상",
+            sender_id or "-",
+        )
+        operator = self._operator_recipients()
+        # An attempt inside the operator chat itself is already in front of
+        # the operator.  Posting the alert there would also show it to the
+        # very group member who tried, revealing that these commands exist.
+        if not operator or chat_id in operator:
+            return
+
+        now = self.config.local_now()
+        window = dt.timedelta(hours=1)
+        if len(self._refused_reported_at) > REFUSED_COMMAND_TRACKED_CHATS:
+            self._refused_reported_at = {
+                key: kept
+                for key, times in self._refused_reported_at.items()
+                if (kept := [seen for seen in times if now - seen < window])
+            }
+        recent = [
+            seen
+            for seen in self._refused_reported_at.get(chat_id, ())
+            if now - seen < window
+        ]
+        if len(recent) >= REFUSED_COMMAND_ALERT_MAX_PER_HOUR:
+            self._refused_reported_at[chat_id] = recent
+            return
+        self._refused_reported_at[chat_id] = [*recent, now]
+
+        def plain(value: Any, limit: int = 60) -> str:
+            text = " ".join(str(value or "").split())[:limit]
+            # A fullwidth slash reads the same but is never a command link.
+            return text.replace("/", "／")
+
+        chat_label = plain(
+            chat.get("title") or chat.get("username") or chat.get("first_name")
+        )
+        chat_kind = {
+            "private": "1:1",
+            "group": "그룹",
+            "supergroup": "그룹",
+            "channel": "채널",
+        }.get(chat_type, chat_type or "미상")
+        lines = [
+            "🚫 운영자 명령 거절",
+            f"명령: {plain(command.lstrip('/'), 40)}",
+            "채팅: " + " · ".join(
+                part for part in (chat_id, chat_label, chat_kind) if part
+            ),
+        ]
+        if sender_id and sender_id != chat_id:
+            sender_label = plain(
+                sender.get("username") or sender.get("first_name")
+            )
+            lines.append(
+                "보낸 사람: " + " · ".join(
+                    part for part in (sender_id, sender_label) if part
+                )
+            )
+        lines.append(f"사유: {reason}")
+        lines.append("상대에게는 일반 안내 문구만 보냈습니다.")
+        self._broadcast_message(
+            "\n".join(lines), category=ALERT_SYSTEM, recipients=operator
         )
 
     def _broadcast_message(
@@ -5477,20 +5584,22 @@ class Watcher(MovieWatcherMixin):
                     chat_id, command, argument
                 )
                 state_changed = state_changed or min_seats_changed
-            elif command == ADMIN_USER_STATUS_COMMAND:
-                # Do not expose one subscriber's settings to a group, even if
-                # that group is configured as the operator destination.
-                if self._is_operator_message(message, chat_id, chat_type):
-                    reply = self._handle_user_status_command(body)
-                else:
-                    reply = "사용 가능한 명령어를 보려면 /help를 보내주세요."
-            elif command in ADMIN_COMMANDS and self._is_operator_message(
-                message, chat_id, chat_type
+            elif command in ADMIN_COMMANDS and (
+                refusal := self._operator_refusal_reason(
+                    message, chat_id, chat_type
+                )
             ):
                 # Anyone else, including other members of an operator group,
-                # falls through to the unknown-command reply, so these are
-                # not advertised to subscribers at all.
-                if command == ADMIN_STATS_COMMAND:
+                # gets the same reply as an unknown command, so these are not
+                # advertised at all.  The operator hears about the attempt.
+                self._report_refused_operator_command(
+                    message, chat, chat_id, chat_type, command, refusal
+                )
+                reply = "사용 가능한 명령어를 보려면 /help를 보내주세요."
+            elif command in ADMIN_COMMANDS:
+                if command == ADMIN_USER_STATUS_COMMAND:
+                    reply = self._handle_user_status_command(body)
+                elif command == ADMIN_STATS_COMMAND:
                     reply = self._subscriber_stats_message()
                 elif command == ADMIN_STATS_SUMMARY_COMMAND:
                     reply = self._subscriber_stats_message(

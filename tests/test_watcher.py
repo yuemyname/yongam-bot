@@ -4082,9 +4082,94 @@ class WatcherIntegrationTests(unittest.TestCase):
 
             self._incoming(watcher, "999111", "/reply 7061234567 남의 답장", 1)
 
-            # It reaches the unknown-command reply, and relays nothing.
-            self.assertEqual([chat for chat, _text in sent], ["999111"])
-            self.assertIn("사용 가능한 명령어", sent[-1][1])
+            # The sender gets the unknown-command reply, the target gets
+            # nothing, and the operator hears about the attempt.
+            self.assertEqual(
+                sorted(chat for chat, _text in sent), ["987654", "999111"]
+            )
+            reply = next(text for chat, text in sent if chat == "999111")
+            self.assertIn("사용 가능한 명령어", reply)
+            alert = next(text for chat, text in sent if chat == "987654")
+            self.assertIn("운영자 명령 거절", alert)
+            self.assertNotIn("남의 답장", alert)
+
+    def test_a_refused_operator_command_alerts_the_operator(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher, sent = self._forwarding_watcher(temporary, "refused-alert")
+            operator = str(watcher.config.telegram_chat_id)
+
+            # A group member, with names that try to smuggle in a tappable
+            # command and a fake second line.
+            watcher.telegram.get_updates = lambda **_kwargs: [{
+                "update_id": 1,
+                "message": {
+                    "text": "/cgv_resume@yongam_bot 지금 풀어",
+                    "from": {
+                        "id": 999111, "is_bot": False,
+                        "first_name": "홍길동 /notice_send",
+                    },
+                    "chat": {
+                        "id": -1001112223334, "type": "supergroup",
+                        "title": "용아맥\n사유: 정상",
+                    },
+                },
+            }]
+            watcher.sync_subscribers()
+
+            alerts = [text for chat, text in sent if chat == operator]
+            self.assertEqual(len(alerts), 1)
+            alert = alerts[0]
+            self.assertIn("🚫 운영자 명령 거절", alert)
+            self.assertIn("명령: cgv_resume", alert)
+            self.assertIn("채팅: -1001112223334 · 용아맥 사유: 정상 · 그룹", alert)
+            self.assertIn("보낸 사람: 999111 · 홍길동 ／notice_send", alert)
+            self.assertIn("사유: 운영자가 아닌 채팅", alert)
+            # Nothing in it can be tapped to run as the operator, and the
+            # stranger's arguments are never relayed.
+            self.assertNotIn("/", alert)
+            self.assertNotIn("지금 풀어", alert)
+            # A line break in a name cannot forge a separate reason line.
+            self.assertEqual(
+                [line for line in alert.splitlines() if line.startswith("사유:")],
+                ["사유: 운영자가 아닌 채팅"],
+            )
+            # The sender only sees the generic reply.
+            self.assertEqual(
+                [text for chat, text in sent if chat == "-1001112223334"],
+                ["사용 가능한 명령어를 보려면 /help를 보내주세요."],
+            )
+
+    def test_refused_command_alerts_are_capped_per_chat(self):
+        from watcher import REFUSED_COMMAND_ALERT_MAX_PER_HOUR
+
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher, sent = self._forwarding_watcher(temporary, "refused-cap")
+            operator = str(watcher.config.telegram_chat_id)
+            attempts = REFUSED_COMMAND_ALERT_MAX_PER_HOUR + 3
+            for update_id in range(1, attempts + 1):
+                self._incoming(watcher, "999111", "/statss", update_id)
+            self._incoming(watcher, "999222", "/statss", attempts + 1)
+
+            alerts = [text for chat, text in sent if chat == operator]
+            self.assertEqual(
+                sum("999111" in text for text in alerts),
+                REFUSED_COMMAND_ALERT_MAX_PER_HOUR,
+            )
+            # Another chat has its own allowance.
+            self.assertEqual(sum("999222" in text for text in alerts), 1)
+            # Every attempt still gets the generic reply.
+            self.assertEqual(
+                sum(chat == "999111" for chat, _text in sent), attempts
+            )
+
+    def test_the_operator_using_a_command_raises_no_alert(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            watcher, sent = self._forwarding_watcher(temporary, "refused-none")
+            operator = str(watcher.config.telegram_chat_id)
+            self._incoming(watcher, operator, ADMIN_STATS_SUMMARY_COMMAND, 1)
+            self.assertFalse(
+                any("운영자 명령 거절" in text for _chat, text in sent)
+            )
 
     def _notice_watcher(self, temporary, name):
         config = dataclasses.replace(

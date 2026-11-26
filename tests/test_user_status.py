@@ -58,10 +58,19 @@ class UserStatusTests(unittest.TestCase):
         self.assertTrue(self.watcher.sync_subscribers())
         if not self.watcher.telegram.send_message.called:
             return ""
-        self.watcher.telegram.send_message.assert_called_once()
-        call = self.watcher.telegram.send_message.call_args
-        self.assertEqual(call.kwargs["chat_id"], chat_id)
-        return call.args[0]
+        calls = self.watcher.telegram.send_message.call_args_list
+        replies = [c for c in calls if c.kwargs["chat_id"] == chat_id]
+        self.assertEqual(len(replies), 1)
+        # Anything else is the refusal alert, and only the operator gets it.
+        # It names the command, never its argument, so it cannot confirm
+        # whether a target chat exists either.
+        for other in calls:
+            if other in replies:
+                continue
+            self.assertEqual(other.kwargs["chat_id"], self.operator)
+            self.assertIn("운영자 명령 거절", other.args[0])
+            self.assertNotIn("테스트 구독자", other.args[0])
+        return replies[0].args[0]
 
     def test_operator_sees_same_status_as_subscriber_and_does_not_modify_settings(self):
         own_reply = self.command("/status", chat_id=self.target)
