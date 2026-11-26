@@ -26,6 +26,7 @@ from watcher import (
     ALERT_NOTICE,
     ALERT_SYSTEM,
     ADMIN_CGV_RESUME_COMMAND,
+    ADMIN_COMMANDS,
     ADMIN_NOTICE_COMMAND,
     ADMIN_NOTICE_SEND_COMMAND,
     ADMIN_STATS_COMMAND,
@@ -5316,13 +5317,19 @@ class DocumentedCommandTests(unittest.TestCase):
         readme = (self.REPO / "README.md").read_text(encoding="utf-8")
         block = development.split("`/setcommands`")[1].split("```")[1]
 
-        # Tied to the constants so a rename cannot quietly publish an
-        # operator-only command to every subscriber.
-        for command in (
-            ADMIN_STATS_COMMAND,
-            ADMIN_STATS_SUMMARY_COMMAND,
-            ADMIN_CGV_RESUME_COMMAND,
-        ):
-            self.assertNotIn(command.lstrip("/"), block)
-            self.assertNotIn(f"| `{command}` |", readme)
-            self.assertNotIn(command, self._botfather_commands())
+        page = (self.REPO / "docs" / "index.html").read_text(encoding="utf-8")
+        botfather = self._botfather_commands()
+
+        # Tied to the constants so a new or renamed operator-only command
+        # cannot quietly be published to every subscriber.  Prose counts
+        # too, not only the command table: a passing mention still tells
+        # strangers the command exists.
+        for command in sorted(ADMIN_COMMANDS):
+            with self.subTest(command=command):
+                mention = re.compile(rf"(?<![\w/]){re.escape(command)}(?![\w])")
+                self.assertNotIn(command, botfather)
+                self.assertIsNone(
+                    re.search(rf"^{re.escape(command.lstrip('/'))} -", block, re.M)
+                )
+                self.assertIsNone(mention.search(readme), "README.md")
+                self.assertIsNone(mention.search(page), "docs/index.html")
